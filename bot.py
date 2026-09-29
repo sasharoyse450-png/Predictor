@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import math
 import os
 import random
 from collections import Counter, deque
@@ -25,7 +26,6 @@ logging.basicConfig(
 log = logging.getLogger("caspredict")
 
 # ==================== НАСТРОЙКИ ====================
-# На Railway берётся из Variables. Локально — из значений по умолчанию.
 
 TOKEN = os.getenv("BOT_TOKEN", "8781607065:AAFn0AbFLUHkcEaQtSgvn2Ix52HksW3_j-0")
 TARGET_ID = int(os.getenv("TARGET_ID", "6173495222"))
@@ -88,13 +88,9 @@ def sb_load_all():
                 pass
         elif key.startswith("history:"):
             game = key[len("history:"):]
-            HISTORY.setdefault(chat_id, {})[game] = deque(
-                value, maxlen=HISTORY_LIMIT
-            )
+            HISTORY.setdefault(chat_id, {})[game] = deque(value, maxlen=HISTORY_LIMIT)
 
-    total_vals = sum(
-        len(dq) for games in HISTORY.values() for dq in games.values()
-    )
+    total_vals = sum(len(dq) for games in HISTORY.values() for dq in games.values())
     log.info(
         "Supabase загружен: чатов %d, значений %d, last_seen %d",
         len(HISTORY), total_vals, len(last_seen),
@@ -147,71 +143,186 @@ async def tracked_reply(message: Message, text: str, **kwargs) -> Message:
     return sent
 
 
-# ==================== ПРЕДСКАЗАНИЯ ====================
+# ==================== АЛГОРИТМ ====================
 
 
 def _streak(results: list) -> int:
     if not results:
         return 0
-    streak = 1
+    s = 1
     for i in range(len(results) - 2, -1, -1):
         if results[i] == results[-1]:
-            streak += 1
+            s += 1
         else:
             break
-    return streak
+    return s
+
+
+def _markov(results: list, states: tuple) -> dict:
+    """P(следующий | текущий) по всем парам в истории."""
+    if len(results) < 2:
+        return {}
+    trans = {}
+    for i in range(len(results) - 1):
+        trans.setdefault(results[i], Counter())[results[i + 1]] += 1
+    out = {}
+    for a, cnt in trans.items():
+        total = sum(cnt.values())
+        out[a] = {b: cnt[b] / total for b in states}
+    return out
+
+
+def _recency_rate(results: list, target: str, half_life: float = 15.0) -> float:
+    """Взвешенная по свежести частота target."""
+    if not results:
+        return 0.5
+    n = len(results)
+    weights = [0.5 ** ((n - 1 - i) / half_life) for i in range(n)]
+    total_w = sum(weights)
+    hit_w = sum(w for w, r in zip(weights, results) if r == target)
+    return hit_w / total_w if total_w else 0.5
+
+
+def _chi_square(values: list, k: int = 6) -> float:
+    """Отклонение от равномерного. 0 = идеально, >11.07 = значимо (p<0.05)."""
+    if not values:
+        return 0.0
+    n = len(values)
+    expected = n / k
+    freq = Counter(values)
+    chi = 0.0
+    for num in range(1, k + 1):
+        obs = freq.get(num, 0)
+        chi += (obs - expected) ** 2 / expected
+    return chi
 
 
 def predict_binary(values: list, goal_values: set) -> tuple:
+    """Гол/мимо: байес + марков + свежесть."""
     if not values:
         return random.choice(["гол", "мимо"]), "нет истории — 50/50", "история: 0"
+
+    states = ("гол", "мимо")
     results = ["гол" if v in goal_values else "мимо" for v in values]
+    n = len(results)
     goals = results.count("гол")
-    misses = len(results) - goals
-    st = _streak(results)
+    misses = n - goals
+
+    alpha = 2.0
+    p_base_goal = (goals + alpha) / (n + 2 * alpha)
+
     last = results[-1]
-    stats = f"всего: {len(results)} | гол: {goals} | мимо: {misses} | серия: {st}x {last}"
-    if st >= 2:
-        pred = "мимо" if last == "гол" else "гол"
-        return pred, f"серия {st}x «{last}» — вероятен перелом", stats
-    if goals < misses:
-        return "гол", f"гол реже ({goals} vs {misses})", stats
-    if misses < goals:
-        return "мимо", f"мимо реже ({misses} vs {goals})", stats
-    return random.choice(["гол", "мимо"]), "равный счёт — 50/50", stats
+    trans = _markov(results, states)
+    p_markov_goal = trans.get(last, {}).get("гол", p_base_goal)
+    p_recent_goal = _recency_rate(results, "гол")
+
+    p_goal = 0.35 * p_base_goal + 0.35 * p_markov_goal + 0.30 * p_recent_goal
+    confidence = abs(p_goal - 0.5) * 200
+
+    st = _streak(results)
+    stats = f"всего: {n} | гол: {goals} | мимо: {misses} | серия: {st}x {last}"
+
+    if confidence < 6:
+        pred = random.choice(states)
+        reason = f"распределение близко к равномерному (уверенность {confidence:.0f}%)"
+    else:
+        pred = "гол" if p_goal > 0.5 else "мимо"
+        p_pred = p_goal if pred == "гол" else 1 - p_goal
+        reason = (
+            f"P({pred})={p_pred*100:.1f}% · уверенность {confidence:.0f}%\n"
+            f"base {p_base_goal*100:.0f}% / markov {p_markov_goal*100:.0f}% "
+            f"/ recent {p_recent_goal*100:.0f}%"
+        )
+
+    return pred, reason, stats
 
 
 def predict_parity(values: list) -> tuple:
+    """Чёт/Нечет — та же логика."""
     if not values:
-        return random.choice(["Чёт", "Нечет"]), "нет истории", "история: 0"
+        return random.choice(["Чёт", "Нечет"]), "нет истории — 50/50", "история: 0"
+
+    states = ("Чёт", "Нечет")
     results = ["Чёт" if v % 2 == 0 else "Нечет" for v in values]
+    n = len(results)
     even = results.count("Чёт")
-    odd = results.count("Нечет")
-    st = _streak(results)
+    odd = n - even
+
+    alpha = 2.0
+    p_base_even = (even + alpha) / (n + 2 * alpha)
+
     last = results[-1]
-    stats = f"всего: {len(results)} | Чёт: {even} | Нечет: {odd} | серия: {st}x {last}"
-    if st >= 2:
-        pred = "Нечет" if last == "Чёт" else "Чёт"
-        return pred, f"серия {st}x «{last}» — вероятен перелом", stats
-    if even < odd:
-        return "Чёт", f"Чёт реже ({even} vs {odd})", stats
-    if odd < even:
-        return "Нечет", f"Нечет реже ({odd} vs {even})", stats
-    return random.choice(["Чёт", "Нечет"]), "равный счёт", stats
+    trans = _markov(results, states)
+    p_markov_even = trans.get(last, {}).get("Чёт", p_base_even)
+    p_recent_even = _recency_rate(results, "Чёт")
+
+    p_even = 0.35 * p_base_even + 0.35 * p_markov_even + 0.30 * p_recent_even
+    confidence = abs(p_even - 0.5) * 200
+
+    st = _streak(results)
+    stats = f"всего: {n} | Чёт: {even} | Нечет: {odd} | серия: {st}x {last}"
+
+    if confidence < 6:
+        pred = random.choice(states)
+        reason = f"распределение близко к равномерному (уверенность {confidence:.0f}%)"
+    else:
+        pred = "Чёт" if p_even > 0.5 else "Нечет"
+        p_pred = p_even if pred == "Чёт" else 1 - p_even
+        reason = (
+            f"P({pred})={p_pred*100:.1f}% · уверенность {confidence:.0f}%\n"
+            f"base {p_base_even*100:.0f}% / markov {p_markov_even*100:.0f}% "
+            f"/ recent {p_recent_even*100:.0f}%"
+        )
+
+    return pred, reason, stats
 
 
 def predict_dice_numbers(values: list, count: int) -> tuple:
+    """Взвешенная выборка: редкость × давность."""
     if not values:
-        nums = random.sample(range(1, 7), count)
-        return nums, "нет истории — случайно", "история: 0"
+        nums = sorted(random.sample(range(1, 7), count))
+        return nums, "нет истории — равновероятно", "история: 0"
+
+    n = len(values)
     freq = Counter(values)
-    base = list(range(1, 7))
-    random.shuffle(base)
-    base.sort(key=lambda n: freq.get(n, 0))
-    nums = sorted(base[:count])
-    freq_str = " ".join(f"{n}:{freq.get(n, 0)}" for n in range(1, 7))
-    stats = f"всего: {len(values)} | частоты: {freq_str}"
-    return nums, "числа с минимальной частотой", stats
+    expected = n / 6.0
+
+    weights = {}
+    for num in range(1, 7):
+        f = freq.get(num, 0)
+        deviation = (expected - f) / max(math.sqrt(expected), 1.0)
+        base_w = 1.0 + max(0.0, deviation) * 0.6
+
+        last_idx = None
+        for i in range(n - 1, -1, -1):
+            if values[i] == num:
+                last_idx = i
+                break
+        gap = (n - 1 - last_idx) if last_idx is not None else n
+        gap_w = 1.0 + min(gap / 10.0, 1.5)
+
+        weights[num] = base_w * gap_w
+
+    pool = list(range(1, 7))
+    nums = []
+    for _ in range(count):
+        total_w = sum(weights[p] for p in pool)
+        r = random.uniform(0, total_w)
+        acc = 0.0
+        for p in pool:
+            acc += weights[p]
+            if r <= acc:
+                nums.append(p)
+                pool.remove(p)
+                break
+    nums.sort()
+
+    chi = _chi_square(values)
+    freq_str = " ".join(f"{k}:{freq.get(k, 0)}" for k in range(1, 7))
+    stats = f"всего: {n} | частоты: {freq_str} | χ²={chi:.1f}"
+    reason = "взвешенный выбор: редкость × давность"
+
+    return nums, reason, stats
 
 
 # ==================== СЛЕЖКА ЗА ЭМОДЗИ ====================
@@ -308,9 +419,7 @@ async def cashistory(message: Message):
 async def cashistorydebug(message: Message):
     ls = last_seen.get(message.chat.id)
     ls_info = f"{ls[0]:%Y-%m-%d %H:%M:%S} / {ls[1][:30]}" if ls else "нет"
-    total_vals = sum(
-        len(dq) for games in HISTORY.values() for dq in games.values()
-    )
+    total_vals = sum(len(dq) for games in HISTORY.values() for dq in games.values())
     text = (
         f"chat.id = <code>{message.chat.id}</code>\n"
         f"chat.type = <code>{message.chat.type}</code>\n"
@@ -444,7 +553,10 @@ async def caspredict_dice_parity_cb(cb: CallbackQuery):
     hist = list(get_hist(cb.message.chat.id, "dice"))
     pred, reason, stats = predict_parity(hist)
     await cb.message.edit_text(
-        f"<b>🎲 Куб: чётность</b>\nПредсказание: <b>{pred}</b>\n<i>{reason}</i>\n<code>{stats}</code>",
+        f"<b>🎲 Куб: чётность</b>\n"
+        f"Предсказание: <b>{pred}</b>\n"
+        f"<i>{reason}</i>\n"
+        f"<code>{stats}</code>",
         reply_markup=caspredict_back_kb(),
     )
     await cb.answer()
@@ -467,7 +579,10 @@ async def caspredict_dice_num_cb(cb: CallbackQuery):
     nums, reason, stats = predict_dice_numbers(hist, count)
     pred = ", ".join(str(n) for n in nums)
     await cb.message.edit_text(
-        f"<b>🎲 Куб: числа</b>\nПредсказание ({count}): <b>{pred}</b>\n<i>{reason}</i>\n<code>{stats}</code>",
+        f"<b>🎲 Куб: числа</b>\n"
+        f"Предсказание ({count}): <b>{pred}</b>\n"
+        f"<i>{reason}</i>\n"
+        f"<code>{stats}</code>",
         reply_markup=caspredict_back_kb(),
     )
     await cb.answer()
@@ -481,7 +596,10 @@ async def caspredict_football_cb(cb: CallbackQuery):
     hist = list(get_hist(cb.message.chat.id, "football"))
     pred, reason, stats = predict_binary(hist, goal_values={4, 5})
     await cb.message.edit_text(
-        f"<b>⚽ Футбол</b>\nПредсказание: <b>{pred}</b>\n<i>{reason}</i>\n<code>{stats}</code>",
+        f"<b>⚽ Футбол</b>\n"
+        f"Предсказание: <b>{pred}</b>\n"
+        f"<i>{reason}</i>\n"
+        f"<code>{stats}</code>",
         reply_markup=caspredict_back_kb(),
     )
     await cb.answer()
@@ -495,7 +613,10 @@ async def caspredict_basketball_cb(cb: CallbackQuery):
     hist = list(get_hist(cb.message.chat.id, "basketball"))
     pred, reason, stats = predict_binary(hist, goal_values={3, 4, 5})
     await cb.message.edit_text(
-        f"<b>🏀 Баскетбол</b>\nПредсказание: <b>{pred}</b>\n<i>{reason}</i>\n<code>{stats}</code>",
+        f"<b>🏀 Баскетбол</b>\n"
+        f"Предсказание: <b>{pred}</b>\n"
+        f"<i>{reason}</i>\n"
+        f"<code>{stats}</code>",
         reply_markup=caspredict_back_kb(),
     )
     await cb.answer()
