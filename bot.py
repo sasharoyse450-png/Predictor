@@ -1,5 +1,4 @@
 import asyncio
-import json
 import logging
 import os
 import random
@@ -16,6 +15,7 @@ from aiogram.types import (
     InlineKeyboardMarkup,
     InlineKeyboardButton,
 )
+from supabase import create_client, Client
 
 logging.basicConfig(
     level=logging.INFO,
@@ -24,16 +24,28 @@ logging.basicConfig(
 )
 log = logging.getLogger("caspredict")
 
-TOKEN = "8781607065:AAFn0AbFLUHkcEaQtSgvn2Ix52HksW3_j-0"
-TARGET_ID = 6173495222
+# ==================== НАСТРОЙКИ ====================
+# На Railway берётся из Variables. Локально — из значений по умолчанию.
 
-BASE_DIR = "/data" if os.path.isdir("/data") else "."
-HISTORY_FILE = os.path.join(BASE_DIR, "dice_history.json")
-LASTSEEN_FILE = os.path.join(BASE_DIR, "last_seen.json")
-HISTORY_LIMIT = 50
+TOKEN = os.getenv("BOT_TOKEN", "8781607065:AAFn0AbFLUHkcEaQtSgvn2Ix52HksW3_j-0")
+TARGET_ID = int(os.getenv("TARGET_ID", "6173495222"))
+
+SUPABASE_URL = os.getenv("SUPABASE_URL", "")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
+
+HISTORY_LIMIT = int(os.getenv("HISTORY_LIMIT", "500"))
+
+if not TOKEN:
+    print("!!! BOT_TOKEN не задан")
+    raise SystemExit(1)
+if not SUPABASE_URL or not SUPABASE_KEY:
+    print("!!! SUPABASE_URL / SUPABASE_KEY не заданы")
+    raise SystemExit(1)
 
 bot = Bot(TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
+
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 last_seen = {}
 bot_messages = {}
@@ -49,77 +61,73 @@ DICE_EMOJI_MAP = {
 }
 
 
-# ==================== ФАЙЛЫ ====================
+# ==================== SUPABASE ====================
 
 
-def load_history():
-    global HISTORY
-    if not os.path.exists(HISTORY_FILE):
-        log.info("Файл истории не найден: %s", HISTORY_FILE)
-        HISTORY = {}
-        return
+def sb_load_all():
+    global HISTORY, last_seen
     try:
-        with open(HISTORY_FILE, "r", encoding="utf-8") as f:
-            raw = json.load(f)
-        HISTORY = {}
-        for chat_id_str, games in raw.items():
-            try:
-                chat_id = int(chat_id_str)
-            except ValueError:
-                continue
-            HISTORY[chat_id] = {}
-            for game, values in games.items():
-                HISTORY[chat_id][game] = deque(values[-HISTORY_LIMIT:], maxlen=HISTORY_LIMIT)
-        log.info("История загружена: чатов %d", len(HISTORY))
+        res = supabase.table("kv_store").select("chat_id,key,value").execute()
     except Exception as e:
-        log.warning("Не смог прочитать %s: %s", HISTORY_FILE, e)
-        HISTORY = {}
-
-
-def save_history():
-    try:
-        raw = {
-            str(cid): {g: list(dq) for g, dq in games.items()}
-            for cid, games in HISTORY.items()
-        }
-        tmp = HISTORY_FILE + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(raw, f, ensure_ascii=False)
-        os.replace(tmp, HISTORY_FILE)
-    except Exception as e:
-        log.warning("Не смог сохранить %s: %s", HISTORY_FILE, e)
-
-
-def load_last_seen():
-    global last_seen
-    if not os.path.exists(LASTSEEN_FILE):
-        last_seen = {}
+        log.error("Не смог загрузить из Supabase: %s", e)
         return
-    try:
-        with open(LASTSEEN_FILE, "r", encoding="utf-8") as f:
-            raw = json.load(f)
-        last_seen = {}
-        for chat_id_str, (dt_str, text) in raw.items():
+
+    HISTORY = {}
+    last_seen = {}
+
+    for row in res.data or []:
+        chat_id = int(row["chat_id"])
+        key = row["key"]
+        value = row["value"]
+
+        if key == "last_seen":
             try:
-                dt = datetime.fromisoformat(dt_str)
+                dt = datetime.fromisoformat(value["dt"])
+                last_seen[chat_id] = (dt, value["text"])
             except Exception:
-                continue
-            last_seen[int(chat_id_str)] = (dt, text)
-        log.info("last_seen загружен: чатов %d", len(last_seen))
-    except Exception as e:
-        log.warning("Не смог прочитать %s: %s", LASTSEEN_FILE, e)
-        last_seen = {}
+                pass
+        elif key.startswith("history:"):
+            game = key[len("history:"):]
+            HISTORY.setdefault(chat_id, {})[game] = deque(
+                value, maxlen=HISTORY_LIMIT
+            )
+
+    total_vals = sum(
+        len(dq) for games in HISTORY.values() for dq in games.values()
+    )
+    log.info(
+        "Supabase загружен: чатов %d, значений %d, last_seen %d",
+        len(HISTORY), total_vals, len(last_seen),
+    )
 
 
-def save_last_seen():
+def sb_save_history(chat_id: int, game: str):
+    dq = HISTORY.get(chat_id, {}).get(game)
+    if dq is None:
+        return
     try:
-        raw = {str(cid): (dt.isoformat(), text) for cid, (dt, text) in last_seen.items()}
-        tmp = LASTSEEN_FILE + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(raw, f, ensure_ascii=False)
-        os.replace(tmp, LASTSEEN_FILE)
+        supabase.table("kv_store").upsert({
+            "chat_id": chat_id,
+            "key": f"history:{game}",
+            "value": list(dq),
+        }).execute()
     except Exception as e:
-        log.warning("Не смог сохранить %s: %s", LASTSEEN_FILE, e)
+        log.warning("Supabase save history: %s", e)
+
+
+def sb_save_last_seen(chat_id: int):
+    data = last_seen.get(chat_id)
+    if not data:
+        return
+    dt, text = data
+    try:
+        supabase.table("kv_store").upsert({
+            "chat_id": chat_id,
+            "key": "last_seen",
+            "value": {"dt": dt.isoformat(), "text": text},
+        }).execute()
+    except Exception as e:
+        log.warning("Supabase save last_seen: %s", e)
 
 
 # ==================== УТИЛЫ ====================
@@ -223,7 +231,7 @@ async def track_dice(message: Message):
         return
     hist = get_hist(message.chat.id, game)
     hist.append(d.value)
-    save_history()
+    sb_save_history(message.chat.id, game)
     log.info("  → записано в %s (всего: %d)", game, len(hist))
 
 
@@ -232,31 +240,20 @@ async def track_dice(message: Message):
 
 @dp.message(Command("kapchenkainfo"))
 async def kapchenkainfo(message: Message):
-    log.info(
-        "/kapchenkainfo от %s в чате %s (type=%s)",
-        message.from_user.id if message.from_user else "?",
-        message.chat.id,
-        message.chat.type,
-    )
     if message.chat.type not in ("group", "supergroup"):
         await tracked_reply(message, "Только для групп.")
         return
-
     data = last_seen.get(message.chat.id)
     if not data:
         await tracked_reply(
             message,
-            f"Пользователь {TARGET_ID} ещё не писал(а) в этом чате "
-            f"с момента запуска (или последнего сброса) бота.\n"
-            f"<i>В памяти чатов: {len(last_seen)}</i>",
+            f"Пользователь {TARGET_ID} ещё не писал(а) в этом чате.",
         )
         return
-
     dt, text = data
     total = int((now_utc() - dt).total_seconds())
     h, rem = divmod(total, 3600)
     m, s = divmod(rem, 60)
-
     await tracked_reply(
         message,
         f"<b>ID {TARGET_ID}</b>\n"
@@ -303,7 +300,7 @@ async def cashistory(message: Message):
             lines.append(f"<b>{game}</b>: нет данных")
             continue
         values = list(dq)
-        lines.append(f"<b>{game}</b>: {len(values)} значений\n<code>{values[-20:]}</code>")
+        lines.append(f"<b>{game}</b>: {len(values)} значений\n<code>{values[-50:]}</code>")
     await tracked_reply(message, "\n".join(lines))
 
 
@@ -311,15 +308,20 @@ async def cashistory(message: Message):
 async def cashistorydebug(message: Message):
     ls = last_seen.get(message.chat.id)
     ls_info = f"{ls[0]:%Y-%m-%d %H:%M:%S} / {ls[1][:30]}" if ls else "нет"
+    total_vals = sum(
+        len(dq) for games in HISTORY.values() for dq in games.values()
+    )
     text = (
         f"chat.id = <code>{message.chat.id}</code>\n"
         f"chat.type = <code>{message.chat.type}</code>\n"
-        f"твой user.id = <code>{message.from_user.id if message.from_user else '?'}</code>\n"
+        f"user.id = <code>{message.from_user.id if message.from_user else '?'}</code>\n"
         f"TARGET_ID = <code>{TARGET_ID}</code>\n"
         f"чатов в истории: <code>{len(HISTORY)}</code>\n"
-        f"ключи: <code>{list(HISTORY.keys())}</code>\n"
+        f"всего значений: <code>{total_vals}</code>\n"
+        f"HISTORY_LIMIT = <code>{HISTORY_LIMIT}</code>\n"
         f"last_seen для этого чата: <code>{ls_info}</code>\n"
-        f"всего чатов в last_seen: <code>{len(last_seen)}</code>"
+        f"всего last_seen: <code>{len(last_seen)}</code>\n"
+        f"Supabase: <code>{SUPABASE_URL}</code>"
     )
     await tracked_reply(message, text)
 
@@ -348,7 +350,7 @@ async def casheset(message: Message):
         return
     dq = get_hist(message.chat.id, game)
     dq.extend(values)
-    save_history()
+    sb_save_history(message.chat.id, game)
     await tracked_reply(message, f"✅ В <b>{game}</b> добавлено {len(values)}. Всего: {len(dq)}")
 
 
@@ -357,7 +359,13 @@ async def cashesetclear(message: Message):
     if message.chat.type not in ("group", "supergroup"):
         return
     HISTORY.pop(message.chat.id, None)
-    save_history()
+    for game in DICE_EMOJI_MAP.values():
+        try:
+            supabase.table("kv_store").delete().eq("chat_id", message.chat.id).eq(
+                "key", f"history:{game}"
+            ).execute()
+        except Exception as e:
+            log.warning("clear history %s: %s", game, e)
     await tracked_reply(message, "🗑 История эмодзи очищена.")
 
 
@@ -366,7 +374,12 @@ async def cashistoryreset_lastseen(message: Message):
     if message.chat.type not in ("group", "supergroup"):
         return
     last_seen.pop(message.chat.id, None)
-    save_last_seen()
+    try:
+        supabase.table("kv_store").delete().eq("chat_id", message.chat.id).eq(
+            "key", "last_seen"
+        ).execute()
+    except Exception as e:
+        log.warning("reset last_seen: %s", e)
     await tracked_reply(message, "🗑 last_seen для этого чата сброшен.")
 
 
@@ -399,12 +412,6 @@ def caspredict_back_kb() -> InlineKeyboardMarkup:
 
 @dp.message(Command("CasPredict", "caspredict"))
 async def caspredict(message: Message):
-    log.info(
-        "/CasPredict от %s в чате %s (type=%s)",
-        message.from_user.id if message.from_user else "?",
-        message.chat.id,
-        message.chat.type,
-    )
     if message.chat.type not in ("group", "supergroup"):
         await tracked_reply(message, "Только для групп.")
         return
@@ -494,18 +501,21 @@ async def caspredict_basketball_cb(cb: CallbackQuery):
     await cb.answer()
 
 
-# ==================== СЛЕЖКА ЗА TARGET_ID (В КОНЦЕ, ЧТОБЫ НЕ ЕЛ КОМАНДЫ) ====================
+# ==================== СЛЕЖКА ЗА TARGET_ID ====================
 
 
 @dp.message(
     F.chat.type.in_({"group", "supergroup"}),
     F.from_user.id == TARGET_ID,
-    ~F.text.startswith("/"),  # не трогаем команды
+    ~F.dice,
+    ~F.text.startswith("/"),
 )
 async def collect(message: Message):
-    text = message.text or message.caption or "<без текста>"
+    text = message.text or message.caption
+    if not text:
+        return
     last_seen[message.chat.id] = (now_utc(), text[:100])
-    save_last_seen()
+    sb_save_last_seen(message.chat.id)
     log.info(
         "👤 TARGET %s написал в чате %s: %s",
         TARGET_ID, message.chat.id, text[:50],
@@ -516,14 +526,24 @@ async def collect(message: Message):
 
 
 async def main():
+    print("=" * 50)
     print("Запуск бота...")
-    print(f"BASE_DIR = {BASE_DIR}")
-    load_history()
-    load_last_seen()
+    print(f"Supabase: {SUPABASE_URL}")
+    print(f"HISTORY_LIMIT: {HISTORY_LIMIT}")
+    sb_load_all()
     me = await bot.get_me()
-    print(f"Подключился как @{me.username}")
+    print(f"Подключился как @{me.username} (id={me.id})")
+    print("Слушаю апдейты...")
+    print("=" * 50)
     await dp.start_polling(bot)
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass
+    except Exception as e:
+        print("!!! БОТ УПАЛ !!!")
+        print(type(e).__name__, "-", e)
+        raise
