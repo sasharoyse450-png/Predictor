@@ -33,15 +33,16 @@ TOKEN = os.getenv("BOT_TOKEN", "8781607065:AAFn0AbFLUHkcEaQtSgvn2Ix52HksW3_j-0")
 SUPABASE_URL = os.getenv("SUPABASE_URL", "")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
 
-XROCKET_API_KEY = os.getenv("XROCKET_API_KEY", "ae53d0c7d02396598dab6e6dc")
-XROCKET_BASE = os.getenv("XROCKET_BASE", "https://pay.api.xrocket.exchange")
+# xRocket Pay API
+XROCKET_API_KEY = os.getenv("XROCKET_API_KEY", "")
+XROCKET_BASE = "https://pay.api.xrocket.exchange"
 
 REWARD_PER_ANSWER = 0.05
 MIN_WITHDRAW = 0.05
 ADMIN_ID = 8130244626
 
 TZ = ZoneInfo(os.getenv("TZ", "Europe/Moscow"))
-WORK_HOURS = list(range(8, 24))
+WORK_HOURS = list(range(8, 24))  # 8:00 ... 23:00
 
 if not TOKEN:
     print("!!! BOT_TOKEN не задан")
@@ -54,8 +55,8 @@ bot = Bot(TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-ACTIVE_QUESTIONS = {}       # chat_id -> {"question": str, "answer": str}
-ANSWERED_ATTEMPTS = {}      # chat_id -> set(user_id)
+ACTIVE_QUESTIONS = {}   # chat_id -> {"question": str, "answer": str}
+ANSWERED_ATTEMPTS = {}  # chat_id -> set(user_id)
 QUIZ_ENABLED = set()
 
 
@@ -176,12 +177,12 @@ async def log_payout(chat_id, user_id, amount, payout_id, status):
     await asyncio.to_thread(_q)
 
 
-# ==================== XROCKET (пробует несколько endpoint'ов) ====================
+# ==================== XROCKET PAYOUT ====================
 
 
 async def xrocket_payout(chat_id, user_id, amount):
     if not XROCKET_API_KEY:
-        return False, "XROCKET_API_KEY пуст"
+        return False, "XROCKET_API_KEY не задан"
 
     payload = {
         "clientPayoutId": f"quiz_{chat_id}_{user_id}_{int(datetime.now().timestamp())}",
@@ -191,38 +192,34 @@ async def xrocket_payout(chat_id, user_id, amount):
         "amount": f"{amount:.4f}",
         "description": "Quiz reward",
     }
+    headers = {
+        "Authorization": f"Bearer {XROCKET_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    url = f"{XROCKET_BASE}/api/v1/payouts"
 
-    attempts = [
-        ("POST", "https://pay.api.xrocket.exchange/api/v1/payouts",
-         {"Rocket-Pay-Key": XROCKET_API_KEY, "Content-Type": "application/json"}),
-        ("POST", "https://api.xrocket.exchange/api/v1/payouts",
-         {"Rocket-Pay-Key": XROCKET_API_KEY, "Content-Type": "application/json"}),
-        ("POST", "https://pay.api.xrocket.exchange/api/v1/transfer",
-         {"Rocket-Pay-Key": XROCKET_API_KEY, "Content-Type": "application/json"}),
-        ("POST", "https://api.xrocket.exchange/api/v1/transfer",
-         {"Rocket-Pay-Key": XROCKET_API_KEY, "Content-Type": "application/json"}),
-    ]
-
-    last_error = None
-    for method, url, headers in attempts:
-        try:
-            timeout = aiohttp.ClientTimeout(total=8, connect=4)
-            async with aiohttp.ClientSession(timeout=timeout) as s:
-                async with s.request(method, url, headers=headers, json=payload) as r:
-                    text = await r.text()
-                    try:
-                        data = json.loads(text)
-                    except Exception:
-                        data = {"raw": text[:200]}
-                    log.info("xRocket [%s] %s: %s", r.status, url, data)
-                    if r.status in (200, 201):
-                        return True, data.get("payoutId", "") or data.get("id", "")
-                    last_error = data.get("detail") or data.get("title") or str(data)
-        except Exception as e:
-            log.warning("xrocket attempt %s: %s", url, e)
-            last_error = str(e)
-
-    return False, last_error or "Все endpoint'ы отклонили"
+    try:
+        timeout = aiohttp.ClientTimeout(total=15, connect=5)
+        async with aiohttp.ClientSession(timeout=timeout) as s:
+            async with s.post(url, headers=headers, json=payload) as r:
+                text = await r.text()
+                try:
+                    data = json.loads(text)
+                except Exception:
+                    data = {"raw": text[:300]}
+                log.info("xRocket [%s] %s", r.status, data)
+                if r.status in (200, 201):
+                    return True, data.get("payoutId") or data.get("id") or "ok"
+                err = data.get("detail") or data.get("title") or data.get("message") or str(data)
+                return False, err
+    except aiohttp.ClientConnectorError as e:
+        log.warning("xRocket connect error: %s", e)
+        return False, f"Нет соединения с xRocket: {e}"
+    except asyncio.TimeoutError:
+        return False, "xRocket не отвечает (таймаут)"
+    except Exception as e:
+        log.warning("xrocket: %s", e)
+        return False, str(e)
 
 
 # ==================== ВОПРОСЫ ====================
@@ -306,13 +303,15 @@ def admin_text(chat_id):
     status = "🟢 включена" if chat_id in QUIZ_ENABLED else "🔴 выключена"
     current = ACTIVE_QUESTIONS.get(chat_id)
     current_txt = f"\n🔓 Открыт: {current['question']}" if current else ""
+    xr_status = "✅ задан" if XROCKET_API_KEY else "❌ не задан"
     return (
         f"🛠 <b>Админ-панель</b>\n"
         f"Викторина: {status}\n"
         f"Расписание: каждый час с 8:00 до 23:00 ({TZ.key})\n"
         f"Награда: ${REWARD_PER_ANSWER:.2f}\n"
         f"Вывод от: ${MIN_WITHDRAW:.2f}\n"
-        f"Вопросов в базе: {len(QUESTIONS)}"
+        f"Вопросов в базе: {len(QUESTIONS)}\n"
+        f"xRocket key: {xr_status}"
         f"{current_txt}"
     )
 
@@ -420,18 +419,20 @@ async def on_admin_cb(cb: CallbackQuery):
 
 
 async def xrocket_debug():
-    lines = ["🧪 <b>xRocket debug</b>", f"Key: <code>{XROCKET_API_KEY[:12]}...</code>", ""]
+    lines = ["🧪 <b>xRocket debug</b>", f"Key: <code>{XROCKET_API_KEY[:12]}...</code>", f"Base: <code>{XROCKET_BASE}</code>", ""]
+    if not XROCKET_API_KEY:
+        lines.append("❌ XROCKET_API_KEY пуст")
+        return "\n".join(lines)
     tests = [
-        ("GET", "https://pay.api.xrocket.exchange/api/v1/me", {"Rocket-Pay-Key": XROCKET_API_KEY}),
-        ("GET", "https://api.xrocket.exchange/api/v1/me", {"Rocket-Pay-Key": XROCKET_API_KEY}),
-        ("GET", "https://pay.api.xrocket.exchange/api/v1/balance", {"Rocket-Pay-Key": XROCKET_API_KEY}),
+        ("GET", f"{XROCKET_BASE}/api/v1/me"),
+        ("GET", f"{XROCKET_BASE}/api/v1/balance"),
     ]
-    for method, url, headers in tests:
+    for method, url in tests:
         try:
-            timeout = aiohttp.ClientTimeout(total=6)
+            timeout = aiohttp.ClientTimeout(total=8)
             async with aiohttp.ClientSession(timeout=timeout) as s:
-                async with s.request(method, url, headers=headers) as r:
-                    text = (await r.text())[:200]
+                async with s.request(method, url, headers={"Authorization": f"Bearer {XROCKET_API_KEY}"}) as r:
+                    text = (await r.text())[:250]
                     lines.append(f"[{r.status}] <code>{url}</code>\n<code>{text}</code>\n")
         except Exception as e:
             lines.append(f"[ERR] {url}: <code>{e}</code>")
@@ -559,7 +560,8 @@ async def main():
     print("=" * 50)
     print("Запуск Quiz Bot (без ИИ, 500 вопросов)")
     print(f"Вопросов в базе: {len(QUESTIONS)}")
-    print(f"xRocket key: {XROCKET_API_KEY[:12]}...")
+    print(f"xRocket Base: {XROCKET_BASE}")
+    print(f"xRocket key: {'задан' if XROCKET_API_KEY else 'НЕ ЗАДАН'}")
     print(f"Часы: {WORK_HOURS[0]}:00 - {WORK_HOURS[-1]}:00 ({TZ.key})")
     me = await bot.get_me()
     print(f"Подключился как @{me.username}")
