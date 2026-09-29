@@ -12,7 +12,6 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramRetryAfter
 from aiogram.filters import Command, CommandStart
-from aiogram.fsm.storage.base import BaseEventIsolation
 from aiogram.types import (
     Message, CallbackQuery,
     InlineKeyboardMarkup, InlineKeyboardButton,
@@ -51,20 +50,8 @@ if not SUPABASE_URL or not SUPABASE_KEY:
     print("!!! SUPABASE_URL / SUPABASE_KEY не заданы")
     raise SystemExit(1)
 
-
-class NoIsolation(BaseEventIsolation):
-    async def __aenter__(self):
-        return None
-
-    async def __aexit__(self, exc_type, exc, tb):
-        return None
-
-    def lock(self, key):
-        return self
-
-
 bot = Bot(TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
-dp = Dispatcher(events_isolation=NoIsolation())
+dp = Dispatcher()
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 ACTIVE_QUESTIONS = {}       # chat_id -> {"question": str, "answer": str}
@@ -205,7 +192,6 @@ async def xrocket_payout(chat_id, user_id, amount):
         "description": "Quiz reward",
     }
 
-    # Пробуем все комбинации endpoint+header
     attempts = [
         ("POST", "https://pay.api.xrocket.exchange/api/v1/payouts",
          {"Rocket-Pay-Key": XROCKET_API_KEY, "Content-Type": "application/json"}),
@@ -243,7 +229,6 @@ async def xrocket_payout(chat_id, user_id, amount):
 
 
 def pick_question():
-    """Случайный вопрос из 500."""
     return random_question()
 
 
@@ -564,7 +549,6 @@ async def handle_answer(message: Message):
         )
         return
 
-    # неправильный — не блокируем, пусть другие пробуют
     ANSWERED_ATTEMPTS.setdefault(chat_id, set()).add(user_id)
 
 
