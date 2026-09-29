@@ -33,7 +33,6 @@ TOKEN = os.getenv("BOT_TOKEN", "8781607065:AAFn0AbFLUHkcEaQtSgvn2Ix52HksW3_j-0")
 SUPABASE_URL = os.getenv("SUPABASE_URL", "")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
 
-# xRocket Pay API
 XROCKET_API_KEY = os.getenv("XROCKET_API_KEY", "")
 XROCKET_BASE = "https://pay.api.xrocket.exchange"
 
@@ -42,7 +41,7 @@ MIN_WITHDRAW = 0.05
 ADMIN_ID = 8130244626
 
 TZ = ZoneInfo(os.getenv("TZ", "Europe/Moscow"))
-WORK_HOURS = list(range(8, 24))  # 8:00 ... 23:00
+WORK_HOURS = list(range(8, 24))
 
 if not TOKEN:
     print("!!! BOT_TOKEN не задан")
@@ -522,6 +521,8 @@ async def cmd_aiwithdraw(message: Message):
 
 
 # ==================== ОТВЕТЫ (ПОСЛЕДНИМ) ====================
+# ГЛАВНЫЙ ФИКС: закрываем вопрос ДО await-ов, чтобы два параллельных
+# хендлера не начислили награду дважды.
 
 
 @dp.message(F.text & ~F.text.startswith("/"))
@@ -538,19 +539,27 @@ async def handle_answer(message: Message):
     if user_id in ANSWERED_ATTEMPTS.get(chat_id, set()):
         return
 
-    if text == q["answer"]:
+    # неправильный ответ — просто помечаем попытку, вопрос остаётся открыт
+    if text != q["answer"]:
         ANSWERED_ATTEMPTS.setdefault(chat_id, set()).add(user_id)
-        await add_balance(chat_id, user_id, REWARD_PER_ANSWER, count_correct=True)
-        ACTIVE_QUESTIONS.pop(chat_id, None)
-        await safe_send(
-            message.reply,
-            f"🎉 <b>Правильно!</b>\n"
-            f"{message.from_user.first_name} получает <b>${REWARD_PER_ANSWER:.2f}</b>\n"
-            f"Ответ: <b>{q['answer']}</b>"
-        )
         return
 
+    # ПРАВИЛЬНЫЙ — сначала синхронно закрываем вопрос (без await!)
+    # тогда второй параллельный апдейт уже не найдёт q и выйдет
+    popped = ACTIVE_QUESTIONS.pop(chat_id, None)
+    if popped is None:
+        # кто-то успел раньше нас между .get и .pop
+        return
     ANSWERED_ATTEMPTS.setdefault(chat_id, set()).add(user_id)
+
+    # теперь можно идти в Supabase — никто не помешает
+    await add_balance(chat_id, user_id, REWARD_PER_ANSWER, count_correct=True)
+    await safe_send(
+        message.reply,
+        f"🎉 <b>Правильно!</b>\n"
+        f"{message.from_user.first_name} получает <b>${REWARD_PER_ANSWER:.2f}</b>\n"
+        f"Ответ: <b>{q['answer']}</b>"
+    )
 
 
 # ==================== СТАРТ ====================
