@@ -40,8 +40,12 @@ REWARD_PER_ANSWER = 0.05
 MIN_WITHDRAW = 0.05
 ADMIN_ID = 8130244626
 
+# Часовой пояс и рабочие часы
 TZ = ZoneInfo(os.getenv("TZ", "Europe/Moscow"))
-WORK_HOURS = list(range(8, 24))  # 8:00 ... 23:00 включительно
+WORK_HOURS = list(range(8, 24))  # 8:00 ... 23:00
+
+# Закрывать ли вопрос после ПЕРВОГО неправильного ответа?
+CLOSE_ON_WRONG = False
 
 if not TOKEN:
     print("!!! BOT_TOKEN не задан")
@@ -54,10 +58,9 @@ bot = Bot(TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-ACTIVE_QUESTIONS = {}   # chat_id -> {id, question, answer}
-ANSWERED_ATTEMPTS = {}  # chat_id -> set(user_id)
-QUIZ_ENABLED = set()    # chat_id's
-
+ACTIVE_QUESTIONS = {}
+ANSWERED_ATTEMPTS = {}
+QUIZ_ENABLED = set()
 
 # ==================== SUPABASE ====================
 
@@ -237,21 +240,33 @@ async def xrocket_payout(chat_id: int, user_id: int, amount: float):
         "amount": f"{amount:.4f}",
         "description": "Quiz reward",
     }
-    try:
-        async with aiohttp.ClientSession() as s:
-            async with s.post(
-                f"{XROCKET_BASE}/api/v1/payouts",
-                headers={"Authorization": f"Bearer {XROCKET_API_KEY}", "Content-Type": "application/json"},
-                json=payload,
-                timeout=aiohttp.ClientTimeout(total=30),
-            ) as r:
-                data = await r.json()
-                if r.status in (200, 201):
-                    return True, data.get("payoutId", "")
-                return False, data.get("detail") or data.get("title") or str(data)
-    except Exception as e:
-        log.warning("xrocket: %s", e)
-        return False, str(e)
+
+    # Пробуем оба варианта заголовка: Rocket-Pay-Key (Legacy) и Authorization: Bearer (Pay API)
+    header_variants = [
+        {"Rocket-Pay-Key": XROCKET_API_KEY, "Content-Type": "application/json"},
+        {"Authorization": f"Bearer {XROCKET_API_KEY}", "Content-Type": "application/json"},
+    ]
+
+    last_error = None
+    for headers in header_variants:
+        try:
+            async with aiohttp.ClientSession() as s:
+                async with s.post(
+                    f"{XROCKET_BASE}/api/v1/payouts",
+                    headers=headers,
+                    json=payload,
+                    timeout=aiohttp.ClientTimeout(total=30),
+                ) as r:
+                    data = await r.json()
+                    log.info("xRocket resp %s: %s", r.status, data)
+                    if r.status in (200, 201):
+                        return True, data.get("payoutId", "")
+                    last_error = data.get("detail") or data.get("title") or str(data)
+        except Exception as e:
+            log.warning("xrocket attempt: %s", e)
+            last_error = str(e)
+
+    return False, last_error or "Unknown error"
 
 
 # ==================== ВОПРОСЫ ====================
@@ -534,7 +549,14 @@ async def handle_answer(message: Message):
             f"{message.from_user.first_name} получает <b>${REWARD_PER_ANSWER:.2f}</b>"
         )
         return
+
+    # Неправильный ответ
     ANSWERED_ATTEMPTS.setdefault(chat_id, set()).add(user_id)
+    if CLOSE_ON_WRONG:
+        ACTIVE_QUESTIONS.pop(chat_id, None)
+        await message.reply(
+            f"❌ Неправильно. Вопрос закрыт, ждём следующий!"
+        )
 
 
 # ==================== СТАРТ ====================
