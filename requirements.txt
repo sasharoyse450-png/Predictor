@@ -1,2 +1,3 @@
 aiogram==3.13.1
 supabase>=2.0.0
+aiohttp>=3.9.0
