@@ -37,11 +37,22 @@ SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
 XROCKET_API_KEY = os.getenv("XROCKET_API_KEY", "")
 XROCKET_BASE = "https://pay.api.xrocket.exchange"
 
+# ========== ССЫЛКИ XROCKET (вставь свои!) ==========
+# Ссылка на подписку (создаётся в @xRocket → Subscriptions)
+XROCKET_SUBSCRIBE_URL = os.getenv("XROCKET_SUBSCRIBE_URL", "https://t.me/xRocket?start=sub_YOUR_ID")
+# Твоя реферальная ссылка (из @xRocket → Referral)
+XROCKET_REFERRAL_URL = os.getenv("XROCKET_REFERRAL_URL", "https://t.me/xRocket?start=ref_YOUR_ID")
+
 # Награда и уровни
 BASE_REWARD = 0.05
 REWARD_STEP = 0.005
 ANSWERS_PER_LEVEL = 10
 MAX_LEVEL = 10
+
+# Множитель для подписчиков
+SUBSCRIBER_MULTIPLIER = 2.0
+SUBSCRIPTION_PRICE = 0.50
+SUBSCRIPTION_DAYS = 7
 
 MIN_WITHDRAW = 0.05
 DAILY_WITHDRAW_LIMIT = 1.00
@@ -51,6 +62,21 @@ ADMIN_IDS = {8130244626, 6173495222}
 TZ = ZoneInfo(os.getenv("TZ", "Europe/Moscow"))
 WORK_HOURS = list(range(8, 24))
 WITHDRAW_CONFIRM_TTL = 120
+
+# ==================== ФРАЗЫ (пункт 41) ====================
+
+CORRECT_PHRASES = [
+    "🎉 <b>Правильно!</b>",
+    "🔥 <b>В точку!</b>",
+    "💎 <b>Красавчик!</b>",
+    "⚡ <b>Молниеносно!</b>",
+    "🧠 <b>Умница!</b>",
+    "🏆 <b>Есть!</b>",
+    "✨ <b>Верно!</b>",
+    "🚀 <b>Полетели!</b>",
+    "🎯 <b>Точно в цель!</b>",
+    "🌟 <b>Блестяще!</b>",
+]
 
 # ==================== УРОВНИ ====================
 
@@ -89,13 +115,15 @@ def level_info(correct_answers: int):
     return lvl, emoji, name, reward, title_str, progress
 
 
-def reward_for(correct_answers: int) -> float:
+def reward_for(correct_answers: int, is_subscriber: bool = False) -> float:
     lvl = level_from_correct(correct_answers)
-    return round(BASE_REWARD + (lvl - 1) * REWARD_STEP, 4)
+    base = BASE_REWARD + (lvl - 1) * REWARD_STEP
+    if is_subscriber:
+        base *= SUBSCRIBER_MULTIPLIER
+    return round(base, 4)
 
 
 def make_progress_bar(correct_answers: int) -> str:
-    """Возвращает '▓▓▓▒▒▒▒▒▒▒ 3/10'."""
     lvl = level_from_correct(correct_answers)
     if lvl >= MAX_LEVEL:
         return "▓" * 10 + " 10/10"
@@ -120,6 +148,7 @@ ACTIVE_QUESTIONS = {}
 QUIZ_ENABLED = set()
 PENDING_WITHDRAWS = {}
 BANNED_CACHE = {}
+SUBSCRIBERS_CACHE = {}  # chat_id -> set(user_id)
 HTTP_SESSION: aiohttp.ClientSession | None = None
 
 
@@ -234,6 +263,20 @@ def load_bans_sync():
         return {}
 
 
+def load_subscribers_sync():
+    """Загружает активных подписчиков (у кого expires_at > now)."""
+    try:
+        now_iso = datetime.now(timezone.utc).isoformat()
+        res = supabase.table("quiz_subscribers").select("chat_id,user_id").gt("expires_at", now_iso).execute()
+        cache = {}
+        for row in res.data or []:
+            cache.setdefault(int(row["chat_id"]), set()).add(int(row["user_id"]))
+        return cache
+    except Exception as e:
+        log.warning("load_subscribers: %s", e)
+        return {}
+
+
 def ban_user_sync(chat_id, user_id, reason, admin_id):
     try:
         supabase.table("quiz_bans").upsert({
@@ -299,10 +342,11 @@ def get_stats_sync():
         players = supabase.table("quiz_players").select("balance,total_won,correct_answers").execute().data or []
         payouts = supabase.table("quiz_payouts").select("amount,status").execute().data or []
         bans = supabase.table("quiz_bans").select("user_id").execute().data or []
-        return players, payouts, bans
+        subs = supabase.table("quiz_subscribers").select("user_id").execute().data or []
+        return players, payouts, bans, subs
     except Exception as e:
         log.warning("get_stats: %s", e)
-        return [], [], []
+        return [], [], [], []
 
 
 def get_payouts_sync(limit=20):
@@ -353,6 +397,10 @@ async def withdrawn_today(chat_id, user_id):
 
 def is_banned_cached(chat_id, user_id) -> bool:
     return user_id in BANNED_CACHE.get(chat_id, set())
+
+
+def is_subscriber_cached(chat_id, user_id) -> bool:
+    return user_id in SUBSCRIBERS_CACHE.get(chat_id, set())
 
 
 async def ban_user(chat_id, user_id, reason, admin_id):
@@ -444,14 +492,23 @@ async def ask_question(chat_id):
     ACTIVE_QUESTIONS[chat_id] = {"question": q, "answer": a.lower()}
     await save_active(chat_id, q, a.lower())
     try:
-        await safe_send(
+        # Пункт 43: анимация "печатает..."
+        await bot.send_chat_action(chat_id, "typing")
+        msg = await safe_send(
             bot.send_message,
             chat_id,
             f"🧠 <b>Вопрос!</b>\n\n"
             f"❓ {q}\n\n"
             f"💰 Награда зависит от уровня: $0.050 — $0.095\n"
+            f"💎 Подписчики получают ×2\n"
             f"🔓 Вопрос открыт, пока кто-то не ответит верно."
         )
+        # Пункт 42: реакция 🧠 на вопрос
+        if msg:
+            try:
+                await bot.set_message_reaction(chat_id, msg.message_id, ["🧠"])
+            except Exception:
+                pass
         return True
     except Exception as e:
         log.warning("send_question: %s", e)
@@ -485,13 +542,15 @@ async def question_scheduler():
         await asyncio.sleep(60)
 
 
-async def bans_refresh_loop():
-    global BANNED_CACHE
+async def caches_refresh_loop():
+    """Обновляем кэши банов и подписчиков раз в 60 секунд."""
+    global BANNED_CACHE, SUBSCRIBERS_CACHE
     while True:
         try:
             BANNED_CACHE = await asyncio.to_thread(load_bans_sync)
+            SUBSCRIBERS_CACHE = await asyncio.to_thread(load_subscribers_sync)
         except Exception as e:
-            log.warning("bans refresh: %s", e)
+            log.warning("caches refresh: %s", e)
         await asyncio.sleep(60)
 
 
@@ -531,6 +590,7 @@ def admin_text(chat_id):
         f"Расписание: каждый час с 8:00 до 23:00 ({TZ.key})\n"
         f"Базовая награда: ${BASE_REWARD:.3f} · +${REWARD_STEP:.3f}/уровень\n"
         f"Макс. награда (ур. 10): ${BASE_REWARD + 9*REWARD_STEP:.3f}\n"
+        f"Подписчики: ×{SUBSCRIBER_MULTIPLIER}\n"
         f"Вывод от: ${MIN_WITHDRAW:.2f} · лимит ${DAILY_WITHDRAW_LIMIT:.2f}/сутки\n"
         f"Вопросов в базе: {len(QUESTIONS)}\n"
         f"xRocket: {xr_status}"
@@ -619,7 +679,7 @@ async def on_admin_cb(cb: CallbackQuery):
 
     if action == "stats":
         await cb.answer("Собираю...")
-        players, payouts, bans = await get_stats()
+        players, payouts, bans, subs = await get_stats()
         tb = sum(float(p["balance"]) for p in players)
         tw = sum(float(p["total_won"]) for p in players)
         tc = sum(int(p["correct_answers"]) for p in players)
@@ -631,6 +691,7 @@ async def on_admin_cb(cb: CallbackQuery):
             f"📊 <b>Статистика</b>\n\n"
             f"👥 Игроков: {len(players)}\n"
             f"🏆 Правильных: {tc}\n"
+            f"💎 Подписчиков: {len(subs)}\n"
             f"🚫 Забанено: {len(bans)}\n\n"
             f"💰 Балансов: ${tb:.4f}\n"
             f"📈 Заработано: ${tw:.4f}\n"
@@ -725,12 +786,17 @@ async def xrocket_debug():
 
 @dp.message(CommandStart())
 async def cmd_start(message: Message):
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="💎 Оформить подписку $0.50/нед", url=XROCKET_SUBSCRIBE_URL)],
+        [InlineKeyboardButton(text="🔗 Партнёрка xRocket", url=XROCKET_REFERRAL_URL)],
+    ])
     await safe_send(
         message.reply,
         f"👋 <b>Викторина с уровнями!</b>\n\n"
         f"🎯 10 уровней, каждый +${REWARD_STEP:.3f} к награде\n"
         f"📈 Новый уровень за каждые {ANSWERS_PER_LEVEL} правильных ответов\n"
         f"💰 Уровень 1: ${BASE_REWARD:.3f} · Уровень 10: ${BASE_REWARD + 9*REWARD_STEP:.3f}\n"
+        f"💎 Подписчики получают <b>×{SUBSCRIBER_MULTIPLIER}</b> к награде\n"
         f"⏰ Вопрос каждый час с 8:00 до 23:00\n"
         f"💸 Вывод от ${MIN_WITHDRAW:.2f}\n\n"
         f"<b>Команды:</b>\n"
@@ -738,7 +804,25 @@ async def cmd_start(message: Message):
         f"/AiProfile — полный профиль\n"
         f"/AiTop — топ игроков\n"
         f"/AiLevels — все уровни\n"
-        f"/AiWithdraw — вывод"
+        f"/AiWithdraw — вывод",
+        reply_markup=kb,
+    )
+
+
+@dp.message(Command("AiSubscribe"))
+async def cmd_aisubscribe(message: Message):
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="💎 Оформить подписку $0.50/нед", url=XROCKET_SUBSCRIBE_URL)],
+    ])
+    await safe_send(
+        message.reply,
+        f"💎 <b>Подписка ×{SUBSCRIBER_MULTIPLIER} к награде</b>\n\n"
+        f"Цена: <b>${SUBSCRIPTION_PRICE:.2f}/нед</b>\n"
+        f"Что даёт:\n"
+        f"• ×{SUBSCRIBER_MULTIPLIER} к награде за правильный ответ\n"
+        f"• Титул 💎 в профиле\n\n"
+        f"Оформляется через @xrocket по кнопке ниже.",
+        reply_markup=kb,
     )
 
 
@@ -752,12 +836,14 @@ async def cmd_aibalance(message: Message):
     ca = int(p["correct_answers"])
     lvl, emoji, name, reward, title_str, progress = level_info(ca)
     bar = make_progress_bar(ca)
+    sub = is_subscriber_cached(message.chat.id, message.from_user.id)
+    sub_line = f"\n💎 Подписка активна · ×{SUBSCRIBER_MULTIPLIER}" if sub else ""
 
     await safe_send(
         message.reply,
         f"💰 <b>${float(p['balance']):.4f}</b>\n"
         f"🎖 {title_str}\n"
-        f"💵 Награда за ответ: <b>${reward:.3f}</b>\n"
+        f"💵 Награда за ответ: <b>${reward:.3f}</b>{sub_line}\n"
         f"🏆 Правильных: {ca}\n"
         f"<code>{bar}</code>\n"
         f"💸 Выведено сегодня: ${today:.4f} / ${DAILY_WITHDRAW_LIMIT:.2f}"
@@ -773,6 +859,7 @@ async def cmd_aiprofile(message: Message):
     ca = int(p["correct_answers"])
     lvl, emoji, name, reward, title_str, progress = level_info(ca)
     bar = make_progress_bar(ca)
+    sub = is_subscriber_cached(message.chat.id, message.from_user.id)
 
     def _place():
         try:
@@ -803,11 +890,13 @@ async def cmd_aiprofile(message: Message):
             f"<b>{remaining}</b> отв. · награда будет ${next_reward:.3f}"
         )
 
+    sub_line = f"\n💎 Подписка: <b>активна</b> (×{SUBSCRIBER_MULTIPLIER})" if sub else "\n💎 Подписка: нет"
+
     await safe_send(
         message.reply,
         f"👤 <b>{message.from_user.first_name}</b>\n\n"
         f"🎖 <b>{title_str}</b>\n"
-        f"💵 Награда за ответ: <b>${reward:.3f}</b>\n\n"
+        f"💵 Награда за ответ: <b>${reward:.3f}</b>{sub_line}\n\n"
         f"<code>{bar}</code>\n"
         f"{next_line}\n\n"
         f"💰 Баланс: <b>${float(p['balance']):.4f}</b>\n"
@@ -900,7 +989,8 @@ async def cmd_aiwithdraw(message: Message):
         f"💸 <b>Подтверждение вывода</b>\n\n"
         f"Сумма: <b>${amount:.4f}</b> USDT\n"
         f"Куда: на твой Telegram ID <code>{user_id}</code>\n\n"
-        f"⚠️ <b>Чтобы вывод прошёл, ты должен зайти в @xrocket</b> "
+        f"⚠️ <b>Чтобы вывод прошёл, ты должен зайти в "
+        f"<a href=\"{XROCKET_REFERRAL_URL}\">@xrocket</a></b> "
         f"и активировать там свой аккаунт. Без этого выплата не дойдёт.\n\n"
         f"Подтверди вывод кнопкой ниже. Запрос действует "
         f"{WITHDRAW_CONFIRM_TTL // 60} мин."
@@ -1040,7 +1130,14 @@ async def handle_answer(message: Message):
         return
 
     text = (message.text or "").strip().lower()
+
+    # Пункт 42: реакция ❌ на неправильный ответ (только если от админа)
     if text != q["answer"]:
+        if is_admin(user_id):
+            try:
+                await bot.set_message_reaction(chat_id, message.message_id, ["❌"])
+            except Exception:
+                pass
         return
 
     if is_banned_cached(chat_id, user_id):
@@ -1053,7 +1150,8 @@ async def handle_answer(message: Message):
     p = await get_player(chat_id, user_id,
                          message.from_user.username, message.from_user.first_name)
     old_level = level_from_correct(int(p["correct_answers"]))
-    reward = reward_for(int(p["correct_answers"]))
+    sub = is_subscriber_cached(chat_id, user_id)
+    reward = reward_for(int(p["correct_answers"]), is_subscriber=sub)
 
     await asyncio.gather(
         clear_active(chat_id),
@@ -1063,10 +1161,13 @@ async def handle_answer(message: Message):
 
     new_correct = int(p["correct_answers"]) + 1
     new_level = level_from_correct(new_correct)
-    _, emoji, name, new_reward, title_str, progress = level_info(new_correct)
+
+    # Пункт 41: случайная фраза
+    phrase = random.choice(CORRECT_PHRASES)
+    sub_badge = " 💎×2" if sub else ""
 
     msg = (
-        f"🎉 <b>Правильно!</b>\n"
+        f"{phrase}{sub_badge}\n"
         f"{message.from_user.first_name} получает <b>${reward:.3f}</b>\n"
         f"<i>Ответ: {q['answer']}</i>"
     )
@@ -1074,12 +1175,26 @@ async def handle_answer(message: Message):
     if new_level > old_level:
         emoji_new = LEVELS[new_level - 1][1]
         name_new = LEVELS[new_level - 1][2]
+        new_reward = reward_for(new_correct, is_subscriber=sub)
         msg += (
             f"\n\n{emoji_new} <b>НОВЫЙ УРОВЕНЬ {new_level}!</b>\n"
             f"🎖 {name_new} · теперь <b>${new_reward:.3f}</b> за ответ"
         )
 
-    await safe_send(message.reply, msg)
+    # Пункт 43: анимация + отправка
+    try:
+        await bot.send_chat_action(chat_id, "typing")
+    except Exception:
+        pass
+
+    sent = await safe_send(message.reply, msg)
+
+    # Пункт 42: реакция ✅ на правильный ответ
+    if sent:
+        try:
+            await bot.set_message_reaction(chat_id, message.message_id, ["✅"])
+        except Exception:
+            pass
 
 
 # ==================== СТАРТ ====================
@@ -1087,19 +1202,21 @@ async def handle_answer(message: Message):
 
 async def main():
     print("=" * 50)
-    print("Quiz Bot · 10 уровней · награда растёт")
+    print("Quiz Bot · 10 уровней · подписка · партнёрка")
     print(f"Вопросов: {len(QUESTIONS)}")
     print(f"Награда: ${BASE_REWARD:.3f} (ур.1) → ${BASE_REWARD + 9*REWARD_STEP:.3f} (ур.10)")
-    print(f"Уровень каждые {ANSWERS_PER_LEVEL} правильных")
+    print(f"Подписка: ${SUBSCRIPTION_PRICE}/нед → ×{SUBSCRIBER_MULTIPLIER}")
     print(f"Админы: {sorted(ADMIN_IDS)}")
 
     await get_http()
     await asyncio.to_thread(unlock_all_withdrawals_sync)
 
-    global BANNED_CACHE
+    global BANNED_CACHE, SUBSCRIBERS_CACHE
     BANNED_CACHE = await asyncio.to_thread(load_bans_sync)
+    SUBSCRIBERS_CACHE = await asyncio.to_thread(load_subscribers_sync)
     total_bans = sum(len(s) for s in BANNED_CACHE.values())
-    print(f"Банов в кэше: {total_bans}")
+    total_subs = sum(len(s) for s in SUBSCRIBERS_CACHE.values())
+    print(f"Банов в кэше: {total_bans} · Подписчиков: {total_subs}")
 
     active_rows = await asyncio.to_thread(load_active_sync)
     for row in active_rows:
@@ -1114,7 +1231,7 @@ async def main():
     me = await bot.get_me()
     print(f"Подключился как @{me.username}")
     asyncio.create_task(question_scheduler())
-    asyncio.create_task(bans_refresh_loop())
+    asyncio.create_task(caches_refresh_loop())
     print("Запущен.")
     print("=" * 50)
 
