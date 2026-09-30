@@ -37,7 +37,12 @@ SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
 XROCKET_API_KEY = os.getenv("XROCKET_API_KEY", "")
 XROCKET_BASE = "https://pay.api.xrocket.exchange"
 
-REWARD_PER_ANSWER = 0.05
+# Награда и уровни
+BASE_REWARD = 0.05
+REWARD_STEP = 0.005
+ANSWERS_PER_LEVEL = 10
+MAX_LEVEL = 10
+
 MIN_WITHDRAW = 0.05
 DAILY_WITHDRAW_LIMIT = 1.00
 
@@ -46,6 +51,59 @@ ADMIN_IDS = {8130244626, 6173495222}
 TZ = ZoneInfo(os.getenv("TZ", "Europe/Moscow"))
 WORK_HOURS = list(range(8, 24))
 WITHDRAW_CONFIRM_TTL = 120
+
+# ==================== УРОВНИ ====================
+
+LEVELS = [
+    (1, "🐣", "Новичок"),
+    (2, "🥚", "Ученик"),
+    (3, "🐥", "Знаток"),
+    (4, "🦅", "Эксперт"),
+    (5, "🧠", "Мастер"),
+    (6, "🎓", "Гуру"),
+    (7, "💎", "Легенда"),
+    (8, "👑", "Гений"),
+    (9, "🔥", "Титан"),
+    (10, "⚡", "Бог викторины"),
+]
+
+
+def level_from_correct(correct_answers: int) -> int:
+    lvl = correct_answers // ANSWERS_PER_LEVEL + 1
+    return min(lvl, MAX_LEVEL)
+
+
+def level_info(correct_answers: int):
+    lvl = level_from_correct(correct_answers)
+    emoji, name = LEVELS[lvl - 1][1], LEVELS[lvl - 1][2]
+    reward = BASE_REWARD + (lvl - 1) * REWARD_STEP
+    title_str = f"{emoji} {name} (ур. {lvl})"
+
+    if lvl >= MAX_LEVEL:
+        progress = "🏆 Максимальный уровень!"
+    else:
+        in_level = correct_answers - (lvl - 1) * ANSWERS_PER_LEVEL
+        remaining = ANSWERS_PER_LEVEL - in_level
+        progress = f"до след. уровня: {remaining} отв."
+
+    return lvl, emoji, name, reward, title_str, progress
+
+
+def reward_for(correct_answers: int) -> float:
+    lvl = level_from_correct(correct_answers)
+    return round(BASE_REWARD + (lvl - 1) * REWARD_STEP, 4)
+
+
+def make_progress_bar(correct_answers: int) -> str:
+    """Возвращает '▓▓▓▒▒▒▒▒▒▒ 3/10'."""
+    lvl = level_from_correct(correct_answers)
+    if lvl >= MAX_LEVEL:
+        return "▓" * 10 + " 10/10"
+    in_level = correct_answers - (lvl - 1) * ANSWERS_PER_LEVEL
+    filled = in_level
+    bar = "▓" * filled + "▒" * (ANSWERS_PER_LEVEL - filled)
+    return f"{bar} {in_level}/{ANSWERS_PER_LEVEL}"
+
 
 if not TOKEN:
     print("!!! BOT_TOKEN не задан")
@@ -61,7 +119,7 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 ACTIVE_QUESTIONS = {}
 QUIZ_ENABLED = set()
 PENDING_WITHDRAWS = {}
-BANNED_CACHE = {}   # chat_id -> set(user_id)
+BANNED_CACHE = {}
 HTTP_SESSION: aiohttp.ClientSession | None = None
 
 
@@ -229,7 +287,7 @@ def get_top_sync(chat_id, limit=10):
     try:
         res = supabase.table("quiz_players").select(
             "user_id,username,first_name,balance,correct_answers"
-        ).eq("chat_id", chat_id).order("balance", desc=True).limit(limit).execute()
+        ).eq("chat_id", chat_id).order("correct_answers", desc=True).limit(limit).execute()
         return res.data or []
     except Exception as e:
         log.warning("get_top: %s", e)
@@ -294,7 +352,6 @@ async def withdrawn_today(chat_id, user_id):
 
 
 def is_banned_cached(chat_id, user_id) -> bool:
-    """Мгновенная проверка без SQL — из кэша в памяти."""
     return user_id in BANNED_CACHE.get(chat_id, set())
 
 
@@ -332,7 +389,7 @@ async def log_payout(chat_id, user_id, amount, payout_id, status):
     await asyncio.to_thread(log_payout_sync, chat_id, user_id, amount, payout_id, status)
 
 
-# ==================== XROCKET PAYOUT ====================
+# ==================== XROCKET ====================
 
 
 async def xrocket_payout(chat_id, user_id, amount):
@@ -352,7 +409,6 @@ async def xrocket_payout(chat_id, user_id, amount):
         "Content-Type": "application/json",
     }
     url = f"{XROCKET_BASE}/api/v1/payouts"
-
     try:
         s = await get_http()
         async with s.post(url, headers=headers, json=payload) as r:
@@ -367,12 +423,10 @@ async def xrocket_payout(chat_id, user_id, amount):
             err = data.get("detail") or data.get("title") or data.get("message") or str(data)
             return False, err
     except aiohttp.ClientConnectorError as e:
-        log.warning("xRocket connect error: %s", e)
         return False, f"Нет соединения с xRocket: {e}"
     except asyncio.TimeoutError:
         return False, "xRocket не отвечает (таймаут)"
     except Exception as e:
-        log.warning("xrocket: %s", e)
         return False, str(e)
 
 
@@ -395,7 +449,7 @@ async def ask_question(chat_id):
             chat_id,
             f"🧠 <b>Вопрос!</b>\n\n"
             f"❓ {q}\n\n"
-            f"💰 Первый правильный ответ → <b>${REWARD_PER_ANSWER:.2f}</b>\n"
+            f"💰 Награда зависит от уровня: $0.050 — $0.095\n"
             f"🔓 Вопрос открыт, пока кто-то не ответит верно."
         )
         return True
@@ -432,7 +486,6 @@ async def question_scheduler():
 
 
 async def bans_refresh_loop():
-    """Обновляем кэш банов раз в 60 секунд."""
     global BANNED_CACHE
     while True:
         try:
@@ -476,7 +529,8 @@ def admin_text(chat_id):
         f"🛠 <b>Админ-панель</b>\n"
         f"Викторина: {status}\n"
         f"Расписание: каждый час с 8:00 до 23:00 ({TZ.key})\n"
-        f"Награда: ${REWARD_PER_ANSWER:.2f}\n"
+        f"Базовая награда: ${BASE_REWARD:.3f} · +${REWARD_STEP:.3f}/уровень\n"
+        f"Макс. награда (ур. 10): ${BASE_REWARD + 9*REWARD_STEP:.3f}\n"
         f"Вывод от: ${MIN_WITHDRAW:.2f} · лимит ${DAILY_WITHDRAW_LIMIT:.2f}/сутки\n"
         f"Вопросов в базе: {len(QUESTIONS)}\n"
         f"xRocket: {xr_status}"
@@ -489,7 +543,6 @@ def admin_text(chat_id):
 
 @dp.message(Command("AiAdmin"))
 async def cmd_aiadmin(message: Message):
-    log.info("/AiAdmin от %s", message.from_user.id if message.from_user else "?")
     if not message.from_user or not is_admin(message.from_user.id):
         return
     if message.chat.type not in ("group", "supergroup"):
@@ -608,9 +661,13 @@ async def on_admin_cb(cb: CallbackQuery):
             return
         lines = ["🏆 <b>Топ чата</b>"]
         for i, row in enumerate(rows, 1):
-            name = row.get("first_name") or row.get("username") or str(row["user_id"])
+            ca = int(row.get("correct_answers", 0))
+            lvl, emoji, name, reward, title_str, _ = level_info(ca)
+            player_name = row.get("first_name") or row.get("username") or str(row["user_id"])
             medal = ["🥇", "🥈", "🥉"][i-1] if i <= 3 else f"{i}."
-            lines.append(f"{medal} {name} — ${float(row['balance']):.4f} ({row['correct_answers']} отв.) · <code>{row['user_id']}</code>")
+            lines.append(
+                f"{medal} {emoji} {player_name} — {ca} отв. · ${float(row['balance']):.4f} · <code>{row['user_id']}</code>"
+            )
         await safe_send(cb.message.answer, "\n".join(lines))
         return
 
@@ -668,37 +725,117 @@ async def xrocket_debug():
 
 @dp.message(CommandStart())
 async def cmd_start(message: Message):
-    log.info("/start от %s", message.from_user.id if message.from_user else "?")
     await safe_send(
         message.reply,
-        f"👋 <b>Викторина!</b>\n\n"
-        f"💰 ${REWARD_PER_ANSWER:.2f} за первый правильный ответ\n"
-        f"⏰ Каждый час с 8:00 до 23:00\n"
-        f"💸 Вывод от ${MIN_WITHDRAW:.2f} (лимит ${DAILY_WITHDRAW_LIMIT:.2f}/сутки)\n\n"
-        f"<b>Команды:</b>\n/AiBalance · /AiWithdraw · /AiTop"
+        f"👋 <b>Викторина с уровнями!</b>\n\n"
+        f"🎯 10 уровней, каждый +${REWARD_STEP:.3f} к награде\n"
+        f"📈 Новый уровень за каждые {ANSWERS_PER_LEVEL} правильных ответов\n"
+        f"💰 Уровень 1: ${BASE_REWARD:.3f} · Уровень 10: ${BASE_REWARD + 9*REWARD_STEP:.3f}\n"
+        f"⏰ Вопрос каждый час с 8:00 до 23:00\n"
+        f"💸 Вывод от ${MIN_WITHDRAW:.2f}\n\n"
+        f"<b>Команды:</b>\n"
+        f"/AiBalance — баланс и уровень\n"
+        f"/AiProfile — полный профиль\n"
+        f"/AiTop — топ игроков\n"
+        f"/AiLevels — все уровни\n"
+        f"/AiWithdraw — вывод"
     )
 
 
 @dp.message(Command("AiBalance"))
 async def cmd_aibalance(message: Message):
-    log.info("/AiBalance от %s", message.from_user.id if message.from_user else "?")
     if message.chat.type not in ("group", "supergroup") or not message.from_user:
         return
     p = await get_player(message.chat.id, message.from_user.id,
                          message.from_user.username, message.from_user.first_name)
     today = await withdrawn_today(message.chat.id, message.from_user.id)
+    ca = int(p["correct_answers"])
+    lvl, emoji, name, reward, title_str, progress = level_info(ca)
+    bar = make_progress_bar(ca)
+
     await safe_send(
         message.reply,
         f"💰 <b>${float(p['balance']):.4f}</b>\n"
-        f"🏆 Правильных: {p['correct_answers']}\n"
-        f"📈 Всего: ${float(p['total_won']):.4f}\n"
+        f"🎖 {title_str}\n"
+        f"💵 Награда за ответ: <b>${reward:.3f}</b>\n"
+        f"🏆 Правильных: {ca}\n"
+        f"<code>{bar}</code>\n"
         f"💸 Выведено сегодня: ${today:.4f} / ${DAILY_WITHDRAW_LIMIT:.2f}"
     )
 
 
+@dp.message(Command("AiProfile"))
+async def cmd_aiprofile(message: Message):
+    if message.chat.type not in ("group", "supergroup") or not message.from_user:
+        return
+    p = await get_player(message.chat.id, message.from_user.id,
+                         message.from_user.username, message.from_user.first_name)
+    ca = int(p["correct_answers"])
+    lvl, emoji, name, reward, title_str, progress = level_info(ca)
+    bar = make_progress_bar(ca)
+
+    def _place():
+        try:
+            res = supabase.table("quiz_players").select("user_id").eq(
+                "chat_id", message.chat.id
+            ).order("correct_answers", desc=True).execute()
+            for i, row in enumerate(res.data or [], 1):
+                if int(row["user_id"]) == message.from_user.id:
+                    return i
+            return None
+        except Exception:
+            return None
+    place = await asyncio.to_thread(_place)
+    place_str = f"#{place}" if place else "—"
+
+    today = await withdrawn_today(message.chat.id, message.from_user.id)
+
+    if lvl >= MAX_LEVEL:
+        next_line = "🏆 Максимальный уровень!"
+    else:
+        in_level = ca - (lvl - 1) * ANSWERS_PER_LEVEL
+        remaining = ANSWERS_PER_LEVEL - in_level
+        next_emoji = LEVELS[lvl][1]
+        next_name = LEVELS[lvl][2]
+        next_reward = BASE_REWARD + lvl * REWARD_STEP
+        next_line = (
+            f"⬆️ До {next_emoji} <b>{next_name}</b> (ур. {lvl+1}): "
+            f"<b>{remaining}</b> отв. · награда будет ${next_reward:.3f}"
+        )
+
+    await safe_send(
+        message.reply,
+        f"👤 <b>{message.from_user.first_name}</b>\n\n"
+        f"🎖 <b>{title_str}</b>\n"
+        f"💵 Награда за ответ: <b>${reward:.3f}</b>\n\n"
+        f"<code>{bar}</code>\n"
+        f"{next_line}\n\n"
+        f"💰 Баланс: <b>${float(p['balance']):.4f}</b>\n"
+        f"📈 Всего заработано: ${float(p['total_won']):.4f}\n"
+        f"💸 Выведено сегодня: ${today:.4f}\n\n"
+        f"🏆 Правильных ответов: <b>{ca}</b>\n"
+        f"📍 Место в чате: <b>{place_str}</b>"
+    )
+
+
+@dp.message(Command("AiLevels"))
+async def cmd_ailevels(message: Message):
+    if message.chat.type not in ("group", "supergroup"):
+        return
+    lines = ["🎖 <b>Уровни и награды</b>\n"]
+    for lvl, emoji, name in LEVELS:
+        reward = BASE_REWARD + (lvl - 1) * REWARD_STEP
+        min_answers = (lvl - 1) * ANSWERS_PER_LEVEL
+        if lvl == MAX_LEVEL:
+            req = f"{min_answers}+ ответов"
+        else:
+            req = f"{min_answers}-{min_answers + ANSWERS_PER_LEVEL - 1} ответов"
+        lines.append(f"{emoji} <b>Ур. {lvl}</b> · {name} · <b>${reward:.3f}</b> · <i>{req}</i>")
+    await safe_send(message.reply, "\n".join(lines))
+
+
 @dp.message(Command("AiTop"))
 async def cmd_aitop(message: Message):
-    log.info("/AiTop от %s", message.from_user.id if message.from_user else "?")
     if message.chat.type not in ("group", "supergroup"):
         return
     rows = await get_top(message.chat.id, 10)
@@ -706,21 +843,24 @@ async def cmd_aitop(message: Message):
         await safe_send(message.reply, "Никто не играл.")
         return
     admin_view = message.from_user and is_admin(message.from_user.id)
-    lines = ["🏆 <b>Топ игроков</b>"]
+    lines = ["🏆 <b>Топ по правильным ответам</b>"]
     for i, row in enumerate(rows, 1):
-        name = row.get("first_name") or row.get("username") or str(row["user_id"])
+        ca = int(row.get("correct_answers", 0))
+        lvl, emoji, name, reward, title_str, _ = level_info(ca)
+        player_name = row.get("first_name") or row.get("username") or str(row["user_id"])
         medal = ["🥇", "🥈", "🥉"][i-1] if i <= 3 else f"{i}."
         uid = f" · <code>{row['user_id']}</code>" if admin_view else ""
-        lines.append(f"{medal} {name} — ${float(row['balance']):.4f} ({row['correct_answers']} отв.){uid}")
+        lines.append(
+            f"{medal} {emoji} {player_name} — {ca} отв. · ${float(row['balance']):.4f}{uid}"
+        )
     await safe_send(message.reply, "\n".join(lines))
 
 
-# ==================== ВЫВОД С ПОДТВЕРЖДЕНИЕМ ====================
+# ==================== ВЫВОД ====================
 
 
 @dp.message(Command("AiWithdraw"))
 async def cmd_aiwithdraw(message: Message):
-    log.info("/AiWithdraw от %s", message.from_user.id if message.from_user else "?")
     if message.chat.type not in ("group", "supergroup") or not message.from_user:
         return
 
@@ -796,7 +936,6 @@ async def on_withdraw_cb(cb: CallbackQuery):
     if not cb.from_user or not isinstance(cb.message, Message):
         await cb.answer()
         return
-
     parts = cb.data.split(":")
     if len(parts) != 3:
         await cb.answer("Ошибка", show_alert=True)
@@ -807,7 +946,6 @@ async def on_withdraw_cb(cb: CallbackQuery):
     except ValueError:
         await cb.answer("Ошибка", show_alert=True)
         return
-
     if cb.from_user.id != owner_id:
         await cb.answer("⛔ Это не твой запрос.", show_alert=True)
         return
@@ -887,9 +1025,7 @@ async def on_withdraw_cb(cb: CallbackQuery):
         await unlock_withdraw(chat_id, user_id)
 
 
-# ==================== ОТВЕТЫ (ПОСЛЕДНИМ) ====================
-# Оптимизация: НЕ лезем в Supabase на каждое сообщение.
-# Ban-проверка идёт из памяти, а q — из ACTIVE_QUESTIONS.
+# ==================== ОТВЕТЫ ====================
 
 
 @dp.message(F.text & ~F.text.startswith("/"))
@@ -899,7 +1035,6 @@ async def handle_answer(message: Message):
     chat_id = message.chat.id
     user_id = message.from_user.id
 
-    # сначала быстрая проверка: есть ли активный вопрос в этом чате?
     q = ACTIVE_QUESTIONS.get(chat_id)
     if not q:
         return
@@ -908,28 +1043,43 @@ async def handle_answer(message: Message):
     if text != q["answer"]:
         return
 
-    # проверка бана — из кэша, без SQL
     if is_banned_cached(chat_id, user_id):
         return
 
-    # атомарный pop до await
     popped = ACTIVE_QUESTIONS.pop(chat_id, None)
     if popped is None:
         return
 
-    # параллельно: очистка в БД + начисление
+    p = await get_player(chat_id, user_id,
+                         message.from_user.username, message.from_user.first_name)
+    old_level = level_from_correct(int(p["correct_answers"]))
+    reward = reward_for(int(p["correct_answers"]))
+
     await asyncio.gather(
         clear_active(chat_id),
-        add_balance(chat_id, user_id, REWARD_PER_ANSWER, count_correct=True),
+        add_balance(chat_id, user_id, reward, count_correct=True),
         return_exceptions=True,
     )
 
-    await safe_send(
-        message.reply,
+    new_correct = int(p["correct_answers"]) + 1
+    new_level = level_from_correct(new_correct)
+    _, emoji, name, new_reward, title_str, progress = level_info(new_correct)
+
+    msg = (
         f"🎉 <b>Правильно!</b>\n"
-        f"{message.from_user.first_name} получает <b>${REWARD_PER_ANSWER:.2f}</b>\n"
-        f"Ответ: <b>{q['answer']}</b>"
+        f"{message.from_user.first_name} получает <b>${reward:.3f}</b>\n"
+        f"<i>Ответ: {q['answer']}</i>"
     )
+
+    if new_level > old_level:
+        emoji_new = LEVELS[new_level - 1][1]
+        name_new = LEVELS[new_level - 1][2]
+        msg += (
+            f"\n\n{emoji_new} <b>НОВЫЙ УРОВЕНЬ {new_level}!</b>\n"
+            f"🎖 {name_new} · теперь <b>${new_reward:.3f}</b> за ответ"
+        )
+
+    await safe_send(message.reply, msg)
 
 
 # ==================== СТАРТ ====================
@@ -937,27 +1087,20 @@ async def handle_answer(message: Message):
 
 async def main():
     print("=" * 50)
-    print("Запуск Quiz Bot (быстрая версия, 2 админа)")
-    print(f"Вопросов в базе: {len(QUESTIONS)}")
-    print(f"xRocket Base: {XROCKET_BASE}")
-    print(f"xRocket key: {'задан' if XROCKET_API_KEY else 'НЕ ЗАДАН'}")
-    print(f"Часы: {WORK_HOURS[0]}:00 - {WORK_HOURS[-1]}:00 ({TZ.key})")
-    print(f"Награда: ${REWARD_PER_ANSWER} · вывод от ${MIN_WITHDRAW}")
+    print("Quiz Bot · 10 уровней · награда растёт")
+    print(f"Вопросов: {len(QUESTIONS)}")
+    print(f"Награда: ${BASE_REWARD:.3f} (ур.1) → ${BASE_REWARD + 9*REWARD_STEP:.3f} (ур.10)")
+    print(f"Уровень каждые {ANSWERS_PER_LEVEL} правильных")
     print(f"Админы: {sorted(ADMIN_IDS)}")
 
-    # прогрев HTTP-сессии (TLS-handshake один раз)
     await get_http()
-
-    # сброс зависших замков
     await asyncio.to_thread(unlock_all_withdrawals_sync)
 
-    # загрузка банов в кэш
     global BANNED_CACHE
     BANNED_CACHE = await asyncio.to_thread(load_bans_sync)
     total_bans = sum(len(s) for s in BANNED_CACHE.values())
     print(f"Банов в кэше: {total_bans}")
 
-    # восстановление активных вопросов
     active_rows = await asyncio.to_thread(load_active_sync)
     for row in active_rows:
         ACTIVE_QUESTIONS[int(row["chat_id"])] = {
@@ -966,13 +1109,13 @@ async def main():
         }
         QUIZ_ENABLED.add(int(row["chat_id"]))
     if active_rows:
-        print(f"Восстановлено активных вопросов: {len(active_rows)}")
+        print(f"Восстановлено активных: {len(active_rows)}")
 
     me = await bot.get_me()
     print(f"Подключился как @{me.username}")
     asyncio.create_task(question_scheduler())
     asyncio.create_task(bans_refresh_loop())
-    print("Фоновые задачи запущены.")
+    print("Запущен.")
     print("=" * 50)
 
     try:
