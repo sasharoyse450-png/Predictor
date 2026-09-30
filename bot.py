@@ -3,6 +3,7 @@ import json
 import logging
 import os
 import random
+import time
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
@@ -44,6 +45,9 @@ ADMIN_ID = 8130244626
 TZ = ZoneInfo(os.getenv("TZ", "Europe/Moscow"))
 WORK_HOURS = list(range(8, 24))
 
+# время жизни pending-запроса на вывод (сек)
+WITHDRAW_CONFIRM_TTL = 120
+
 if not TOKEN:
     print("!!! BOT_TOKEN не задан")
     raise SystemExit(1)
@@ -57,6 +61,9 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 ACTIVE_QUESTIONS = {}
 QUIZ_ENABLED = set()
+
+# pending выводов: msg_id -> {chat_id, user_id, amount, ts}
+PENDING_WITHDRAWS = {}
 
 
 # ==================== SAFE SEND ====================
@@ -679,6 +686,9 @@ async def cmd_aitop(message: Message):
     await safe_send(message.reply, "\n".join(lines))
 
 
+# ==================== ВЫВОД С ПОДТВЕРЖДЕНИЕМ ====================
+
+
 @dp.message(Command("AiWithdraw"))
 async def cmd_aiwithdraw(message: Message):
     log.info("/AiWithdraw от %s", message.from_user.id if message.from_user else "?")
@@ -692,60 +702,172 @@ async def cmd_aiwithdraw(message: Message):
         await safe_send(message.reply, "🚫 Ты в бане, вывод недоступен.")
         return
 
+    p = await get_player(chat_id, user_id,
+                         message.from_user.username, message.from_user.first_name)
+    balance = float(p["balance"])
+
+    if balance < MIN_WITHDRAW:
+        await safe_send(message.reply, f"❌ Минимум ${MIN_WITHDRAW:.2f}. У тебя ${balance:.4f}")
+        return
+
+    today = await withdrawn_today(chat_id, user_id)
+    remaining = DAILY_WITHDRAW_LIMIT - today
+    if remaining <= 0:
+        await safe_send(
+            message.reply,
+            f"❌ Дневной лимит исчерпан (${DAILY_WITHDRAW_LIMIT:.2f}).\n"
+            f"Выведено сегодня: ${today:.4f}"
+        )
+        return
+    amount = min(balance, remaining)
+
+    # показываем подтверждение
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="✅ Принять", callback_data=f"wd:accept:{user_id}"),
+            InlineKeyboardButton(text="❌ Отклонить", callback_data=f"wd:reject:{user_id}"),
+        ],
+    ])
+    text = (
+        f"💸 <b>Подтверждение вывода</b>\n\n"
+        f"Сумма: <b>${amount:.4f}</b> USDT\n"
+        f"Куда: на твой Telegram ID <code>{user_id}</code>\n\n"
+        f"⚠️ <b>Чтобы вывод прошёл, ты должен зайти в @xrocket</b> "
+        f"и активировать там свой аккаунт. Без этого выплата не дойдёт.\n\n"
+        f"Подтверди вывод кнопкой ниже. Запрос действует "
+        f"{WITHDRAW_CONFIRM_TTL // 60} мин."
+    )
+
+    sent = await safe_send(message.reply, text, reply_markup=kb)
+    if not sent:
+        return
+
+    PENDING_WITHDRAWS[sent.message_id] = {
+        "chat_id": chat_id,
+        "user_id": user_id,
+        "amount": amount,
+        "ts": time.time(),
+    }
+
+    # авто-отмена через TTL
+    async def auto_cancel():
+        await asyncio.sleep(WITHDRAW_CONFIRM_TTL)
+        info = PENDING_WITHDRAWS.pop(sent.message_id, None)
+        if not info:
+            return
+        try:
+            await bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=sent.message_id,
+                text="⌛ <b>Запрос на вывод истёк.</b>\nСоздай новый через /AiWithdraw.",
+            )
+        except Exception:
+            pass
+
+    asyncio.create_task(auto_cancel())
+
+
+@dp.callback_query(F.data.startswith("wd:"))
+async def on_withdraw_cb(cb: CallbackQuery):
+    if not cb.from_user or not isinstance(cb.message, Message):
+        await cb.answer()
+        return
+
+    parts = cb.data.split(":")
+    if len(parts) != 3:
+        await cb.answer("Ошибка", show_alert=True)
+        return
+    action, owner_id_str = parts[1], parts[2]
+    try:
+        owner_id = int(owner_id_str)
+    except ValueError:
+        await cb.answer("Ошибка", show_alert=True)
+        return
+
+    # только автор может нажимать
+    if cb.from_user.id != owner_id:
+        await cb.answer("⛔ Это не твой запрос.", show_alert=True)
+        return
+
+    info = PENDING_WITHDRAWS.pop(cb.message.message_id, None)
+    if not info:
+        await cb.answer("⌛ Запрос уже истёк или обработан.", show_alert=True)
+        return
+
+    chat_id = info["chat_id"]
+    user_id = info["user_id"]
+    amount = info["amount"]
+
+    if action == "reject":
+        try:
+            await cb.message.edit_text(
+                f"❌ <b>Вывод отменён.</b>\n"
+                f"Сумма ${amount:.4f} осталась на балансе."
+            )
+        except Exception:
+            pass
+        await cb.answer("Отменено")
+        return
+
+    # action == "accept"
+    await cb.answer("Принято, отправляю...")
+
+    # замок на вывод
     locked = await try_lock_withdraw(chat_id, user_id)
     if not locked:
-        await safe_send(message.reply, "⏳ Предыдущий вывод ещё обрабатывается. Подожди.")
+        try:
+            await cb.message.edit_text("⏳ Предыдущий вывод ещё обрабатывается.")
+        except Exception:
+            pass
         return
 
     try:
-        p = await get_player(chat_id, user_id,
-                             message.from_user.username, message.from_user.first_name)
+        # перепроверяем баланс — вдруг уже потратил
+        p = await get_player(chat_id, user_id)
         balance = float(p["balance"])
-
-        if balance < MIN_WITHDRAW:
-            await safe_send(message.reply, f"❌ Минимум ${MIN_WITHDRAW:.2f}. У тебя ${balance:.4f}")
+        if balance < amount:
+            amount = balance
+        if amount < MIN_WITHDRAW:
+            try:
+                await cb.message.edit_text(
+                    f"❌ Недостаточно средств. Минимум ${MIN_WITHDRAW:.2f}, у тебя ${balance:.4f}"
+                )
+            except Exception:
+                pass
             return
 
-        today = await withdrawn_today(chat_id, user_id)
-        remaining = DAILY_WITHDRAW_LIMIT - today
-        if remaining <= 0:
-            await safe_send(
-                message.reply,
-                f"❌ Дневной лимит исчерпан (${DAILY_WITHDRAW_LIMIT:.2f}).\n"
-                f"Выведено сегодня: ${today:.4f}"
-            )
-            return
-        amount = min(balance, remaining)
+        try:
+            await cb.message.edit_text(f"⏳ Отправляю ${amount:.4f} на xRocket...")
+        except Exception:
+            pass
 
-        msg = await safe_send(message.reply, f"⏳ Отправляю ${amount:.4f}...")
         ok, result = await xrocket_payout(chat_id, user_id, amount)
 
         if ok:
-            deducted = await deduct_balance(chat_id, user_id, amount)
-            if not deducted:
-                log.error("Withdraw успешен, но списать не удалось: %s / %s / %s",
-                          chat_id, user_id, amount)
+            await deduct_balance(chat_id, user_id, amount)
             await log_payout(chat_id, user_id, amount, result, "finished")
-            text = f"✅ <b>Выплачено ${amount:.4f}</b>\nID: <code>{result}</code>"
+            text = (
+                f"✅ <b>Выплачено ${amount:.4f}</b>\n"
+                f"ID: <code>{result}</code>\n\n"
+                f"Если не получил — открой @xrocket и активируй аккаунт."
+            )
         else:
             await log_payout(chat_id, user_id, amount, "", "failed")
-            text = f"❌ <b>Ошибка</b>\n<code>{result}</code>"
+            text = (
+                f"❌ <b>Ошибка выплаты</b>\n<code>{result}</code>\n\n"
+                f"Баланс не списан. Проверь, что зашёл в @xrocket."
+            )
 
-        if msg:
-            try:
-                await msg.edit_text(text)
-            except Exception:
-                await safe_send(message.reply, text)
-        else:
-            await safe_send(message.reply, text)
+        try:
+            await cb.message.edit_text(text)
+        except Exception:
+            await safe_send(bot.send_message, chat_id, text)
 
     finally:
         await unlock_withdraw(chat_id, user_id)
 
 
 # ==================== ОТВЕТЫ (ПОСЛЕДНИМ) ====================
-# ВАЖНО: неправильный ответ НЕ блокирует игрока. Кто первый написал
-# правильный — получает награду, вопрос закрывается атомарным pop().
 
 
 @dp.message(F.text & ~F.text.startswith("/"))
@@ -763,11 +885,9 @@ async def handle_answer(message: Message):
     if not q:
         return
 
-    # Неправильный ответ — просто игнорируем
     if text != q["answer"]:
         return
 
-    # Правильный — атомарный pop (защита от двойной награды)
     popped = ACTIVE_QUESTIONS.pop(chat_id, None)
     if popped is None:
         return
@@ -787,7 +907,7 @@ async def handle_answer(message: Message):
 
 async def main():
     print("=" * 50)
-    print("Запуск Quiz Bot (безопасная версия)")
+    print("Запуск Quiz Bot (с подтверждением вывода)")
     print(f"Вопросов в базе: {len(QUESTIONS)}")
     print(f"xRocket Base: {XROCKET_BASE}")
     print(f"xRocket key: {'задан' if XROCKET_API_KEY else 'НЕ ЗАДАН'}")
