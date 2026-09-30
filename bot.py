@@ -53,9 +53,7 @@ SUBSCRIPTION_PRICE = 0.50
 MIN_WITHDRAW = 0.05
 DAILY_WITHDRAW_LIMIT = 1.00
 
-# Копилка: 5% от каждой награды идёт в фонд чата
 POT_PERCENT = 0.05
-# Час раздачи копилки (МСК)
 POT_HOUR = 21
 
 ADMIN_IDS = {8130244626, 6173495222}
@@ -133,7 +131,7 @@ bot = Bot(TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-ACTIVE_QUESTIONS = {}   # chat_id -> {"question","answers","is_multi"}
+ACTIVE_QUESTIONS = {}
 QUIZ_ENABLED = set()
 PENDING_WITHDRAWS = {}
 BANNED_CACHE = {}
@@ -151,7 +149,6 @@ def is_admin(uid):
 
 
 def get_font(size=64):
-    """Пробует найти системный шрифт с кириллицей."""
     global _FONT_PATH
     candidates = [
         "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
@@ -176,7 +173,6 @@ def get_font(size=64):
 
 
 def render_question_image(text: str) -> bytes:
-    """Рисует вопрос на PNG. Возвращает bytes."""
     W, H = 800, 300
     img = Image.new("RGB", (W, H), "white")
     draw = ImageDraw.Draw(img)
@@ -184,7 +180,6 @@ def render_question_image(text: str) -> bytes:
 
     bbox = draw.textbbox((0, 0), text, font=font)
     tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
-    # если не влезает — уменьшаем
     while tw > W - 60 and font.size > 20:
         font = get_font(font.size - 5)
         bbox = draw.textbbox((0, 0), text, font=font)
@@ -348,7 +343,7 @@ def save_active_sync(chat_id, question, answers, is_multi):
         supabase.table("quiz_active").upsert({
             "chat_id": chat_id,
             "question": question,
-            "answer": "||".join(answers),  # объединяем мультиответы
+            "answer": "||".join(answers),
             "is_multi": is_multi,
         }).execute()
     except Exception as e:
@@ -423,8 +418,8 @@ async def get_player(cid, uid, un=None, fn=None):
     return await asyncio.to_thread(get_player_sync, cid, uid, un, fn)
 
 
-async def add_balance(cid, uid, amt, cc=False):
-    return await asyncio.to_thread(add_balance_sync, cid, uid, amt, cc)
+async def add_balance(cid, uid, amt, count_correct=False):
+    return await asyncio.to_thread(add_balance_sync, cid, uid, amt, count_correct)
 
 
 async def deduct_balance(cid, uid, amt):
@@ -599,7 +594,6 @@ async def question_scheduler():
 
 
 async def pot_payout_loop():
-    """Раз в день в POT_HOUR раздаём копилку случайному активному игроку."""
     await asyncio.sleep(30)
     last_payout_date = None
     while True:
@@ -612,7 +606,6 @@ async def pot_payout_loop():
                     amount = await payout_pot(cid)
                     if amount < 0.01:
                         continue
-                    # случайный из топ-10
                     rows = await get_top(cid, 10)
                     if not rows:
                         continue
@@ -1198,7 +1191,6 @@ async def handle_answer(message: Message):
     sub = is_subscriber_cached(cid, uid)
     reward = reward_for(int(p["correct_answers"]), is_sub=sub)
 
-    # 5% в копилку (дополнительно, не из награды)
     pot_add = round(reward * POT_PERCENT, 4)
 
     await asyncio.gather(
@@ -1213,7 +1205,10 @@ async def handle_answer(message: Message):
 
     phrase = random.choice(CORRECT_PHRASES)
     sub_badge = " 💎×2" if sub else ""
-    answer_shown = q["answers"][0] if not q["is_multi"] else "любой из " + ", ".join(q["answers"][:5]) + ("..." if len(q["answers"]) > 5 else "")
+    if q["is_multi"]:
+        answer_shown = "любой из: " + ", ".join(q["answers"][:5]) + ("..." if len(q["answers"]) > 5 else "")
+    else:
+        answer_shown = q["answers"][0]
 
     msg = (
         f"{phrase}{sub_badge}\n"
