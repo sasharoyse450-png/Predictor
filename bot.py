@@ -40,12 +40,11 @@ XROCKET_BASE = "https://pay.api.xrocket.exchange"
 REWARD_PER_ANSWER = 0.05
 MIN_WITHDRAW = 0.05
 DAILY_WITHDRAW_LIMIT = 1.00
-ADMIN_ID = 8130244626
+
+ADMIN_IDS = {8130244626, 6173495222}
 
 TZ = ZoneInfo(os.getenv("TZ", "Europe/Moscow"))
 WORK_HOURS = list(range(8, 24))
-
-# время жизни pending-запроса на вывод (сек)
 WITHDRAW_CONFIRM_TTL = 120
 
 if not TOKEN:
@@ -61,9 +60,32 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 ACTIVE_QUESTIONS = {}
 QUIZ_ENABLED = set()
-
-# pending выводов: msg_id -> {chat_id, user_id, amount, ts}
 PENDING_WITHDRAWS = {}
+BANNED_CACHE = {}   # chat_id -> set(user_id)
+HTTP_SESSION: aiohttp.ClientSession | None = None
+
+
+def is_admin(user_id) -> bool:
+    return user_id in ADMIN_IDS
+
+
+# ==================== HTTP ====================
+
+
+async def get_http() -> aiohttp.ClientSession:
+    global HTTP_SESSION
+    if HTTP_SESSION is None or HTTP_SESSION.closed:
+        HTTP_SESSION = aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=15, connect=5),
+            connector=aiohttp.TCPConnector(limit=100, ttl_dns_cache=300),
+        )
+    return HTTP_SESSION
+
+
+async def close_http():
+    global HTTP_SESSION
+    if HTTP_SESSION and not HTTP_SESSION.closed:
+        await HTTP_SESSION.close()
 
 
 # ==================== SAFE SEND ====================
@@ -111,10 +133,8 @@ def get_player_sync(chat_id, user_id, username=None, first_name=None):
 
 def add_balance_sync(chat_id, user_id, amount, count_correct=False):
     r = _rpc("add_balance_atomic", {
-        "p_chat_id": chat_id,
-        "p_user_id": user_id,
-        "p_amount": amount,
-        "p_count_correct": count_correct,
+        "p_chat_id": chat_id, "p_user_id": user_id,
+        "p_amount": amount, "p_count_correct": count_correct,
     })
     if r and r.data is not None:
         return float(r.data)
@@ -123,20 +143,14 @@ def add_balance_sync(chat_id, user_id, amount, count_correct=False):
 
 def deduct_balance_sync(chat_id, user_id, amount):
     r = _rpc("deduct_balance_atomic", {
-        "p_chat_id": chat_id,
-        "p_user_id": user_id,
-        "p_amount": amount,
+        "p_chat_id": chat_id, "p_user_id": user_id, "p_amount": amount,
     })
-    if r and r.data is True:
-        return True
-    return False
+    return bool(r and r.data is True)
 
 
 def try_lock_withdraw_sync(chat_id, user_id):
     r = _rpc("try_lock_withdraw", {"p_chat_id": chat_id, "p_user_id": user_id})
-    if r and r.data is True:
-        return True
-    return False
+    return bool(r and r.data is True)
 
 
 def unlock_withdraw_sync(chat_id, user_id):
@@ -150,12 +164,16 @@ def withdrawn_today_sync(chat_id, user_id):
     return 0.0
 
 
-def is_banned_sync(chat_id, user_id):
+def load_bans_sync():
     try:
-        res = supabase.table("quiz_bans").select("user_id").eq("chat_id", chat_id).eq("user_id", user_id).execute()
-        return bool(res.data)
-    except Exception:
-        return False
+        res = supabase.table("quiz_bans").select("chat_id,user_id").execute()
+        cache = {}
+        for row in res.data or []:
+            cache.setdefault(int(row["chat_id"]), set()).add(int(row["user_id"]))
+        return cache
+    except Exception as e:
+        log.warning("load_bans: %s", e)
+        return {}
 
 
 def ban_user_sync(chat_id, user_id, reason, admin_id):
@@ -275,16 +293,19 @@ async def withdrawn_today(chat_id, user_id):
     return await asyncio.to_thread(withdrawn_today_sync, chat_id, user_id)
 
 
-async def is_banned(chat_id, user_id):
-    return await asyncio.to_thread(is_banned_sync, chat_id, user_id)
+def is_banned_cached(chat_id, user_id) -> bool:
+    """Мгновенная проверка без SQL — из кэша в памяти."""
+    return user_id in BANNED_CACHE.get(chat_id, set())
 
 
 async def ban_user(chat_id, user_id, reason, admin_id):
     await asyncio.to_thread(ban_user_sync, chat_id, user_id, reason, admin_id)
+    BANNED_CACHE.setdefault(chat_id, set()).add(user_id)
 
 
 async def unban_user(chat_id, user_id):
     await asyncio.to_thread(unban_user_sync, chat_id, user_id)
+    BANNED_CACHE.get(chat_id, set()).discard(user_id)
 
 
 async def save_active(chat_id, question, answer):
@@ -333,19 +354,18 @@ async def xrocket_payout(chat_id, user_id, amount):
     url = f"{XROCKET_BASE}/api/v1/payouts"
 
     try:
-        timeout = aiohttp.ClientTimeout(total=15, connect=5)
-        async with aiohttp.ClientSession(timeout=timeout) as s:
-            async with s.post(url, headers=headers, json=payload) as r:
-                text = await r.text()
-                try:
-                    data = json.loads(text)
-                except Exception:
-                    data = {"raw": text[:300]}
-                log.info("xRocket [%s] %s", r.status, data)
-                if r.status in (200, 201):
-                    return True, data.get("payoutId") or data.get("id") or "ok"
-                err = data.get("detail") or data.get("title") or data.get("message") or str(data)
-                return False, err
+        s = await get_http()
+        async with s.post(url, headers=headers, json=payload) as r:
+            text = await r.text()
+            try:
+                data = json.loads(text)
+            except Exception:
+                data = {"raw": text[:300]}
+            log.info("xRocket [%s] %s", r.status, data)
+            if r.status in (200, 201):
+                return True, data.get("payoutId") or data.get("id") or "ok"
+            err = data.get("detail") or data.get("title") or data.get("message") or str(data)
+            return False, err
     except aiohttp.ClientConnectorError as e:
         log.warning("xRocket connect error: %s", e)
         return False, f"Нет соединения с xRocket: {e}"
@@ -411,6 +431,17 @@ async def question_scheduler():
         await asyncio.sleep(60)
 
 
+async def bans_refresh_loop():
+    """Обновляем кэш банов раз в 60 секунд."""
+    global BANNED_CACHE
+    while True:
+        try:
+            BANNED_CACHE = await asyncio.to_thread(load_bans_sync)
+        except Exception as e:
+            log.warning("bans refresh: %s", e)
+        await asyncio.sleep(60)
+
+
 # ==================== АДМИН-ПАНЕЛЬ ====================
 
 
@@ -459,7 +490,7 @@ def admin_text(chat_id):
 @dp.message(Command("AiAdmin"))
 async def cmd_aiadmin(message: Message):
     log.info("/AiAdmin от %s", message.from_user.id if message.from_user else "?")
-    if not message.from_user or message.from_user.id != ADMIN_ID:
+    if not message.from_user or not is_admin(message.from_user.id):
         return
     if message.chat.type not in ("group", "supergroup"):
         return
@@ -468,7 +499,7 @@ async def cmd_aiadmin(message: Message):
 
 @dp.message(Command("AiBan"))
 async def cmd_aiban(message: Message):
-    if not message.from_user or message.from_user.id != ADMIN_ID:
+    if not message.from_user or not is_admin(message.from_user.id):
         return
     parts = (message.text or "").split(maxsplit=2)
     if len(parts) < 2:
@@ -480,13 +511,13 @@ async def cmd_aiban(message: Message):
         await safe_send(message.reply, "user_id — целое число.")
         return
     reason = parts[2] if len(parts) > 2 else "без причины"
-    await ban_user(message.chat.id, target, reason, ADMIN_ID)
+    await ban_user(message.chat.id, target, reason, message.from_user.id)
     await safe_send(message.reply, f"🚫 <code>{target}</code> забанен.\nПричина: {reason}")
 
 
 @dp.message(Command("AiUnban"))
 async def cmd_aiunban(message: Message):
-    if not message.from_user or message.from_user.id != ADMIN_ID:
+    if not message.from_user or not is_admin(message.from_user.id):
         return
     parts = (message.text or "").split()
     if len(parts) != 2:
@@ -503,7 +534,7 @@ async def cmd_aiunban(message: Message):
 
 @dp.callback_query(F.data.startswith("adm:"))
 async def on_admin_cb(cb: CallbackQuery):
-    if not cb.from_user or cb.from_user.id != ADMIN_ID:
+    if not cb.from_user or not is_admin(cb.from_user.id):
         await cb.answer("⛔", show_alert=True)
         return
     if not isinstance(cb.message, Message):
@@ -618,19 +649,17 @@ async def xrocket_debug():
     if not XROCKET_API_KEY:
         lines.append("❌ XROCKET_API_KEY пуст")
         return "\n".join(lines)
-    tests = [
-        ("GET", f"{XROCKET_BASE}/api/v1/me"),
-        ("GET", f"{XROCKET_BASE}/api/v1/balance"),
-    ]
-    for method, url in tests:
-        try:
-            timeout = aiohttp.ClientTimeout(total=8)
-            async with aiohttp.ClientSession(timeout=timeout) as s:
-                async with s.request(method, url, headers={"Authorization": f"Bearer {XROCKET_API_KEY}"}) as r:
+    try:
+        s = await get_http()
+        for url in (f"{XROCKET_BASE}/api/v1/me", f"{XROCKET_BASE}/api/v1/balance"):
+            try:
+                async with s.get(url, headers={"Authorization": f"Bearer {XROCKET_API_KEY}"}) as r:
                     text = (await r.text())[:250]
                     lines.append(f"[{r.status}] <code>{url}</code>\n<code>{text}</code>\n")
-        except Exception as e:
-            lines.append(f"[ERR] {url}: <code>{e}</code>")
+            except Exception as e:
+                lines.append(f"[ERR] {url}: <code>{e}</code>")
+    except Exception as e:
+        lines.append(f"[ERR] http: <code>{e}</code>")
     return "\n".join(lines)
 
 
@@ -676,12 +705,12 @@ async def cmd_aitop(message: Message):
     if not rows:
         await safe_send(message.reply, "Никто не играл.")
         return
-    is_admin = message.from_user and message.from_user.id == ADMIN_ID
+    admin_view = message.from_user and is_admin(message.from_user.id)
     lines = ["🏆 <b>Топ игроков</b>"]
     for i, row in enumerate(rows, 1):
         name = row.get("first_name") or row.get("username") or str(row["user_id"])
         medal = ["🥇", "🥈", "🥉"][i-1] if i <= 3 else f"{i}."
-        uid = f" · <code>{row['user_id']}</code>" if is_admin else ""
+        uid = f" · <code>{row['user_id']}</code>" if admin_view else ""
         lines.append(f"{medal} {name} — ${float(row['balance']):.4f} ({row['correct_answers']} отв.){uid}")
     await safe_send(message.reply, "\n".join(lines))
 
@@ -698,7 +727,7 @@ async def cmd_aiwithdraw(message: Message):
     chat_id = message.chat.id
     user_id = message.from_user.id
 
-    if await is_banned(chat_id, user_id):
+    if is_banned_cached(chat_id, user_id):
         await safe_send(message.reply, "🚫 Ты в бане, вывод недоступен.")
         return
 
@@ -721,7 +750,6 @@ async def cmd_aiwithdraw(message: Message):
         return
     amount = min(balance, remaining)
 
-    # показываем подтверждение
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [
             InlineKeyboardButton(text="✅ Принять", callback_data=f"wd:accept:{user_id}"),
@@ -743,13 +771,10 @@ async def cmd_aiwithdraw(message: Message):
         return
 
     PENDING_WITHDRAWS[sent.message_id] = {
-        "chat_id": chat_id,
-        "user_id": user_id,
-        "amount": amount,
-        "ts": time.time(),
+        "chat_id": chat_id, "user_id": user_id,
+        "amount": amount, "ts": time.time(),
     }
 
-    # авто-отмена через TTL
     async def auto_cancel():
         await asyncio.sleep(WITHDRAW_CONFIRM_TTL)
         info = PENDING_WITHDRAWS.pop(sent.message_id, None)
@@ -757,8 +782,7 @@ async def cmd_aiwithdraw(message: Message):
             return
         try:
             await bot.edit_message_text(
-                chat_id=chat_id,
-                message_id=sent.message_id,
+                chat_id=chat_id, message_id=sent.message_id,
                 text="⌛ <b>Запрос на вывод истёк.</b>\nСоздай новый через /AiWithdraw.",
             )
         except Exception:
@@ -784,7 +808,6 @@ async def on_withdraw_cb(cb: CallbackQuery):
         await cb.answer("Ошибка", show_alert=True)
         return
 
-    # только автор может нажимать
     if cb.from_user.id != owner_id:
         await cb.answer("⛔ Это не твой запрос.", show_alert=True)
         return
@@ -809,10 +832,8 @@ async def on_withdraw_cb(cb: CallbackQuery):
         await cb.answer("Отменено")
         return
 
-    # action == "accept"
     await cb.answer("Принято, отправляю...")
 
-    # замок на вывод
     locked = await try_lock_withdraw(chat_id, user_id)
     if not locked:
         try:
@@ -822,7 +843,6 @@ async def on_withdraw_cb(cb: CallbackQuery):
         return
 
     try:
-        # перепроверяем баланс — вдруг уже потратил
         p = await get_player(chat_id, user_id)
         balance = float(p["balance"])
         if balance < amount:
@@ -868,6 +888,8 @@ async def on_withdraw_cb(cb: CallbackQuery):
 
 
 # ==================== ОТВЕТЫ (ПОСЛЕДНИМ) ====================
+# Оптимизация: НЕ лезем в Supabase на каждое сообщение.
+# Ban-проверка идёт из памяти, а q — из ACTIVE_QUESTIONS.
 
 
 @dp.message(F.text & ~F.text.startswith("/"))
@@ -876,24 +898,32 @@ async def handle_answer(message: Message):
         return
     chat_id = message.chat.id
     user_id = message.from_user.id
-    text = (message.text or "").strip().lower()
 
-    if await is_banned(chat_id, user_id):
-        return
-
+    # сначала быстрая проверка: есть ли активный вопрос в этом чате?
     q = ACTIVE_QUESTIONS.get(chat_id)
     if not q:
         return
 
+    text = (message.text or "").strip().lower()
     if text != q["answer"]:
         return
 
+    # проверка бана — из кэша, без SQL
+    if is_banned_cached(chat_id, user_id):
+        return
+
+    # атомарный pop до await
     popped = ACTIVE_QUESTIONS.pop(chat_id, None)
     if popped is None:
         return
 
-    await clear_active(chat_id)
-    await add_balance(chat_id, user_id, REWARD_PER_ANSWER, count_correct=True)
+    # параллельно: очистка в БД + начисление
+    await asyncio.gather(
+        clear_active(chat_id),
+        add_balance(chat_id, user_id, REWARD_PER_ANSWER, count_correct=True),
+        return_exceptions=True,
+    )
+
     await safe_send(
         message.reply,
         f"🎉 <b>Правильно!</b>\n"
@@ -907,15 +937,27 @@ async def handle_answer(message: Message):
 
 async def main():
     print("=" * 50)
-    print("Запуск Quiz Bot (с подтверждением вывода)")
+    print("Запуск Quiz Bot (быстрая версия, 2 админа)")
     print(f"Вопросов в базе: {len(QUESTIONS)}")
     print(f"xRocket Base: {XROCKET_BASE}")
     print(f"xRocket key: {'задан' if XROCKET_API_KEY else 'НЕ ЗАДАН'}")
     print(f"Часы: {WORK_HOURS[0]}:00 - {WORK_HOURS[-1]}:00 ({TZ.key})")
-    print(f"Награда: ${REWARD_PER_ANSWER} · вывод от ${MIN_WITHDRAW} · лимит ${DAILY_WITHDRAW_LIMIT}/сутки")
+    print(f"Награда: ${REWARD_PER_ANSWER} · вывод от ${MIN_WITHDRAW}")
+    print(f"Админы: {sorted(ADMIN_IDS)}")
 
+    # прогрев HTTP-сессии (TLS-handshake один раз)
+    await get_http()
+
+    # сброс зависших замков
     await asyncio.to_thread(unlock_all_withdrawals_sync)
 
+    # загрузка банов в кэш
+    global BANNED_CACHE
+    BANNED_CACHE = await asyncio.to_thread(load_bans_sync)
+    total_bans = sum(len(s) for s in BANNED_CACHE.values())
+    print(f"Банов в кэше: {total_bans}")
+
+    # восстановление активных вопросов
     active_rows = await asyncio.to_thread(load_active_sync)
     for row in active_rows:
         ACTIVE_QUESTIONS[int(row["chat_id"])] = {
@@ -928,11 +970,15 @@ async def main():
 
     me = await bot.get_me()
     print(f"Подключился как @{me.username}")
-    print(f"Админ: {ADMIN_ID}")
     asyncio.create_task(question_scheduler())
-    print("Планировщик запущен.")
+    asyncio.create_task(bans_refresh_loop())
+    print("Фоновые задачи запущены.")
     print("=" * 50)
-    await dp.start_polling(bot)
+
+    try:
+        await dp.start_polling(bot)
+    finally:
+        await close_http()
 
 
 if __name__ == "__main__":
