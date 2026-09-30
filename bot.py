@@ -1,4 +1,5 @@
 import asyncio
+import io
 import json
 import logging
 import os
@@ -14,12 +15,13 @@ from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramRetryAfter
 from aiogram.filters import Command, CommandStart
 from aiogram.types import (
-    Message, CallbackQuery,
+    Message, CallbackQuery, BufferedInputFile,
     InlineKeyboardMarkup, InlineKeyboardButton,
 )
+from PIL import Image, ImageDraw, ImageFont
 from supabase import create_client, Client
 
-from questions import QUESTIONS, random_question
+from questions import QUESTIONS, MULTI_QUESTIONS, random_question
 
 logging.basicConfig(
     level=logging.INFO,
@@ -37,33 +39,30 @@ SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
 XROCKET_API_KEY = os.getenv("XROCKET_API_KEY", "")
 XROCKET_BASE = "https://pay.api.xrocket.exchange"
 
-# ========== ССЫЛКИ XROCKET (вставь свои!) ==========
-# Ссылка на подписку (создаётся в @xRocket → Subscriptions)
-XROCKET_SUBSCRIBE_URL = os.getenv("XROCKET_SUBSCRIBE_URL", "https://t.me/xRocket?start=sub_YOUR_ID")
-# Твоя реферальная ссылка (из @xRocket → Referral)
-XROCKET_REFERRAL_URL = os.getenv("XROCKET_REFERRAL_URL", "https://t.me/xRocket?start=ref_YOUR_ID")
+XROCKET_SUBSCRIBE_URL = os.getenv("XROCKET_SUBSCRIBE_URL", "https://t.me/xRocket")
+XROCKET_REFERRAL_URL = os.getenv("XROCKET_REFERRAL_URL", "https://t.me/xRocket")
 
-# Награда и уровни
 BASE_REWARD = 0.05
 REWARD_STEP = 0.005
 ANSWERS_PER_LEVEL = 10
 MAX_LEVEL = 10
 
-# Множитель для подписчиков
 SUBSCRIBER_MULTIPLIER = 2.0
 SUBSCRIPTION_PRICE = 0.50
-SUBSCRIPTION_DAYS = 7
 
 MIN_WITHDRAW = 0.05
 DAILY_WITHDRAW_LIMIT = 1.00
+
+# Копилка: 5% от каждой награды идёт в фонд чата
+POT_PERCENT = 0.05
+# Час раздачи копилки (МСК)
+POT_HOUR = 21
 
 ADMIN_IDS = {8130244626, 6173495222}
 
 TZ = ZoneInfo(os.getenv("TZ", "Europe/Moscow"))
 WORK_HOURS = list(range(8, 24))
 WITHDRAW_CONFIRM_TTL = 120
-
-# ==================== ФРАЗЫ (пункт 41) ====================
 
 CORRECT_PHRASES = [
     "🎉 <b>Правильно!</b>",
@@ -77,8 +76,6 @@ CORRECT_PHRASES = [
     "🎯 <b>Точно в цель!</b>",
     "🌟 <b>Блестяще!</b>",
 ]
-
-# ==================== УРОВНИ ====================
 
 LEVELS = [
     (1, "🐣", "Новичок"),
@@ -94,72 +91,118 @@ LEVELS = [
 ]
 
 
-def level_from_correct(correct_answers: int) -> int:
-    lvl = correct_answers // ANSWERS_PER_LEVEL + 1
-    return min(lvl, MAX_LEVEL)
+def level_from_correct(c):
+    return min(c // ANSWERS_PER_LEVEL + 1, MAX_LEVEL)
 
 
-def level_info(correct_answers: int):
-    lvl = level_from_correct(correct_answers)
+def level_info(c):
+    lvl = level_from_correct(c)
     emoji, name = LEVELS[lvl - 1][1], LEVELS[lvl - 1][2]
     reward = BASE_REWARD + (lvl - 1) * REWARD_STEP
     title_str = f"{emoji} {name} (ур. {lvl})"
-
     if lvl >= MAX_LEVEL:
         progress = "🏆 Максимальный уровень!"
     else:
-        in_level = correct_answers - (lvl - 1) * ANSWERS_PER_LEVEL
+        in_level = c - (lvl - 1) * ANSWERS_PER_LEVEL
         remaining = ANSWERS_PER_LEVEL - in_level
         progress = f"до след. уровня: {remaining} отв."
-
     return lvl, emoji, name, reward, title_str, progress
 
 
-def reward_for(correct_answers: int, is_subscriber: bool = False) -> float:
-    lvl = level_from_correct(correct_answers)
+def reward_for(c, is_sub=False):
+    lvl = level_from_correct(c)
     base = BASE_REWARD + (lvl - 1) * REWARD_STEP
-    if is_subscriber:
+    if is_sub:
         base *= SUBSCRIBER_MULTIPLIER
     return round(base, 4)
 
 
-def make_progress_bar(correct_answers: int) -> str:
-    lvl = level_from_correct(correct_answers)
+def make_progress_bar(c):
+    lvl = level_from_correct(c)
     if lvl >= MAX_LEVEL:
         return "▓" * 10 + " 10/10"
-    in_level = correct_answers - (lvl - 1) * ANSWERS_PER_LEVEL
-    filled = in_level
-    bar = "▓" * filled + "▒" * (ANSWERS_PER_LEVEL - filled)
-    return f"{bar} {in_level}/{ANSWERS_PER_LEVEL}"
+    in_level = c - (lvl - 1) * ANSWERS_PER_LEVEL
+    return f"{'▓' * in_level}{'▒' * (ANSWERS_PER_LEVEL - in_level)} {in_level}/{ANSWERS_PER_LEVEL}"
 
 
-if not TOKEN:
-    print("!!! BOT_TOKEN не задан")
-    raise SystemExit(1)
-if not SUPABASE_URL or not SUPABASE_KEY:
-    print("!!! SUPABASE_URL / SUPABASE_KEY не заданы")
+if not TOKEN or not SUPABASE_URL or not SUPABASE_KEY:
+    print("!!! Не заданы BOT_TOKEN / SUPABASE_URL / SUPABASE_KEY")
     raise SystemExit(1)
 
 bot = Bot(TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-ACTIVE_QUESTIONS = {}
+ACTIVE_QUESTIONS = {}   # chat_id -> {"question","answers","is_multi"}
 QUIZ_ENABLED = set()
 PENDING_WITHDRAWS = {}
 BANNED_CACHE = {}
-SUBSCRIBERS_CACHE = {}  # chat_id -> set(user_id)
-HTTP_SESSION: aiohttp.ClientSession | None = None
+SUBSCRIBERS_CACHE = {}
+HTTP_SESSION = None
+
+_FONT_PATH = None
 
 
-def is_admin(user_id) -> bool:
-    return user_id in ADMIN_IDS
+def is_admin(uid):
+    return uid in ADMIN_IDS
+
+
+# ==================== FONT ====================
+
+
+def get_font(size=64):
+    """Пробует найти системный шрифт с кириллицей."""
+    global _FONT_PATH
+    candidates = [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/TTF/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/dejavu/DejaVuSans-Bold.ttf",
+        "/System/Library/Fonts/Supplemental/Arial Bold.ttf",
+    ]
+    if _FONT_PATH is None:
+        for path in candidates:
+            if os.path.exists(path):
+                _FONT_PATH = path
+                break
+        if _FONT_PATH is None:
+            _FONT_PATH = ""
+    try:
+        if _FONT_PATH:
+            return ImageFont.truetype(_FONT_PATH, size)
+    except Exception:
+        pass
+    return ImageFont.load_default()
+
+
+def render_question_image(text: str) -> bytes:
+    """Рисует вопрос на PNG. Возвращает bytes."""
+    W, H = 800, 300
+    img = Image.new("RGB", (W, H), "white")
+    draw = ImageDraw.Draw(img)
+    font = get_font(80)
+
+    bbox = draw.textbbox((0, 0), text, font=font)
+    tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+    # если не влезает — уменьшаем
+    while tw > W - 60 and font.size > 20:
+        font = get_font(font.size - 5)
+        bbox = draw.textbbox((0, 0), text, font=font)
+        tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+
+    x = (W - tw) / 2 - bbox[0]
+    y = (H - th) / 2 - bbox[1]
+    draw.text((x, y), text, fill=(20, 20, 80), font=font)
+
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue()
 
 
 # ==================== HTTP ====================
 
 
-async def get_http() -> aiohttp.ClientSession:
+async def get_http():
     global HTTP_SESSION
     if HTTP_SESSION is None or HTTP_SESSION.closed:
         HTTP_SESSION = aiohttp.ClientSession(
@@ -173,9 +216,6 @@ async def close_http():
     global HTTP_SESSION
     if HTTP_SESSION and not HTTP_SESSION.closed:
         await HTTP_SESSION.close()
-
-
-# ==================== SAFE SEND ====================
 
 
 async def safe_send(coro_func, *args, **kwargs):
@@ -205,14 +245,14 @@ def get_player_sync(chat_id, user_id, username=None, first_name=None):
         if res.data:
             return res.data[0]
     except Exception as e:
-        log.warning("get_player select: %s", e)
+        log.warning("get_player: %s", e)
     try:
         supabase.table("quiz_players").insert({
             "chat_id": chat_id, "user_id": user_id,
             "username": username, "first_name": first_name,
         }).execute()
-    except Exception as e:
-        log.warning("get_player insert: %s", e)
+    except Exception:
+        pass
     return {"chat_id": chat_id, "user_id": user_id, "username": username,
             "first_name": first_name, "balance": 0, "total_won": 0,
             "correct_answers": 0, "is_withdrawing": False}
@@ -223,15 +263,11 @@ def add_balance_sync(chat_id, user_id, amount, count_correct=False):
         "p_chat_id": chat_id, "p_user_id": user_id,
         "p_amount": amount, "p_count_correct": count_correct,
     })
-    if r and r.data is not None:
-        return float(r.data)
-    return None
+    return float(r.data) if r and r.data is not None else None
 
 
 def deduct_balance_sync(chat_id, user_id, amount):
-    r = _rpc("deduct_balance_atomic", {
-        "p_chat_id": chat_id, "p_user_id": user_id, "p_amount": amount,
-    })
+    r = _rpc("deduct_balance_atomic", {"p_chat_id": chat_id, "p_user_id": user_id, "p_amount": amount})
     return bool(r and r.data is True)
 
 
@@ -246,9 +282,25 @@ def unlock_withdraw_sync(chat_id, user_id):
 
 def withdrawn_today_sync(chat_id, user_id):
     r = _rpc("withdrawn_today", {"p_chat_id": chat_id, "p_user_id": user_id})
-    if r and r.data is not None:
-        return float(r.data)
-    return 0.0
+    return float(r.data) if r and r.data is not None else 0.0
+
+
+def add_to_pot_sync(chat_id, amount):
+    r = _rpc("add_to_pot", {"p_chat_id": chat_id, "p_amount": amount})
+    return float(r.data) if r and r.data is not None else None
+
+
+def payout_pot_sync(chat_id):
+    r = _rpc("payout_pot", {"p_chat_id": chat_id})
+    return float(r.data) if r and r.data is not None else 0.0
+
+
+def get_pot_sync(chat_id):
+    try:
+        res = supabase.table("quiz_pot").select("amount").eq("chat_id", chat_id).execute()
+        return float(res.data[0]["amount"]) if res.data else 0.0
+    except Exception:
+        return 0.0
 
 
 def load_bans_sync():
@@ -258,13 +310,11 @@ def load_bans_sync():
         for row in res.data or []:
             cache.setdefault(int(row["chat_id"]), set()).add(int(row["user_id"]))
         return cache
-    except Exception as e:
-        log.warning("load_bans: %s", e)
+    except Exception:
         return {}
 
 
 def load_subscribers_sync():
-    """Загружает активных подписчиков (у кого expires_at > now)."""
     try:
         now_iso = datetime.now(timezone.utc).isoformat()
         res = supabase.table("quiz_subscribers").select("chat_id,user_id").gt("expires_at", now_iso).execute()
@@ -272,8 +322,7 @@ def load_subscribers_sync():
         for row in res.data or []:
             cache.setdefault(int(row["chat_id"]), set()).add(int(row["user_id"]))
         return cache
-    except Exception as e:
-        log.warning("load_subscribers: %s", e)
+    except Exception:
         return {}
 
 
@@ -294,10 +343,13 @@ def unban_user_sync(chat_id, user_id):
         log.warning("unban: %s", e)
 
 
-def save_active_sync(chat_id, question, answer):
+def save_active_sync(chat_id, question, answers, is_multi):
     try:
         supabase.table("quiz_active").upsert({
-            "chat_id": chat_id, "question": question, "answer": answer,
+            "chat_id": chat_id,
+            "question": question,
+            "answer": "||".join(answers),  # объединяем мультиответы
+            "is_multi": is_multi,
         }).execute()
     except Exception as e:
         log.warning("save_active: %s", e)
@@ -306,24 +358,23 @@ def save_active_sync(chat_id, question, answer):
 def clear_active_sync(chat_id):
     try:
         supabase.table("quiz_active").delete().eq("chat_id", chat_id).execute()
-    except Exception as e:
-        log.warning("clear_active: %s", e)
+    except Exception:
+        pass
 
 
 def load_active_sync():
     try:
-        res = supabase.table("quiz_active").select("chat_id,question,answer").execute()
+        res = supabase.table("quiz_active").select("*").execute()
         return res.data or []
-    except Exception as e:
-        log.warning("load_active: %s", e)
+    except Exception:
         return []
 
 
 def unlock_all_withdrawals_sync():
     try:
         supabase.table("quiz_players").update({"is_withdrawing": False}).eq("is_withdrawing", True).execute()
-    except Exception as e:
-        log.warning("unlock_all: %s", e)
+    except Exception:
+        pass
 
 
 def get_top_sync(chat_id, limit=10):
@@ -332,8 +383,7 @@ def get_top_sync(chat_id, limit=10):
             "user_id,username,first_name,balance,correct_answers"
         ).eq("chat_id", chat_id).order("correct_answers", desc=True).limit(limit).execute()
         return res.data or []
-    except Exception as e:
-        log.warning("get_top: %s", e)
+    except Exception:
         return []
 
 
@@ -344,8 +394,7 @@ def get_stats_sync():
         bans = supabase.table("quiz_bans").select("user_id").execute().data or []
         subs = supabase.table("quiz_subscribers").select("user_id").execute().data or []
         return players, payouts, bans, subs
-    except Exception as e:
-        log.warning("get_stats: %s", e)
+    except Exception:
         return [], [], [], []
 
 
@@ -353,8 +402,7 @@ def get_payouts_sync(limit=20):
     try:
         res = supabase.table("quiz_payouts").select("*").order("created_at", desc=True).limit(limit).execute()
         return res.data or []
-    except Exception as e:
-        log.warning("get_payouts: %s", e)
+    except Exception:
         return []
 
 
@@ -371,58 +419,70 @@ def log_payout_sync(chat_id, user_id, amount, payout_id, status):
 # ==================== SUPABASE (async) ====================
 
 
-async def get_player(chat_id, user_id, username=None, first_name=None):
-    return await asyncio.to_thread(get_player_sync, chat_id, user_id, username, first_name)
+async def get_player(cid, uid, un=None, fn=None):
+    return await asyncio.to_thread(get_player_sync, cid, uid, un, fn)
 
 
-async def add_balance(chat_id, user_id, amount, count_correct=False):
-    return await asyncio.to_thread(add_balance_sync, chat_id, user_id, amount, count_correct)
+async def add_balance(cid, uid, amt, cc=False):
+    return await asyncio.to_thread(add_balance_sync, cid, uid, amt, cc)
 
 
-async def deduct_balance(chat_id, user_id, amount):
-    return await asyncio.to_thread(deduct_balance_sync, chat_id, user_id, amount)
+async def deduct_balance(cid, uid, amt):
+    return await asyncio.to_thread(deduct_balance_sync, cid, uid, amt)
 
 
-async def try_lock_withdraw(chat_id, user_id):
-    return await asyncio.to_thread(try_lock_withdraw_sync, chat_id, user_id)
+async def try_lock_withdraw(cid, uid):
+    return await asyncio.to_thread(try_lock_withdraw_sync, cid, uid)
 
 
-async def unlock_withdraw(chat_id, user_id):
-    await asyncio.to_thread(unlock_withdraw_sync, chat_id, user_id)
+async def unlock_withdraw(cid, uid):
+    await asyncio.to_thread(unlock_withdraw_sync, cid, uid)
 
 
-async def withdrawn_today(chat_id, user_id):
-    return await asyncio.to_thread(withdrawn_today_sync, chat_id, user_id)
+async def withdrawn_today(cid, uid):
+    return await asyncio.to_thread(withdrawn_today_sync, cid, uid)
 
 
-def is_banned_cached(chat_id, user_id) -> bool:
-    return user_id in BANNED_CACHE.get(chat_id, set())
+async def add_to_pot(cid, amt):
+    return await asyncio.to_thread(add_to_pot_sync, cid, amt)
 
 
-def is_subscriber_cached(chat_id, user_id) -> bool:
-    return user_id in SUBSCRIBERS_CACHE.get(chat_id, set())
+async def payout_pot(cid):
+    return await asyncio.to_thread(payout_pot_sync, cid)
 
 
-async def ban_user(chat_id, user_id, reason, admin_id):
-    await asyncio.to_thread(ban_user_sync, chat_id, user_id, reason, admin_id)
-    BANNED_CACHE.setdefault(chat_id, set()).add(user_id)
+async def get_pot(cid):
+    return await asyncio.to_thread(get_pot_sync, cid)
 
 
-async def unban_user(chat_id, user_id):
-    await asyncio.to_thread(unban_user_sync, chat_id, user_id)
-    BANNED_CACHE.get(chat_id, set()).discard(user_id)
+def is_banned_cached(cid, uid):
+    return uid in BANNED_CACHE.get(cid, set())
 
 
-async def save_active(chat_id, question, answer):
-    await asyncio.to_thread(save_active_sync, chat_id, question, answer)
+def is_subscriber_cached(cid, uid):
+    return uid in SUBSCRIBERS_CACHE.get(cid, set())
 
 
-async def clear_active(chat_id):
-    await asyncio.to_thread(clear_active_sync, chat_id)
+async def ban_user(cid, uid, reason, admin_id):
+    await asyncio.to_thread(ban_user_sync, cid, uid, reason, admin_id)
+    BANNED_CACHE.setdefault(cid, set()).add(uid)
 
 
-async def get_top(chat_id, limit=10):
-    return await asyncio.to_thread(get_top_sync, chat_id, limit)
+async def unban_user(cid, uid):
+    await asyncio.to_thread(unban_user_sync, cid, uid)
+    BANNED_CACHE.get(cid, set()).discard(uid)
+
+
+async def save_active(cid, q, answers, is_multi):
+    await asyncio.to_thread(save_active_sync, cid, q, answers, is_multi)
+
+
+async def clear_active(cid):
+    await asyncio.to_thread(clear_active_sync, cid)
+
+
+async def get_top(cid, limit=10):
+    return await asyncio.to_thread(get_top_sync, cid, limit)
 
 
 async def get_stats():
@@ -433,47 +493,36 @@ async def get_payouts(limit=20):
     return await asyncio.to_thread(get_payouts_sync, limit)
 
 
-async def log_payout(chat_id, user_id, amount, payout_id, status):
-    await asyncio.to_thread(log_payout_sync, chat_id, user_id, amount, payout_id, status)
+async def log_payout(cid, uid, amt, pid, status):
+    await asyncio.to_thread(log_payout_sync, cid, uid, amt, pid, status)
 
 
 # ==================== XROCKET ====================
 
 
-async def xrocket_payout(chat_id, user_id, amount):
+async def xrocket_payout(cid, uid, amount):
     if not XROCKET_API_KEY:
         return False, "XROCKET_API_KEY не задан"
-
     payload = {
-        "clientPayoutId": f"quiz_{chat_id}_{user_id}_{int(datetime.now().timestamp()*1000)}",
-        "target": str(user_id),
+        "clientPayoutId": f"quiz_{cid}_{uid}_{int(datetime.now().timestamp()*1000)}",
+        "target": str(uid),
         "targetType": "telegram_user_id",
         "asset": "USDT",
         "amount": f"{amount:.4f}",
         "description": "Quiz reward",
     }
-    headers = {
-        "Authorization": f"Bearer {XROCKET_API_KEY}",
-        "Content-Type": "application/json",
-    }
-    url = f"{XROCKET_BASE}/api/v1/payouts"
     try:
         s = await get_http()
-        async with s.post(url, headers=headers, json=payload) as r:
-            text = await r.text()
-            try:
-                data = json.loads(text)
-            except Exception:
-                data = {"raw": text[:300]}
+        async with s.post(
+            f"{XROCKET_BASE}/api/v1/payouts",
+            headers={"Authorization": f"Bearer {XROCKET_API_KEY}", "Content-Type": "application/json"},
+            json=payload,
+        ) as r:
+            data = await r.json()
             log.info("xRocket [%s] %s", r.status, data)
             if r.status in (200, 201):
                 return True, data.get("payoutId") or data.get("id") or "ok"
-            err = data.get("detail") or data.get("title") or data.get("message") or str(data)
-            return False, err
-    except aiohttp.ClientConnectorError as e:
-        return False, f"Нет соединения с xRocket: {e}"
-    except asyncio.TimeoutError:
-        return False, "xRocket не отвечает (таймаут)"
+            return False, data.get("detail") or data.get("title") or str(data)
     except Exception as e:
         return False, str(e)
 
@@ -481,29 +530,41 @@ async def xrocket_payout(chat_id, user_id, amount):
 # ==================== ВОПРОСЫ ====================
 
 
-def pick_question_safe():
-    if not QUESTIONS:
-        return ("Сколько будет 2+2?", "4")
-    return random_question()
-
-
 async def ask_question(chat_id):
-    q, a = pick_question_safe()
-    ACTIVE_QUESTIONS[chat_id] = {"question": q, "answer": a.lower()}
-    await save_active(chat_id, q, a.lower())
+    q, answers, is_multi, is_image = random_question()
+    ACTIVE_QUESTIONS[chat_id] = {"question": q, "answers": answers, "is_multi": is_multi}
+    await save_active(chat_id, q, answers, is_multi)
+
     try:
-        # Пункт 43: анимация "печатает..."
         await bot.send_chat_action(chat_id, "typing")
-        msg = await safe_send(
-            bot.send_message,
-            chat_id,
-            f"🧠 <b>Вопрос!</b>\n\n"
-            f"❓ {q}\n\n"
-            f"💰 Награда зависит от уровня: $0.050 — $0.095\n"
-            f"💎 Подписчики получают ×2\n"
-            f"🔓 Вопрос открыт, пока кто-то не ответит верно."
-        )
-        # Пункт 42: реакция 🧠 на вопрос
+    except Exception:
+        pass
+
+    pot = await get_pot(chat_id)
+    pot_line = f"🎰 Копилка чата: <b>${pot:.3f}</b>\n" if pot >= 0.01 else ""
+
+    try:
+        if is_image:
+            png = render_question_image(q)
+            buf = BufferedInputFile(png, filename="q.png")
+            caption = (
+                f"🧠 <b>Вопрос!</b>\n\n"
+                f"💰 Награда: $0.050 — $0.095\n"
+                f"💎 Подписчики ×2\n"
+                f"{pot_line}"
+                f"🔓 Вопрос открыт, пока кто-то не ответит верно."
+            )
+            msg = await safe_send(bot.send_photo, chat_id, buf, caption=caption)
+        else:
+            msg = await safe_send(
+                bot.send_message, chat_id,
+                f"🧠 <b>Вопрос!</b>\n\n"
+                f"❓ {q}\n\n"
+                f"💰 Награда: $0.050 — $0.095\n"
+                f"💎 Подписчики ×2\n"
+                f"{pot_line}"
+                f"🔓 Вопрос открыт, пока кто-то не ответит верно."
+            )
         if msg:
             try:
                 await bot.set_message_reaction(chat_id, msg.message_id, ["🧠"])
@@ -520,8 +581,7 @@ def next_run_time(now):
         target = now.replace(hour=h, minute=0, second=5, microsecond=0)
         if target > now:
             return target
-    tomorrow = now + timedelta(days=1)
-    return tomorrow.replace(hour=WORK_HOURS[0], minute=0, second=5, microsecond=0)
+    return (now + timedelta(days=1)).replace(hour=WORK_HOURS[0], minute=0, second=5, microsecond=0)
 
 
 async def question_scheduler():
@@ -530,20 +590,50 @@ async def question_scheduler():
         now = datetime.now(TZ)
         target = next_run_time(now)
         wait = (target - now).total_seconds()
-        log.info("Следующий вопрос в %s (через %.0f сек)", target.strftime("%H:%M:%S %d.%m"), wait)
+        log.info("Следующий вопрос в %s (через %.0f сек)", target.strftime("%H:%M:%S"), wait)
         await asyncio.sleep(max(1, wait))
+        if QUIZ_ENABLED:
+            log.info("Задаю вопрос в %d чатах...", len(QUIZ_ENABLED))
+            await asyncio.gather(*[ask_question(c) for c in list(QUIZ_ENABLED)], return_exceptions=True)
+        await asyncio.sleep(60)
 
-        if not QUIZ_ENABLED:
-            continue
 
-        log.info("Задаю вопрос в %d чатах...", len(QUIZ_ENABLED))
-        tasks = [ask_question(cid) for cid in list(QUIZ_ENABLED)]
-        await asyncio.gather(*tasks, return_exceptions=True)
+async def pot_payout_loop():
+    """Раз в день в POT_HOUR раздаём копилку случайному активному игроку."""
+    await asyncio.sleep(30)
+    last_payout_date = None
+    while True:
+        now = datetime.now(TZ)
+        today = now.date()
+        if now.hour == POT_HOUR and last_payout_date != today:
+            last_payout_date = today
+            for cid in list(QUIZ_ENABLED):
+                try:
+                    amount = await payout_pot(cid)
+                    if amount < 0.01:
+                        continue
+                    # случайный из топ-10
+                    rows = await get_top(cid, 10)
+                    if not rows:
+                        continue
+                    winner = random.choice(rows)
+                    wuid = int(winner["user_id"])
+                    wname = winner.get("first_name") or winner.get("username") or str(wuid)
+                    await add_balance(cid, wuid, amount)
+                    await safe_send(
+                        bot.send_message, cid,
+                        f"🎰 <b>Розыгрыш копилки!</b>\n\n"
+                        f"💰 Выигрыш: <b>${amount:.4f}</b>\n"
+                        f"🏆 Победитель: <b>{wname}</b>\n"
+                        f"<i>Случайный выбор из топ-10 активных.</i>"
+                    )
+                    log.info("Pot payout: chat=%s user=%s amount=%s", cid, wuid, amount)
+                except Exception as e:
+                    log.warning("pot payout: %s", e)
         await asyncio.sleep(60)
 
 
 async def caches_refresh_loop():
-    """Обновляем кэши банов и подписчиков раз в 60 секунд."""
     global BANNED_CACHE, SUBSCRIBERS_CACHE
     while True:
         try:
@@ -557,47 +647,44 @@ async def caches_refresh_loop():
 # ==================== АДМИН-ПАНЕЛЬ ====================
 
 
-def admin_kb(chat_id):
-    enabled = chat_id in QUIZ_ENABLED
+def admin_kb(cid):
+    enabled = cid in QUIZ_ENABLED
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(
             text="⏸ Выключить" if enabled else "▶️ Включить",
             callback_data="adm:toggle"
         )],
         [
-            InlineKeyboardButton(text="❓ Вопрос сейчас", callback_data="adm:ask"),
-            InlineKeyboardButton(text="📊 Статистика", callback_data="adm:stats"),
+            InlineKeyboardButton(text="❓ Вопрос", callback_data="adm:ask"),
+            InlineKeyboardButton(text="📊 Стата", callback_data="adm:stats"),
         ],
         [
             InlineKeyboardButton(text="💸 Выплаты", callback_data="adm:payouts"),
             InlineKeyboardButton(text="📋 Топ", callback_data="adm:top"),
         ],
         [
+            InlineKeyboardButton(text="🎰 Копилка", callback_data="adm:pot"),
             InlineKeyboardButton(text="🚫 Баны", callback_data="adm:bans"),
+        ],
+        [
             InlineKeyboardButton(text="🧪 xRocket", callback_data="adm:xrdbg"),
         ],
     ])
 
 
-def admin_text(chat_id):
-    status = "🟢 включена" if chat_id in QUIZ_ENABLED else "🔴 выключена"
-    current = ACTIVE_QUESTIONS.get(chat_id)
-    current_txt = f"\n🔓 Открыт: {current['question']}" if current else ""
-    xr_status = "✅ задан" if XROCKET_API_KEY else "❌ не задан"
+def admin_text(cid):
+    status = "🟢 включена" if cid in QUIZ_ENABLED else "🔴 выключена"
+    current = ACTIVE_QUESTIONS.get(cid)
+    cur_txt = f"\n🔓 Открыт: {current['question']}" if current else ""
     return (
         f"🛠 <b>Админ-панель</b>\n"
         f"Викторина: {status}\n"
-        f"Расписание: каждый час с 8:00 до 23:00 ({TZ.key})\n"
-        f"Базовая награда: ${BASE_REWARD:.3f} · +${REWARD_STEP:.3f}/уровень\n"
-        f"Макс. награда (ур. 10): ${BASE_REWARD + 9*REWARD_STEP:.3f}\n"
-        f"Подписчики: ×{SUBSCRIBER_MULTIPLIER}\n"
-        f"Вывод от: ${MIN_WITHDRAW:.2f} · лимит ${DAILY_WITHDRAW_LIMIT:.2f}/сутки\n"
-        f"Вопросов в базе: {len(QUESTIONS)}\n"
-        f"xRocket: {xr_status}"
-        f"{current_txt}\n\n"
-        f"<b>Админ-команды:</b>\n"
-        f"/AiBan &lt;user_id&gt; [причина]\n"
-        f"/AiUnban &lt;user_id&gt;"
+        f"Расписание: с 8:00 до 23:00 ({TZ.key})\n"
+        f"Награда: ${BASE_REWARD:.3f} — ${BASE_REWARD + 9*REWARD_STEP:.3f}\n"
+        f"Подписка ×{SUBSCRIBER_MULTIPLIER}\n"
+        f"Копилка: {int(POT_PERCENT*100)}% с каждого ответа, раздача в {POT_HOUR}:00 МСК\n"
+        f"Вопросов: {len(QUESTIONS)} + {len(MULTI_QUESTIONS)} мульти"
+        f"{cur_txt}"
     )
 
 
@@ -653,28 +740,28 @@ async def on_admin_cb(cb: CallbackQuery):
     if not isinstance(cb.message, Message):
         await cb.answer()
         return
-    chat_id = cb.message.chat.id
+    cid = cb.message.chat.id
     action = cb.data.split(":")[1]
 
     if action == "toggle":
-        if chat_id in QUIZ_ENABLED:
-            QUIZ_ENABLED.discard(chat_id)
-            ACTIVE_QUESTIONS.pop(chat_id, None)
-            await clear_active(chat_id)
+        if cid in QUIZ_ENABLED:
+            QUIZ_ENABLED.discard(cid)
+            ACTIVE_QUESTIONS.pop(cid, None)
+            await clear_active(cid)
             await cb.answer("Выключено")
         else:
-            QUIZ_ENABLED.add(chat_id)
+            QUIZ_ENABLED.add(cid)
             await cb.answer("Включено")
         try:
-            await cb.message.edit_text(admin_text(chat_id), reply_markup=admin_kb(chat_id))
+            await cb.message.edit_text(admin_text(cid), reply_markup=admin_kb(cid))
         except Exception:
             pass
         return
 
     if action == "ask":
-        QUIZ_ENABLED.add(chat_id)
+        QUIZ_ENABLED.add(cid)
         await cb.answer("Задаю...")
-        asyncio.create_task(ask_question(chat_id))
+        asyncio.create_task(ask_question(cid))
         return
 
     if action == "stats":
@@ -700,6 +787,19 @@ async def on_admin_cb(cb: CallbackQuery):
         )
         return
 
+    if action == "pot":
+        await cb.answer()
+        pot = await get_pot(cid)
+        await safe_send(
+            cb.message.answer,
+            f"🎰 <b>Копилка чата</b>\n\n"
+            f"Сейчас в фонде: <b>${pot:.4f}</b>\n"
+            f"Раздача: каждый день в <b>{POT_HOUR}:00 МСК</b> "
+            f"случайному из топ-10 активных.\n"
+            f"Пополнение: {int(POT_PERCENT*100)}% от каждой награды."
+        )
+        return
+
     if action == "payouts":
         await cb.answer("Собираю...")
         rows = await get_payouts(20)
@@ -716,35 +816,32 @@ async def on_admin_cb(cb: CallbackQuery):
 
     if action == "top":
         await cb.answer()
-        rows = await get_top(chat_id, 10)
+        rows = await get_top(cid, 10)
         if not rows:
             await safe_send(cb.message.answer, "Никто не играл.")
             return
         lines = ["🏆 <b>Топ чата</b>"]
         for i, row in enumerate(rows, 1):
             ca = int(row.get("correct_answers", 0))
-            lvl, emoji, name, reward, title_str, _ = level_info(ca)
-            player_name = row.get("first_name") or row.get("username") or str(row["user_id"])
+            _, emoji, _, _, _, _ = level_info(ca)
+            nm = row.get("first_name") or row.get("username") or str(row["user_id"])
             medal = ["🥇", "🥈", "🥉"][i-1] if i <= 3 else f"{i}."
-            lines.append(
-                f"{medal} {emoji} {player_name} — {ca} отв. · ${float(row['balance']):.4f} · <code>{row['user_id']}</code>"
-            )
+            lines.append(f"{medal} {emoji} {nm} — {ca} отв. · ${float(row['balance']):.4f} · <code>{row['user_id']}</code>")
         await safe_send(cb.message.answer, "\n".join(lines))
         return
 
     if action == "bans":
-        await cb.answer("Собираю...")
+        await cb.answer()
         def _q():
             try:
-                res = supabase.table("quiz_bans").select("*").eq("chat_id", chat_id).execute()
-                return res.data or []
+                return supabase.table("quiz_bans").select("*").eq("chat_id", cid).execute().data or []
             except Exception:
                 return []
         rows = await asyncio.to_thread(_q)
         if not rows:
             await safe_send(cb.message.answer, "Забаненных нет.")
             return
-        lines = ["🚫 <b>Забаненные в чате</b>"]
+        lines = ["🚫 <b>Забаненные</b>"]
         for b in rows:
             lines.append(f"<code>{b['user_id']}</code> — {b.get('reason','—')}")
         await safe_send(cb.message.answer, "\n".join(lines))
@@ -758,12 +855,12 @@ async def on_admin_cb(cb: CallbackQuery):
             try:
                 await msg.edit_text(info)
             except Exception:
-                await safe_send(cb.message.answer, info)
+                pass
         return
 
 
 async def xrocket_debug():
-    lines = ["🧪 <b>xRocket debug</b>", f"Key: <code>{XROCKET_API_KEY[:12]}...</code>", f"Base: <code>{XROCKET_BASE}</code>", ""]
+    lines = ["🧪 <b>xRocket</b>", f"Key: <code>{XROCKET_API_KEY[:12]}...</code>", ""]
     if not XROCKET_API_KEY:
         lines.append("❌ XROCKET_API_KEY пуст")
         return "\n".join(lines)
@@ -772,12 +869,12 @@ async def xrocket_debug():
         for url in (f"{XROCKET_BASE}/api/v1/me", f"{XROCKET_BASE}/api/v1/balance"):
             try:
                 async with s.get(url, headers={"Authorization": f"Bearer {XROCKET_API_KEY}"}) as r:
-                    text = (await r.text())[:250]
+                    text = (await r.text())[:200]
                     lines.append(f"[{r.status}] <code>{url}</code>\n<code>{text}</code>\n")
             except Exception as e:
                 lines.append(f"[ERR] {url}: <code>{e}</code>")
     except Exception as e:
-        lines.append(f"[ERR] http: <code>{e}</code>")
+        lines.append(f"[ERR] {e}")
     return "\n".join(lines)
 
 
@@ -787,41 +884,36 @@ async def xrocket_debug():
 @dp.message(CommandStart())
 async def cmd_start(message: Message):
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="💎 Оформить подписку $0.50/нед", url=XROCKET_SUBSCRIBE_URL)],
+        [InlineKeyboardButton(text="💎 Подписка $0.50/нед", url=XROCKET_SUBSCRIBE_URL)],
         [InlineKeyboardButton(text="🔗 Партнёрка xRocket", url=XROCKET_REFERRAL_URL)],
     ])
     await safe_send(
         message.reply,
         f"👋 <b>Викторина с уровнями!</b>\n\n"
-        f"🎯 10 уровней, каждый +${REWARD_STEP:.3f} к награде\n"
-        f"📈 Новый уровень за каждые {ANSWERS_PER_LEVEL} правильных ответов\n"
-        f"💰 Уровень 1: ${BASE_REWARD:.3f} · Уровень 10: ${BASE_REWARD + 9*REWARD_STEP:.3f}\n"
-        f"💎 Подписчики получают <b>×{SUBSCRIBER_MULTIPLIER}</b> к награде\n"
+        f"🎯 10 уровней, +${REWARD_STEP:.3f} к награде каждый\n"
+        f"💰 Ур.1: ${BASE_REWARD:.3f} · Ур.10: ${BASE_REWARD + 9*REWARD_STEP:.3f}\n"
+        f"💎 Подписчики ×{SUBSCRIBER_MULTIPLIER}\n"
+        f"🎰 Копилка чата: розыгрыш раз в день\n"
         f"⏰ Вопрос каждый час с 8:00 до 23:00\n"
         f"💸 Вывод от ${MIN_WITHDRAW:.2f}\n\n"
         f"<b>Команды:</b>\n"
-        f"/AiBalance — баланс и уровень\n"
-        f"/AiProfile — полный профиль\n"
-        f"/AiTop — топ игроков\n"
-        f"/AiLevels — все уровни\n"
-        f"/AiWithdraw — вывод",
+        f"/AiBalance · /AiProfile · /AiTop · /AiLevels · /AiWithdraw",
         reply_markup=kb,
     )
 
 
 @dp.message(Command("AiSubscribe"))
-async def cmd_aisubscribe(message: Message):
+async def cmd_aisub(message: Message):
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="💎 Оформить подписку $0.50/нед", url=XROCKET_SUBSCRIBE_URL)],
+        [InlineKeyboardButton(text="💎 Оформить $0.50/нед", url=XROCKET_SUBSCRIBE_URL)],
     ])
     await safe_send(
         message.reply,
-        f"💎 <b>Подписка ×{SUBSCRIBER_MULTIPLIER} к награде</b>\n\n"
+        f"💎 <b>Подписка ×{SUBSCRIBER_MULTIPLIER}</b>\n\n"
         f"Цена: <b>${SUBSCRIPTION_PRICE:.2f}/нед</b>\n"
-        f"Что даёт:\n"
-        f"• ×{SUBSCRIBER_MULTIPLIER} к награде за правильный ответ\n"
-        f"• Титул 💎 в профиле\n\n"
-        f"Оформляется через @xrocket по кнопке ниже.",
+        f"• ×{SUBSCRIBER_MULTIPLIER} к награде за ответ\n"
+        f"• Бейдж 💎 в профиле\n\n"
+        f"Оформить через @xrocket:",
         reply_markup=kb,
     )
 
@@ -834,10 +926,12 @@ async def cmd_aibalance(message: Message):
                          message.from_user.username, message.from_user.first_name)
     today = await withdrawn_today(message.chat.id, message.from_user.id)
     ca = int(p["correct_answers"])
-    lvl, emoji, name, reward, title_str, progress = level_info(ca)
+    _, _, _, reward, title_str, _ = level_info(ca)
     bar = make_progress_bar(ca)
     sub = is_subscriber_cached(message.chat.id, message.from_user.id)
-    sub_line = f"\n💎 Подписка активна · ×{SUBSCRIBER_MULTIPLIER}" if sub else ""
+    sub_line = f"\n💎 Подписка · ×{SUBSCRIBER_MULTIPLIER}" if sub else ""
+    pot = await get_pot(message.chat.id)
+    pot_line = f"\n🎰 Копилка чата: ${pot:.3f}" if pot >= 0.01 else ""
 
     await safe_send(
         message.reply,
@@ -847,6 +941,7 @@ async def cmd_aibalance(message: Message):
         f"🏆 Правильных: {ca}\n"
         f"<code>{bar}</code>\n"
         f"💸 Выведено сегодня: ${today:.4f} / ${DAILY_WITHDRAW_LIMIT:.2f}"
+        f"{pot_line}"
     )
 
 
@@ -857,7 +952,7 @@ async def cmd_aiprofile(message: Message):
     p = await get_player(message.chat.id, message.from_user.id,
                          message.from_user.username, message.from_user.first_name)
     ca = int(p["correct_answers"])
-    lvl, emoji, name, reward, title_str, progress = level_info(ca)
+    lvl, _, _, reward, title_str, _ = level_info(ca)
     bar = make_progress_bar(ca)
     sub = is_subscriber_cached(message.chat.id, message.from_user.id)
 
@@ -882,13 +977,10 @@ async def cmd_aiprofile(message: Message):
     else:
         in_level = ca - (lvl - 1) * ANSWERS_PER_LEVEL
         remaining = ANSWERS_PER_LEVEL - in_level
-        next_emoji = LEVELS[lvl][1]
-        next_name = LEVELS[lvl][2]
-        next_reward = BASE_REWARD + lvl * REWARD_STEP
-        next_line = (
-            f"⬆️ До {next_emoji} <b>{next_name}</b> (ур. {lvl+1}): "
-            f"<b>{remaining}</b> отв. · награда будет ${next_reward:.3f}"
-        )
+        n_emoji = LEVELS[lvl][1]
+        n_name = LEVELS[lvl][2]
+        n_reward = BASE_REWARD + lvl * REWARD_STEP
+        next_line = f"⬆️ До {n_emoji} <b>{n_name}</b>: <b>{remaining}</b> отв. → ${n_reward:.3f}"
 
     sub_line = f"\n💎 Подписка: <b>активна</b> (×{SUBSCRIBER_MULTIPLIER})" if sub else "\n💎 Подписка: нет"
 
@@ -896,14 +988,14 @@ async def cmd_aiprofile(message: Message):
         message.reply,
         f"👤 <b>{message.from_user.first_name}</b>\n\n"
         f"🎖 <b>{title_str}</b>\n"
-        f"💵 Награда за ответ: <b>${reward:.3f}</b>{sub_line}\n\n"
+        f"💵 Награда: <b>${reward:.3f}</b>{sub_line}\n\n"
         f"<code>{bar}</code>\n"
         f"{next_line}\n\n"
         f"💰 Баланс: <b>${float(p['balance']):.4f}</b>\n"
-        f"📈 Всего заработано: ${float(p['total_won']):.4f}\n"
-        f"💸 Выведено сегодня: ${today:.4f}\n\n"
-        f"🏆 Правильных ответов: <b>{ca}</b>\n"
-        f"📍 Место в чате: <b>{place_str}</b>"
+        f"📈 Всего: ${float(p['total_won']):.4f}\n"
+        f"💸 Выведено: ${today:.4f}\n\n"
+        f"🏆 Правильных: <b>{ca}</b>\n"
+        f"📍 Место: <b>{place_str}</b>"
     )
 
 
@@ -914,11 +1006,8 @@ async def cmd_ailevels(message: Message):
     lines = ["🎖 <b>Уровни и награды</b>\n"]
     for lvl, emoji, name in LEVELS:
         reward = BASE_REWARD + (lvl - 1) * REWARD_STEP
-        min_answers = (lvl - 1) * ANSWERS_PER_LEVEL
-        if lvl == MAX_LEVEL:
-            req = f"{min_answers}+ ответов"
-        else:
-            req = f"{min_answers}-{min_answers + ANSWERS_PER_LEVEL - 1} ответов"
+        mn = (lvl - 1) * ANSWERS_PER_LEVEL
+        req = f"{mn}+" if lvl == MAX_LEVEL else f"{mn}-{mn + ANSWERS_PER_LEVEL - 1}"
         lines.append(f"{emoji} <b>Ур. {lvl}</b> · {name} · <b>${reward:.3f}</b> · <i>{req}</i>")
     await safe_send(message.reply, "\n".join(lines))
 
@@ -932,16 +1021,14 @@ async def cmd_aitop(message: Message):
         await safe_send(message.reply, "Никто не играл.")
         return
     admin_view = message.from_user and is_admin(message.from_user.id)
-    lines = ["🏆 <b>Топ по правильным ответам</b>"]
+    lines = ["🏆 <b>Топ по ответам</b>"]
     for i, row in enumerate(rows, 1):
         ca = int(row.get("correct_answers", 0))
-        lvl, emoji, name, reward, title_str, _ = level_info(ca)
-        player_name = row.get("first_name") or row.get("username") or str(row["user_id"])
+        _, emoji, _, _, _, _ = level_info(ca)
+        nm = row.get("first_name") or row.get("username") or str(row["user_id"])
         medal = ["🥇", "🥈", "🥉"][i-1] if i <= 3 else f"{i}."
         uid = f" · <code>{row['user_id']}</code>" if admin_view else ""
-        lines.append(
-            f"{medal} {emoji} {player_name} — {ca} отв. · ${float(row['balance']):.4f}{uid}"
-        )
+        lines.append(f"{medal} {emoji} {nm} — {ca} отв. · ${float(row['balance']):.4f}{uid}")
     await safe_send(message.reply, "\n".join(lines))
 
 
@@ -952,58 +1039,42 @@ async def cmd_aitop(message: Message):
 async def cmd_aiwithdraw(message: Message):
     if message.chat.type not in ("group", "supergroup") or not message.from_user:
         return
+    cid = message.chat.id
+    uid = message.from_user.id
 
-    chat_id = message.chat.id
-    user_id = message.from_user.id
-
-    if is_banned_cached(chat_id, user_id):
-        await safe_send(message.reply, "🚫 Ты в бане, вывод недоступен.")
+    if is_banned_cached(cid, uid):
+        await safe_send(message.reply, "🚫 Ты в бане.")
         return
 
-    p = await get_player(chat_id, user_id,
-                         message.from_user.username, message.from_user.first_name)
-    balance = float(p["balance"])
-
-    if balance < MIN_WITHDRAW:
-        await safe_send(message.reply, f"❌ Минимум ${MIN_WITHDRAW:.2f}. У тебя ${balance:.4f}")
+    p = await get_player(cid, uid, message.from_user.username, message.from_user.first_name)
+    bal = float(p["balance"])
+    if bal < MIN_WITHDRAW:
+        await safe_send(message.reply, f"❌ Минимум ${MIN_WITHDRAW:.2f}. У тебя ${bal:.4f}")
         return
 
-    today = await withdrawn_today(chat_id, user_id)
-    remaining = DAILY_WITHDRAW_LIMIT - today
-    if remaining <= 0:
-        await safe_send(
-            message.reply,
-            f"❌ Дневной лимит исчерпан (${DAILY_WITHDRAW_LIMIT:.2f}).\n"
-            f"Выведено сегодня: ${today:.4f}"
-        )
+    today = await withdrawn_today(cid, uid)
+    rem = DAILY_WITHDRAW_LIMIT - today
+    if rem <= 0:
+        await safe_send(message.reply, f"❌ Дневной лимит ${DAILY_WITHDRAW_LIMIT:.2f} исчерпан.")
         return
-    amount = min(balance, remaining)
+    amount = min(bal, rem)
 
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="✅ Принять", callback_data=f"wd:accept:{user_id}"),
-            InlineKeyboardButton(text="❌ Отклонить", callback_data=f"wd:reject:{user_id}"),
-        ],
-    ])
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="✅ Принять", callback_data=f"wd:accept:{uid}"),
+        InlineKeyboardButton(text="❌ Отклонить", callback_data=f"wd:reject:{uid}"),
+    ]])
     text = (
         f"💸 <b>Подтверждение вывода</b>\n\n"
         f"Сумма: <b>${amount:.4f}</b> USDT\n"
-        f"Куда: на твой Telegram ID <code>{user_id}</code>\n\n"
-        f"⚠️ <b>Чтобы вывод прошёл, ты должен зайти в "
-        f"<a href=\"{XROCKET_REFERRAL_URL}\">@xrocket</a></b> "
-        f"и активировать там свой аккаунт. Без этого выплата не дойдёт.\n\n"
-        f"Подтверди вывод кнопкой ниже. Запрос действует "
-        f"{WITHDRAW_CONFIRM_TTL // 60} мин."
+        f"Куда: Telegram ID <code>{uid}</code>\n\n"
+        f"⚠️ <b>Чтобы вывод прошёл, зайди в "
+        f"<a href=\"{XROCKET_REFERRAL_URL}\">@xrocket</a></b> и активируй аккаунт.\n\n"
+        f"Запрос действует {WITHDRAW_CONFIRM_TTL // 60} мин."
     )
-
     sent = await safe_send(message.reply, text, reply_markup=kb)
     if not sent:
         return
-
-    PENDING_WITHDRAWS[sent.message_id] = {
-        "chat_id": chat_id, "user_id": user_id,
-        "amount": amount, "ts": time.time(),
-    }
+    PENDING_WITHDRAWS[sent.message_id] = {"chat_id": cid, "user_id": uid, "amount": amount, "ts": time.time()}
 
     async def auto_cancel():
         await asyncio.sleep(WITHDRAW_CONFIRM_TTL)
@@ -1012,12 +1083,11 @@ async def cmd_aiwithdraw(message: Message):
             return
         try:
             await bot.edit_message_text(
-                chat_id=chat_id, message_id=sent.message_id,
-                text="⌛ <b>Запрос на вывод истёк.</b>\nСоздай новый через /AiWithdraw.",
+                chat_id=cid, message_id=sent.message_id,
+                text="⌛ <b>Запрос истёк.</b> Создай новый /AiWithdraw.",
             )
         except Exception:
             pass
-
     asyncio.create_task(auto_cancel())
 
 
@@ -1030,89 +1100,67 @@ async def on_withdraw_cb(cb: CallbackQuery):
     if len(parts) != 3:
         await cb.answer("Ошибка", show_alert=True)
         return
-    action, owner_id_str = parts[1], parts[2]
+    action, owner_str = parts[1], parts[2]
     try:
-        owner_id = int(owner_id_str)
+        owner_id = int(owner_str)
     except ValueError:
         await cb.answer("Ошибка", show_alert=True)
         return
     if cb.from_user.id != owner_id:
-        await cb.answer("⛔ Это не твой запрос.", show_alert=True)
+        await cb.answer("⛔ Не твой запрос.", show_alert=True)
         return
 
     info = PENDING_WITHDRAWS.pop(cb.message.message_id, None)
     if not info:
-        await cb.answer("⌛ Запрос уже истёк или обработан.", show_alert=True)
+        await cb.answer("⌛ Уже истёк или обработан.", show_alert=True)
         return
 
-    chat_id = info["chat_id"]
-    user_id = info["user_id"]
-    amount = info["amount"]
+    cid, uid, amount = info["chat_id"], info["user_id"], info["amount"]
 
     if action == "reject":
         try:
-            await cb.message.edit_text(
-                f"❌ <b>Вывод отменён.</b>\n"
-                f"Сумма ${amount:.4f} осталась на балансе."
-            )
+            await cb.message.edit_text(f"❌ Отменено. ${amount:.4f} на балансе.")
         except Exception:
             pass
         await cb.answer("Отменено")
         return
 
-    await cb.answer("Принято, отправляю...")
-
-    locked = await try_lock_withdraw(chat_id, user_id)
-    if not locked:
+    await cb.answer("Принято...")
+    if not await try_lock_withdraw(cid, uid):
         try:
-            await cb.message.edit_text("⏳ Предыдущий вывод ещё обрабатывается.")
+            await cb.message.edit_text("⏳ Другой вывод уже обрабатывается.")
         except Exception:
             pass
         return
-
     try:
-        p = await get_player(chat_id, user_id)
-        balance = float(p["balance"])
-        if balance < amount:
-            amount = balance
+        p = await get_player(cid, uid)
+        bal = float(p["balance"])
+        amount = min(bal, amount)
         if amount < MIN_WITHDRAW:
             try:
-                await cb.message.edit_text(
-                    f"❌ Недостаточно средств. Минимум ${MIN_WITHDRAW:.2f}, у тебя ${balance:.4f}"
-                )
+                await cb.message.edit_text(f"❌ Недостаточно. Минимум ${MIN_WITHDRAW:.2f}.")
             except Exception:
                 pass
             return
-
         try:
-            await cb.message.edit_text(f"⏳ Отправляю ${amount:.4f} на xRocket...")
+            await cb.message.edit_text(f"⏳ Отправляю ${amount:.4f}...")
         except Exception:
             pass
 
-        ok, result = await xrocket_payout(chat_id, user_id, amount)
-
+        ok, result = await xrocket_payout(cid, uid, amount)
         if ok:
-            await deduct_balance(chat_id, user_id, amount)
-            await log_payout(chat_id, user_id, amount, result, "finished")
-            text = (
-                f"✅ <b>Выплачено ${amount:.4f}</b>\n"
-                f"ID: <code>{result}</code>\n\n"
-                f"Если не получил — открой @xrocket и активируй аккаунт."
-            )
+            await deduct_balance(cid, uid, amount)
+            await log_payout(cid, uid, amount, result, "finished")
+            text = f"✅ <b>Выплачено ${amount:.4f}</b>\nID: <code>{result}</code>"
         else:
-            await log_payout(chat_id, user_id, amount, "", "failed")
-            text = (
-                f"❌ <b>Ошибка выплаты</b>\n<code>{result}</code>\n\n"
-                f"Баланс не списан. Проверь, что зашёл в @xrocket."
-            )
-
+            await log_payout(cid, uid, amount, "", "failed")
+            text = f"❌ <b>Ошибка</b>\n<code>{result}</code>\n\nЗайди в @xrocket."
         try:
             await cb.message.edit_text(text)
         except Exception:
-            await safe_send(bot.send_message, chat_id, text)
-
+            await safe_send(bot.send_message, cid, text)
     finally:
-        await unlock_withdraw(chat_id, user_id)
+        await unlock_withdraw(cid, uid)
 
 
 # ==================== ОТВЕТЫ ====================
@@ -1122,77 +1170,72 @@ async def on_withdraw_cb(cb: CallbackQuery):
 async def handle_answer(message: Message):
     if message.chat.type not in ("group", "supergroup") or not message.from_user:
         return
-    chat_id = message.chat.id
-    user_id = message.from_user.id
+    cid = message.chat.id
+    uid = message.from_user.id
 
-    q = ACTIVE_QUESTIONS.get(chat_id)
+    q = ACTIVE_QUESTIONS.get(cid)
     if not q:
         return
 
     text = (message.text or "").strip().lower()
-
-    # Пункт 42: реакция ❌ на неправильный ответ (только если от админа)
-    if text != q["answer"]:
-        if is_admin(user_id):
+    if text not in q["answers"]:
+        if is_admin(uid):
             try:
-                await bot.set_message_reaction(chat_id, message.message_id, ["❌"])
+                await bot.set_message_reaction(cid, message.message_id, ["❌"])
             except Exception:
                 pass
         return
 
-    if is_banned_cached(chat_id, user_id):
+    if is_banned_cached(cid, uid):
         return
 
-    popped = ACTIVE_QUESTIONS.pop(chat_id, None)
+    popped = ACTIVE_QUESTIONS.pop(cid, None)
     if popped is None:
         return
 
-    p = await get_player(chat_id, user_id,
-                         message.from_user.username, message.from_user.first_name)
-    old_level = level_from_correct(int(p["correct_answers"]))
-    sub = is_subscriber_cached(chat_id, user_id)
-    reward = reward_for(int(p["correct_answers"]), is_subscriber=sub)
+    p = await get_player(cid, uid, message.from_user.username, message.from_user.first_name)
+    old_lvl = level_from_correct(int(p["correct_answers"]))
+    sub = is_subscriber_cached(cid, uid)
+    reward = reward_for(int(p["correct_answers"]), is_sub=sub)
+
+    # 5% в копилку (дополнительно, не из награды)
+    pot_add = round(reward * POT_PERCENT, 4)
 
     await asyncio.gather(
-        clear_active(chat_id),
-        add_balance(chat_id, user_id, reward, count_correct=True),
+        clear_active(cid),
+        add_balance(cid, uid, reward, count_correct=True),
+        add_to_pot(cid, pot_add),
         return_exceptions=True,
     )
 
     new_correct = int(p["correct_answers"]) + 1
-    new_level = level_from_correct(new_correct)
+    new_lvl = level_from_correct(new_correct)
 
-    # Пункт 41: случайная фраза
     phrase = random.choice(CORRECT_PHRASES)
     sub_badge = " 💎×2" if sub else ""
+    answer_shown = q["answers"][0] if not q["is_multi"] else "любой из " + ", ".join(q["answers"][:5]) + ("..." if len(q["answers"]) > 5 else "")
 
     msg = (
         f"{phrase}{sub_badge}\n"
         f"{message.from_user.first_name} получает <b>${reward:.3f}</b>\n"
-        f"<i>Ответ: {q['answer']}</i>"
+        f"<i>Ответ: {answer_shown}</i>"
     )
 
-    if new_level > old_level:
-        emoji_new = LEVELS[new_level - 1][1]
-        name_new = LEVELS[new_level - 1][2]
-        new_reward = reward_for(new_correct, is_subscriber=sub)
-        msg += (
-            f"\n\n{emoji_new} <b>НОВЫЙ УРОВЕНЬ {new_level}!</b>\n"
-            f"🎖 {name_new} · теперь <b>${new_reward:.3f}</b> за ответ"
-        )
+    if new_lvl > old_lvl:
+        n_emoji = LEVELS[new_lvl - 1][1]
+        n_name = LEVELS[new_lvl - 1][2]
+        n_reward = reward_for(new_correct, is_sub=sub)
+        msg += f"\n\n{n_emoji} <b>НОВЫЙ УРОВЕНЬ {new_lvl}!</b>\n🎖 {n_name} · теперь <b>${n_reward:.3f}</b>"
 
-    # Пункт 43: анимация + отправка
     try:
-        await bot.send_chat_action(chat_id, "typing")
+        await bot.send_chat_action(cid, "typing")
     except Exception:
         pass
 
     sent = await safe_send(message.reply, msg)
-
-    # Пункт 42: реакция ✅ на правильный ответ
     if sent:
         try:
-            await bot.set_message_reaction(chat_id, message.message_id, ["✅"])
+            await bot.set_message_reaction(cid, message.message_id, ["✅"])
         except Exception:
             pass
 
@@ -1202,10 +1245,10 @@ async def handle_answer(message: Message):
 
 async def main():
     print("=" * 50)
-    print("Quiz Bot · 10 уровней · подписка · партнёрка")
-    print(f"Вопросов: {len(QUESTIONS)}")
-    print(f"Награда: ${BASE_REWARD:.3f} (ур.1) → ${BASE_REWARD + 9*REWARD_STEP:.3f} (ур.10)")
-    print(f"Подписка: ${SUBSCRIPTION_PRICE}/нед → ×{SUBSCRIBER_MULTIPLIER}")
+    print("Quiz Bot · 10 уровней · картинки · мульти · копилка")
+    print(f"Вопросов: {len(QUESTIONS)} + {len(MULTI_QUESTIONS)} мульти")
+    print(f"Награда: ${BASE_REWARD:.3f} → ${BASE_REWARD + 9*REWARD_STEP:.3f}")
+    print(f"Копилка: {int(POT_PERCENT*100)}%, раздача в {POT_HOUR}:00")
     print(f"Админы: {sorted(ADMIN_IDS)}")
 
     await get_http()
@@ -1214,15 +1257,15 @@ async def main():
     global BANNED_CACHE, SUBSCRIBERS_CACHE
     BANNED_CACHE = await asyncio.to_thread(load_bans_sync)
     SUBSCRIBERS_CACHE = await asyncio.to_thread(load_subscribers_sync)
-    total_bans = sum(len(s) for s in BANNED_CACHE.values())
-    total_subs = sum(len(s) for s in SUBSCRIBERS_CACHE.values())
-    print(f"Банов в кэше: {total_bans} · Подписчиков: {total_subs}")
+    print(f"Банов: {sum(len(s) for s in BANNED_CACHE.values())}, подписчиков: {sum(len(s) for s in SUBSCRIBERS_CACHE.values())}")
 
     active_rows = await asyncio.to_thread(load_active_sync)
     for row in active_rows:
+        answers = row["answer"].split("||")
         ACTIVE_QUESTIONS[int(row["chat_id"])] = {
             "question": row["question"],
-            "answer": row["answer"].lower(),
+            "answers": [a.lower() for a in answers],
+            "is_multi": row.get("is_multi", False),
         }
         QUIZ_ENABLED.add(int(row["chat_id"]))
     if active_rows:
@@ -1232,6 +1275,7 @@ async def main():
     print(f"Подключился как @{me.username}")
     asyncio.create_task(question_scheduler())
     asyncio.create_task(caches_refresh_loop())
+    asyncio.create_task(pot_payout_loop())
     print("Запущен.")
     print("=" * 50)
 
@@ -1247,6 +1291,6 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         pass
     except Exception as e:
-        print("!!! БОТ УПАЛ !!!")
+        print("!!! УПАЛ !!!")
         print(type(e).__name__, "-", e)
         raise
