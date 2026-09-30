@@ -56,6 +56,11 @@ DAILY_WITHDRAW_LIMIT = 1.00
 POT_PERCENT = 0.05
 POT_HOUR = 21
 
+# Дуэли
+DUEL_MIN = 0.05
+DUEL_MAX = 1.00
+DUEL_TTL = 120
+
 ADMIN_IDS = {8130244626, 6173495222}
 
 TZ = ZoneInfo(os.getenv("TZ", "Europe/Moscow"))
@@ -136,6 +141,7 @@ QUIZ_ENABLED = set()
 PENDING_WITHDRAWS = {}
 BANNED_CACHE = {}
 SUBSCRIBERS_CACHE = {}
+DUEL_BUSY = set()   # user_ids, которые уже в дуэли
 HTTP_SESSION = None
 
 _FONT_PATH = None
@@ -637,6 +643,232 @@ async def caches_refresh_loop():
         await asyncio.sleep(60)
 
 
+# ==================== ДУЭЛИ НА КУБАХ ====================
+
+
+@dp.message(Command("AiDuel"))
+async def cmd_duel(message: Message):
+    if message.chat.type not in ("group", "supergroup") or not message.from_user:
+        return
+    cid = message.chat.id
+    uid = message.from_user.id
+
+    if is_banned_cached(cid, uid):
+        await safe_send(message.reply, "🚫 Ты в бане.")
+        return
+
+    parts = (message.text or "").split()
+    if len(parts) < 2:
+        await safe_send(
+            message.reply,
+            f"🎲 <b>Дуэль на кубах</b>\n\n"
+            f"Формат: <code>/AiDuel 0.20</code> — ответом на сообщение противника\n\n"
+            f"Оба кидают кубик. У кого больше — забирает банк.\n"
+            f"Ставка: от ${DUEL_MIN:.2f} до ${DUEL_MAX:.2f}\n"
+            f"Ничья — возврат ставок."
+        )
+        return
+
+    try:
+        amount = float(parts[1])
+    except ValueError:
+        await safe_send(message.reply, "Ставка — число, например <code>0.20</code>")
+        return
+
+    amount = round(amount, 4)
+    if amount < DUEL_MIN or amount > DUEL_MAX:
+        await safe_send(message.reply, f"Ставка: от ${DUEL_MIN:.2f} до ${DUEL_MAX:.2f}")
+        return
+
+    # ищем противника
+    opponent_id = None
+    opponent_name = None
+    if message.reply_to_message and message.reply_to_message.from_user:
+        opp = message.reply_to_message.from_user
+        opponent_id = opp.id
+        opponent_name = opp.first_name
+    elif message.entities:
+        for ent in message.entities:
+            if ent.type == "text_mention" and ent.user:
+                opponent_id = ent.user.id
+                opponent_name = ent.user.first_name
+                break
+
+    if not opponent_id:
+        await safe_send(message.reply, "Ответь на сообщение противника или упомяни его.")
+        return
+    if opponent_id == uid:
+        await safe_send(message.reply, "Себе нельзя 😄")
+        return
+    if opponent_id == bot.id:
+        await safe_send(message.reply, "С ботом нельзя 😄")
+        return
+
+    # проверяем балансы
+    p_c = await get_player(cid, uid, message.from_user.username, message.from_user.first_name)
+    p_o = await get_player(cid, opponent_id)
+    bal_c = float(p_c["balance"])
+    bal_o = float(p_o["balance"])
+
+    if bal_c < amount:
+        await safe_send(message.reply, f"❌ У тебя ${bal_c:.4f}, нужно ${amount:.2f}")
+        return
+    if bal_o < amount:
+        await safe_send(message.reply, f"❌ У противника ${bal_o:.4f}, нужно ${amount:.2f}")
+        return
+    if uid in DUEL_BUSY or opponent_id in DUEL_BUSY:
+        await safe_send(message.reply, "⏳ Один из вас уже в дуэли.")
+        return
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="✅ Принять", callback_data=f"duel:a:{uid}:{opponent_id}:{amount}"),
+        InlineKeyboardButton(text="❌ Отклонить", callback_data=f"duel:r:{uid}:{opponent_id}:{amount}"),
+    ]])
+    text = (
+        f"🎲 <b>Дуэль на кубах!</b>\n\n"
+        f"<b>{message.from_user.first_name}</b> вызывает <b>{opponent_name}</b>\n\n"
+        f"💵 Ставка с каждого: <b>${amount:.4f}</b>\n"
+        f"💰 Банк: <b>${amount*2:.4f}</b>\n\n"
+        f"У кого кубик больше — забирает всё.\n"
+        f"<i>У {opponent_name} {DUEL_TTL // 60} мин, чтобы принять.</i>"
+    )
+    sent = await safe_send(message.reply, text, reply_markup=kb)
+    if not sent:
+        return
+
+    async def auto_close():
+        await asyncio.sleep(DUEL_TTL)
+        try:
+            await bot.edit_message_reply_markup(cid, sent.message_id, reply_markup=None)
+            await bot.edit_message_text(
+                chat_id=cid, message_id=sent.message_id,
+                text=f"⌛ <b>Дуэль истекла.</b>\n{opponent_name} не ответил.",
+            )
+        except Exception:
+            pass
+    asyncio.create_task(auto_close())
+
+
+@dp.callback_query(F.data.startswith("duel:"))
+async def on_duel_cb(cb: CallbackQuery):
+    if not cb.from_user or not isinstance(cb.message, Message):
+        await cb.answer()
+        return
+    parts = cb.data.split(":")
+    if len(parts) != 5:
+        await cb.answer("Ошибка", show_alert=True)
+        return
+    _, action, ch_str, op_str, amt_str = parts
+    try:
+        challenger_id = int(ch_str)
+        opponent_id = int(op_str)
+        amount = float(amt_str)
+    except ValueError:
+        await cb.answer("Ошибка", show_alert=True)
+        return
+
+    cid = cb.message.chat.id
+
+    if cb.from_user.id != opponent_id:
+        await cb.answer("Это не твой вызов.", show_alert=True)
+        return
+
+    if action == "r":
+        try:
+            await cb.message.edit_text(
+                f"❌ <b>Дуэль отклонена.</b>\n{cb.from_user.first_name} отказался."
+            )
+        except Exception:
+            pass
+        await cb.answer("Отклонено")
+        return
+
+    # accept
+    await cb.answer("Поехали!")
+    if challenger_id in DUEL_BUSY or opponent_id in DUEL_BUSY:
+        try:
+            await cb.message.edit_text("⏳ Один из вас уже в дуэли.")
+        except Exception:
+            pass
+        return
+
+    DUEL_BUSY.add(challenger_id)
+    DUEL_BUSY.add(opponent_id)
+    try:
+        p_c = await get_player(cid, challenger_id)
+        p_o = await get_player(cid, opponent_id)
+        if float(p_c["balance"]) < amount or float(p_o["balance"]) < amount:
+            try:
+                await cb.message.edit_text("❌ У кого-то не хватает баланса.")
+            except Exception:
+                pass
+            return
+
+        # списываем ставки (эскроу)
+        if not await deduct_balance(cid, challenger_id, amount):
+            try:
+                await cb.message.edit_text("❌ Не удалось списать у вызывающего.")
+            except Exception:
+                pass
+            return
+        if not await deduct_balance(cid, opponent_id, amount):
+            await add_balance(cid, challenger_id, amount)
+            try:
+                await cb.message.edit_text("❌ Не удалось списать у соперника. Ставка возвращена.")
+            except Exception:
+                pass
+            return
+
+        name_c = p_c.get("first_name") or str(challenger_id)
+        name_o = p_o.get("first_name") or str(opponent_id)
+
+        try:
+            await cb.message.edit_text(
+                f"🎲 <b>Дуэль началась!</b>\n\n"
+                f"💰 Банк: <b>${amount*2:.4f}</b>\n"
+                f"🎯 {name_c} vs {name_o}\n\n"
+                f"Бросаю кубики..."
+            )
+        except Exception:
+            pass
+
+        await asyncio.sleep(1)
+        m1 = await safe_send(bot.send_dice, cid, emoji="🎲")
+        r1 = m1.dice.value if m1 and m1.dice else 0
+        await asyncio.sleep(2)
+        m2 = await safe_send(bot.send_dice, cid, emoji="🎲")
+        r2 = m2.dice.value if m2 and m2.dice else 0
+        await asyncio.sleep(2)
+
+        if r1 > r2:
+            winner_id, winner_name = challenger_id, name_c
+        elif r2 > r1:
+            winner_id, winner_name = opponent_id, name_o
+        else:
+            # ничья — возврат
+            await add_balance(cid, challenger_id, amount)
+            await add_balance(cid, opponent_id, amount)
+            await safe_send(
+                bot.send_message, cid,
+                f"🤝 <b>Ничья! {r1} : {r2}</b>\n"
+                f"Ставки возвращены по ${amount:.4f}."
+            )
+            return
+
+        pot = round(amount * 2, 4)
+        await add_balance(cid, winner_id, pot)
+        await safe_send(
+            bot.send_message, cid,
+            f"🏆 <b>{winner_name} победил!</b>\n\n"
+            f"🎲 {name_c}: <b>{r1}</b>\n"
+            f"🎲 {name_o}: <b>{r2}</b>\n\n"
+            f"💰 Забирает банк: <b>${pot:.4f}</b>"
+        )
+    finally:
+        DUEL_BUSY.discard(challenger_id)
+        DUEL_BUSY.discard(opponent_id)
+
+
 # ==================== АДМИН-ПАНЕЛЬ ====================
 
 
@@ -675,7 +907,7 @@ def admin_text(cid):
         f"Расписание: с 8:00 до 23:00 ({TZ.key})\n"
         f"Награда: ${BASE_REWARD:.3f} — ${BASE_REWARD + 9*REWARD_STEP:.3f}\n"
         f"Подписка ×{SUBSCRIBER_MULTIPLIER}\n"
-        f"Копилка: {int(POT_PERCENT*100)}% с каждого ответа, раздача в {POT_HOUR}:00 МСК\n"
+        f"Копилка: {int(POT_PERCENT*100)}% · раздача в {POT_HOUR}:00 МСК\n"
         f"Вопросов: {len(QUESTIONS)} + {len(MULTI_QUESTIONS)} мульти"
         f"{cur_txt}"
     )
@@ -887,6 +1119,7 @@ async def cmd_start(message: Message):
         f"💰 Ур.1: ${BASE_REWARD:.3f} · Ур.10: ${BASE_REWARD + 9*REWARD_STEP:.3f}\n"
         f"💎 Подписчики ×{SUBSCRIBER_MULTIPLIER}\n"
         f"🎰 Копилка чата: розыгрыш раз в день\n"
+        f"🎲 Дуэли на кубах: /AiDuel 0.20\n"
         f"⏰ Вопрос каждый час с 8:00 до 23:00\n"
         f"💸 Вывод от ${MIN_WITHDRAW:.2f}\n\n"
         f"<b>Команды:</b>\n"
@@ -1190,7 +1423,6 @@ async def handle_answer(message: Message):
     old_lvl = level_from_correct(int(p["correct_answers"]))
     sub = is_subscriber_cached(cid, uid)
     reward = reward_for(int(p["correct_answers"]), is_sub=sub)
-
     pot_add = round(reward * POT_PERCENT, 4)
 
     await asyncio.gather(
@@ -1240,10 +1472,9 @@ async def handle_answer(message: Message):
 
 async def main():
     print("=" * 50)
-    print("Quiz Bot · 10 уровней · картинки · мульти · копилка")
+    print("Quiz Bot · уровни · картинки · копилка · дуэли")
     print(f"Вопросов: {len(QUESTIONS)} + {len(MULTI_QUESTIONS)} мульти")
-    print(f"Награда: ${BASE_REWARD:.3f} → ${BASE_REWARD + 9*REWARD_STEP:.3f}")
-    print(f"Копилка: {int(POT_PERCENT*100)}%, раздача в {POT_HOUR}:00")
+    print(f"Дуэли: ставка ${DUEL_MIN} — ${DUEL_MAX}")
     print(f"Админы: {sorted(ADMIN_IDS)}")
 
     await get_http()
@@ -1252,7 +1483,6 @@ async def main():
     global BANNED_CACHE, SUBSCRIBERS_CACHE
     BANNED_CACHE = await asyncio.to_thread(load_bans_sync)
     SUBSCRIBERS_CACHE = await asyncio.to_thread(load_subscribers_sync)
-    print(f"Банов: {sum(len(s) for s in BANNED_CACHE.values())}, подписчиков: {sum(len(s) for s in SUBSCRIBERS_CACHE.values())}")
 
     active_rows = await asyncio.to_thread(load_active_sync)
     for row in active_rows:
@@ -1263,8 +1493,6 @@ async def main():
             "is_multi": row.get("is_multi", False),
         }
         QUIZ_ENABLED.add(int(row["chat_id"]))
-    if active_rows:
-        print(f"Восстановлено активных: {len(active_rows)}")
 
     me = await bot.get_me()
     print(f"Подключился как @{me.username}")
