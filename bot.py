@@ -12,7 +12,7 @@ import aiohttp
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
-from aiogram.exceptions import TelegramRetryAfter
+from aiogram.exceptions import TelegramRetryAfter, TelegramBadRequest
 from aiogram.filters import Command, CommandStart
 from aiogram.types import (
     Message, CallbackQuery, BufferedInputFile,
@@ -199,12 +199,27 @@ async def close_http():
 
 
 async def safe_send(coro_func, *args, **kwargs):
+    """Отправка с ретраями на FloodWait и fallback на plain text при плохом HTML."""
     for _ in range(3):
         try:
             return await coro_func(*args, **kwargs)
         except TelegramRetryAfter as e:
             log.warning("FloodWait %s сек", e.retry_after)
             await asyncio.sleep(e.retry_after + 1)
+        except TelegramBadRequest as e:
+            if "can't parse entities" in str(e) and "parse_mode" in kwargs:
+                log.warning("Bad HTML, отправляю без разметки: %s", e)
+                kwargs.pop("parse_mode", None)
+                try:
+                    return await coro_func(*args, **kwargs)
+                except Exception as e2:
+                    log.warning("Fallback тоже упал: %s", e2)
+                    return None
+            log.warning("safe_send bad request: %s", e)
+            return None
+        except Exception as e:
+            log.warning("safe_send error: %s", e)
+            return None
     return None
 
 
@@ -599,7 +614,7 @@ async def distribute_pot(cid, reason="auto"):
     """Раздаёт копилку случайному из топ-10. Возвращает (ok, текст)."""
     amount = await payout_pot(cid)
     if amount < 0.01:
-        return False, "Копилка пуста (<$0.01)"
+        return False, "Копилка пуста (меньше $0.01)"
     rows = await get_top(cid, 10)
     if not rows:
         await add_to_pot(cid, amount)
@@ -699,7 +714,7 @@ async def cmd_aihelp(message: Message):
             f"<b>🎰 Управление копилкой</b>\n"
             f"/AiPot — сколько сейчас в фонде\n"
             f"/AiPotAdd &lt;сумма&gt; — пополнить фонд\n"
-            f"/AiPotTake &lt;сумма&gt; — снять из фонда\n"
+            f"/AiPotTake &lt;сумма&gt; — снять из фонда себе\n"
             f"/AiPotGive — раздать фонд сейчас\n"
         )
     await safe_send(message.reply, text)
@@ -896,7 +911,7 @@ async def cmd_aipotadd(message: Message):
         await safe_send(message.reply, "Сумма — число.")
         return
     if amount <= 0:
-        await safe_send(message.reply, "Сумма должна быть > 0.")
+        await safe_send(message.reply, "Сумма должна быть больше нуля.")
         return
 
     new_pot = await add_to_pot(message.chat.id, amount)
@@ -922,7 +937,7 @@ async def cmd_aipottake(message: Message):
         await safe_send(message.reply, "Сумма — число.")
         return
     if amount <= 0:
-        await safe_send(message.reply, "Сумма должна быть > 0.")
+        await safe_send(message.reply, "Сумма должна быть больше нуля.")
         return
 
     ok, new_pot = await pot_take(message.chat.id, amount)
@@ -931,7 +946,6 @@ async def cmd_aipottake(message: Message):
             f"❌ В копилке только <b>${new_pot:.4f}</b>, снять ${amount:.4f} нельзя.")
         return
 
-    # зачислим снятое админу на баланс
     await add_balance(message.chat.id, message.from_user.id, amount)
     await safe_send(message.reply,
         f"✅ Из копилки снято <b>${amount:.4f}</b>\n"
@@ -1029,7 +1043,7 @@ async def on_admin_cb(cb: CallbackQuery):
         await cb.answer("Раздаю...")
         ok, info = await distribute_pot(cid, reason="manual")
         if not ok:
-            await cb.message.answer(f"❌ {info}")
+            await safe_send(cb.message.answer, f"❌ {info}")
         return
 
     if action == "payouts":
@@ -1591,7 +1605,7 @@ async def handle_answer(message: Message):
 
 async def main():
     print("=" * 50)
-    print("Quiz Bot · уровни · копилка с ручным управлением · дуэли")
+    print("Quiz Bot · уровни · копилка · дуэли · правила")
     print(f"Вопросов: {len(QUESTIONS)} + {len(MULTI_QUESTIONS)} мульти")
     print(f"Админы: {sorted(ADMIN_IDS)}")
 
