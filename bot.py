@@ -281,20 +281,43 @@ def withdrawn_today_sync(chat_id, user_id):
 
 
 def add_to_pot_sync(chat_id, amount):
-    r = _rpc("add_to_pot", {"p_chat_id": chat_id, "p_amount": amount})
-    return float(r.data) if r and r.data is not None else None
+    """Напрямую пишет в таблицу quiz_pot, без RPC."""
+    try:
+        res = supabase.table("quiz_pot").select("amount").eq("chat_id", chat_id).execute()
+        current = float(res.data[0]["amount"]) if res.data else 0.0
+        new_amount = round(current + amount, 4)
+        if res.data:
+            supabase.table("quiz_pot").update({"amount": new_amount}).eq("chat_id", chat_id).execute()
+        else:
+            supabase.table("quiz_pot").insert({"chat_id": chat_id, "amount": new_amount}).execute()
+        log.info("add_to_pot chat=%s +%s → %s", chat_id, amount, new_amount)
+        return new_amount
+    except Exception as e:
+        log.warning("add_to_pot error: %s", e)
+        return None
 
 
 def payout_pot_sync(chat_id):
-    r = _rpc("payout_pot", {"p_chat_id": chat_id})
-    return float(r.data) if r and r.data is not None else 0.0
+    """Напрямую читает и обнуляет, без RPC. Возвращает снятую сумму."""
+    try:
+        res = supabase.table("quiz_pot").select("amount").eq("chat_id", chat_id).execute()
+        if not res.data:
+            return 0.0
+        amount = float(res.data[0]["amount"])
+        supabase.table("quiz_pot").update({"amount": 0}).eq("chat_id", chat_id).execute()
+        log.info("payout_pot chat=%s → %s", chat_id, amount)
+        return amount
+    except Exception as e:
+        log.warning("payout_pot error: %s", e)
+        return 0.0
 
 
 def get_pot_sync(chat_id):
     try:
         res = supabase.table("quiz_pot").select("amount").eq("chat_id", chat_id).execute()
         return float(res.data[0]["amount"]) if res.data else 0.0
-    except Exception:
+    except Exception as e:
+        log.warning("get_pot error: %s", e)
         return 0.0
 
 
@@ -307,6 +330,7 @@ def pot_take_sync(chat_id, amount):
             return False, current
         new_amount = round(current - amount, 4)
         supabase.table("quiz_pot").update({"amount": new_amount}).eq("chat_id", chat_id).execute()
+        log.info("pot_take chat=%s -%s → %s", chat_id, amount, new_amount)
         return True, new_amount
     except Exception as e:
         log.warning("pot_take: %s", e)
@@ -1605,7 +1629,7 @@ async def handle_answer(message: Message):
 
 async def main():
     print("=" * 50)
-    print("Quiz Bot · уровни · копилка · дуэли · правила")
+    print("Quiz Bot · уровни · копилка (без RPC) · дуэли · правила")
     print(f"Вопросов: {len(QUESTIONS)} + {len(MULTI_QUESTIONS)} мульти")
     print(f"Админы: {sorted(ADMIN_IDS)}")
 
