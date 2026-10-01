@@ -56,7 +56,6 @@ DAILY_WITHDRAW_LIMIT = 1.00
 POT_PERCENT = 0.05
 POT_HOUR = 21
 
-# Дуэли
 DUEL_MIN = 0.05
 DUEL_MAX = 1.00
 DUEL_TTL = 120
@@ -141,9 +140,8 @@ QUIZ_ENABLED = set()
 PENDING_WITHDRAWS = {}
 BANNED_CACHE = {}
 SUBSCRIBERS_CACHE = {}
-DUEL_BUSY = set()   # user_ids, которые уже в дуэли
+DUEL_BUSY = set()
 HTTP_SESSION = None
-
 _FONT_PATH = None
 
 
@@ -183,18 +181,15 @@ def render_question_image(text: str) -> bytes:
     img = Image.new("RGB", (W, H), "white")
     draw = ImageDraw.Draw(img)
     font = get_font(80)
-
     bbox = draw.textbbox((0, 0), text, font=font)
     tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
     while tw > W - 60 and font.size > 20:
         font = get_font(font.size - 5)
         bbox = draw.textbbox((0, 0), text, font=font)
         tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
-
     x = (W - tw) / 2 - bbox[0]
     y = (H - th) / 2 - bbox[1]
     draw.text((x, y), text, fill=(20, 20, 80), font=font)
-
     buf = io.BytesIO()
     img.save(buf, format="PNG")
     return buf.getvalue()
@@ -305,13 +300,24 @@ def get_pot_sync(chat_id):
 
 
 def load_bans_sync():
+    """Грузит только активные баны (учитывая banned_until)."""
     try:
-        res = supabase.table("quiz_bans").select("chat_id,user_id").execute()
+        res = supabase.table("quiz_bans").select("chat_id,user_id,banned_until").execute()
         cache = {}
+        now = datetime.now(timezone.utc)
         for row in res.data or []:
+            bu = row.get("banned_until")
+            if bu:
+                try:
+                    until = datetime.fromisoformat(bu.replace("Z", "+00:00"))
+                    if until <= now:
+                        continue
+                except Exception:
+                    pass
             cache.setdefault(int(row["chat_id"]), set()).add(int(row["user_id"]))
         return cache
-    except Exception:
+    except Exception as e:
+        log.warning("load_bans: %s", e)
         return {}
 
 
@@ -327,11 +333,14 @@ def load_subscribers_sync():
         return {}
 
 
-def ban_user_sync(chat_id, user_id, reason, admin_id):
+def ban_user_sync(chat_id, user_id, reason, admin_id, banned_until=None):
     try:
         supabase.table("quiz_bans").upsert({
-            "chat_id": chat_id, "user_id": user_id,
-            "reason": reason, "banned_by": admin_id,
+            "chat_id": chat_id,
+            "user_id": user_id,
+            "reason": reason,
+            "banned_by": admin_id,
+            "banned_until": banned_until,
         }).execute()
     except Exception as e:
         log.warning("ban: %s", e)
@@ -464,8 +473,8 @@ def is_subscriber_cached(cid, uid):
     return uid in SUBSCRIBERS_CACHE.get(cid, set())
 
 
-async def ban_user(cid, uid, reason, admin_id):
-    await asyncio.to_thread(ban_user_sync, cid, uid, reason, admin_id)
+async def ban_user(cid, uid, reason, admin_id, banned_until=None):
+    await asyncio.to_thread(ban_user_sync, cid, uid, reason, admin_id, banned_until)
     BANNED_CACHE.setdefault(cid, set()).add(uid)
 
 
@@ -626,7 +635,6 @@ async def pot_payout_loop():
                         f"🏆 Победитель: <b>{wname}</b>\n"
                         f"<i>Случайный выбор из топ-10 активных.</i>"
                     )
-                    log.info("Pot payout: chat=%s user=%s amount=%s", cid, wuid, amount)
                 except Exception as e:
                     log.warning("pot payout: %s", e)
         await asyncio.sleep(60)
@@ -643,230 +651,116 @@ async def caches_refresh_loop():
         await asyncio.sleep(60)
 
 
-# ==================== ДУЭЛИ НА КУБАХ ====================
+# ==================== КОМАНДЫ: HELP / RULES / START ====================
 
 
-@dp.message(Command("AiDuel"))
-async def cmd_duel(message: Message):
-    if message.chat.type not in ("group", "supergroup") or not message.from_user:
-        return
-    cid = message.chat.id
-    uid = message.from_user.id
-
-    if is_banned_cached(cid, uid):
-        await safe_send(message.reply, "🚫 Ты в бане.")
-        return
-
-    parts = (message.text or "").split()
-    if len(parts) < 2:
-        await safe_send(
-            message.reply,
-            f"🎲 <b>Дуэль на кубах</b>\n\n"
-            f"Формат: <code>/AiDuel 0.20</code> — ответом на сообщение противника\n\n"
-            f"Оба кидают кубик. У кого больше — забирает банк.\n"
-            f"Ставка: от ${DUEL_MIN:.2f} до ${DUEL_MAX:.2f}\n"
-            f"Ничья — возврат ставок."
-        )
-        return
-
-    try:
-        amount = float(parts[1])
-    except ValueError:
-        await safe_send(message.reply, "Ставка — число, например <code>0.20</code>")
-        return
-
-    amount = round(amount, 4)
-    if amount < DUEL_MIN or amount > DUEL_MAX:
-        await safe_send(message.reply, f"Ставка: от ${DUEL_MIN:.2f} до ${DUEL_MAX:.2f}")
-        return
-
-    # ищем противника
-    opponent_id = None
-    opponent_name = None
-    if message.reply_to_message and message.reply_to_message.from_user:
-        opp = message.reply_to_message.from_user
-        opponent_id = opp.id
-        opponent_name = opp.first_name
-    elif message.entities:
-        for ent in message.entities:
-            if ent.type == "text_mention" and ent.user:
-                opponent_id = ent.user.id
-                opponent_name = ent.user.first_name
-                break
-
-    if not opponent_id:
-        await safe_send(message.reply, "Ответь на сообщение противника или упомяни его.")
-        return
-    if opponent_id == uid:
-        await safe_send(message.reply, "Себе нельзя 😄")
-        return
-    if opponent_id == bot.id:
-        await safe_send(message.reply, "С ботом нельзя 😄")
-        return
-
-    # проверяем балансы
-    p_c = await get_player(cid, uid, message.from_user.username, message.from_user.first_name)
-    p_o = await get_player(cid, opponent_id)
-    bal_c = float(p_c["balance"])
-    bal_o = float(p_o["balance"])
-
-    if bal_c < amount:
-        await safe_send(message.reply, f"❌ У тебя ${bal_c:.4f}, нужно ${amount:.2f}")
-        return
-    if bal_o < amount:
-        await safe_send(message.reply, f"❌ У противника ${bal_o:.4f}, нужно ${amount:.2f}")
-        return
-    if uid in DUEL_BUSY or opponent_id in DUEL_BUSY:
-        await safe_send(message.reply, "⏳ Один из вас уже в дуэли.")
-        return
-
-    kb = InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="✅ Принять", callback_data=f"duel:a:{uid}:{opponent_id}:{amount}"),
-        InlineKeyboardButton(text="❌ Отклонить", callback_data=f"duel:r:{uid}:{opponent_id}:{amount}"),
-    ]])
-    text = (
-        f"🎲 <b>Дуэль на кубах!</b>\n\n"
-        f"<b>{message.from_user.first_name}</b> вызывает <b>{opponent_name}</b>\n\n"
-        f"💵 Ставка с каждого: <b>${amount:.4f}</b>\n"
-        f"💰 Банк: <b>${amount*2:.4f}</b>\n\n"
-        f"У кого кубик больше — забирает всё.\n"
-        f"<i>У {opponent_name} {DUEL_TTL // 60} мин, чтобы принять.</i>"
+@dp.message(CommandStart())
+async def cmd_start(message: Message):
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="💎 Подписка $0.50/нед", url=XROCKET_SUBSCRIBE_URL)],
+        [InlineKeyboardButton(text="🔗 Партнёрка xRocket", url=XROCKET_REFERRAL_URL)],
+    ])
+    await safe_send(
+        message.reply,
+        f"👋 <b>Викторина с уровнями!</b>\n\n"
+        f"🎯 10 уровней, +${REWARD_STEP:.3f} к награде каждый\n"
+        f"💰 Ур.1: ${BASE_REWARD:.3f} · Ур.10: ${BASE_REWARD + 9*REWARD_STEP:.3f}\n"
+        f"💎 Подписчики ×{SUBSCRIBER_MULTIPLIER}\n"
+        f"🎰 Копилка чата: розыгрыш раз в день\n"
+        f"🎲 Дуэли на кубах\n"
+        f"⏰ Вопрос каждый час с 8:00 до 23:00\n"
+        f"💸 Вывод от ${MIN_WITHDRAW:.2f}\n\n"
+        f"📖 /AiHelp — все команды\n"
+        f"📜 /AiRules — правила проекта",
+        reply_markup=kb,
     )
-    sent = await safe_send(message.reply, text, reply_markup=kb)
-    if not sent:
+
+
+@dp.message(Command("AiHelp"))
+async def cmd_aihelp(message: Message):
+    if message.chat.type not in ("group", "supergroup"):
         return
 
-    async def auto_close():
-        await asyncio.sleep(DUEL_TTL)
-        try:
-            await bot.edit_message_reply_markup(cid, sent.message_id, reply_markup=None)
-            await bot.edit_message_text(
-                chat_id=cid, message_id=sent.message_id,
-                text=f"⌛ <b>Дуэль истекла.</b>\n{opponent_name} не ответил.",
-            )
-        except Exception:
-            pass
-    asyncio.create_task(auto_close())
+    text = (
+        f"📖 <b>СПРАВКА ПО КОМАНДАМ</b>\n\n"
 
+        f"<b>🎮 Игра</b>\n"
+        f"/AiBalance — баланс, уровень, награда, прогресс\n"
+        f"/AiProfile — полный профиль с местом в топе\n"
+        f"/AiTop — топ-10 игроков по ответам\n"
+        f"/AiLevels — все 10 уровней и награды\n"
+        f"/AiWithdraw — вывод USDT от ${MIN_WITHDRAW:.2f}\n"
+        f"/AiSubscribe — инфо о подписке ×{SUBSCRIBER_MULTIPLIER}\n"
+        f"/AiDuel 0.20 — дуэль на кубах (ответом на сообщение)\n\n"
 
-@dp.callback_query(F.data.startswith("duel:"))
-async def on_duel_cb(cb: CallbackQuery):
-    if not cb.from_user or not isinstance(cb.message, Message):
-        await cb.answer()
-        return
-    parts = cb.data.split(":")
-    if len(parts) != 5:
-        await cb.answer("Ошибка", show_alert=True)
-        return
-    _, action, ch_str, op_str, amt_str = parts
-    try:
-        challenger_id = int(ch_str)
-        opponent_id = int(op_str)
-        amount = float(amt_str)
-    except ValueError:
-        await cb.answer("Ошибка", show_alert=True)
-        return
+        f"<b>📜 Общее</b>\n"
+        f"/AiRules — правила проекта\n"
+        f"/AiHelp — эта справка\n"
+    )
 
-    cid = cb.message.chat.id
-
-    if cb.from_user.id != opponent_id:
-        await cb.answer("Это не твой вызов.", show_alert=True)
-        return
-
-    if action == "r":
-        try:
-            await cb.message.edit_text(
-                f"❌ <b>Дуэль отклонена.</b>\n{cb.from_user.first_name} отказался."
-            )
-        except Exception:
-            pass
-        await cb.answer("Отклонено")
-        return
-
-    # accept
-    await cb.answer("Поехали!")
-    if challenger_id in DUEL_BUSY or opponent_id in DUEL_BUSY:
-        try:
-            await cb.message.edit_text("⏳ Один из вас уже в дуэли.")
-        except Exception:
-            pass
-        return
-
-    DUEL_BUSY.add(challenger_id)
-    DUEL_BUSY.add(opponent_id)
-    try:
-        p_c = await get_player(cid, challenger_id)
-        p_o = await get_player(cid, opponent_id)
-        if float(p_c["balance"]) < amount or float(p_o["balance"]) < amount:
-            try:
-                await cb.message.edit_text("❌ У кого-то не хватает баланса.")
-            except Exception:
-                pass
-            return
-
-        # списываем ставки (эскроу)
-        if not await deduct_balance(cid, challenger_id, amount):
-            try:
-                await cb.message.edit_text("❌ Не удалось списать у вызывающего.")
-            except Exception:
-                pass
-            return
-        if not await deduct_balance(cid, opponent_id, amount):
-            await add_balance(cid, challenger_id, amount)
-            try:
-                await cb.message.edit_text("❌ Не удалось списать у соперника. Ставка возвращена.")
-            except Exception:
-                pass
-            return
-
-        name_c = p_c.get("first_name") or str(challenger_id)
-        name_o = p_o.get("first_name") or str(opponent_id)
-
-        try:
-            await cb.message.edit_text(
-                f"🎲 <b>Дуэль началась!</b>\n\n"
-                f"💰 Банк: <b>${amount*2:.4f}</b>\n"
-                f"🎯 {name_c} vs {name_o}\n\n"
-                f"Бросаю кубики..."
-            )
-        except Exception:
-            pass
-
-        await asyncio.sleep(1)
-        m1 = await safe_send(bot.send_dice, cid, emoji="🎲")
-        r1 = m1.dice.value if m1 and m1.dice else 0
-        await asyncio.sleep(2)
-        m2 = await safe_send(bot.send_dice, cid, emoji="🎲")
-        r2 = m2.dice.value if m2 and m2.dice else 0
-        await asyncio.sleep(2)
-
-        if r1 > r2:
-            winner_id, winner_name = challenger_id, name_c
-        elif r2 > r1:
-            winner_id, winner_name = opponent_id, name_o
-        else:
-            # ничья — возврат
-            await add_balance(cid, challenger_id, amount)
-            await add_balance(cid, opponent_id, amount)
-            await safe_send(
-                bot.send_message, cid,
-                f"🤝 <b>Ничья! {r1} : {r2}</b>\n"
-                f"Ставки возвращены по ${amount:.4f}."
-            )
-            return
-
-        pot = round(amount * 2, 4)
-        await add_balance(cid, winner_id, pot)
-        await safe_send(
-            bot.send_message, cid,
-            f"🏆 <b>{winner_name} победил!</b>\n\n"
-            f"🎲 {name_c}: <b>{r1}</b>\n"
-            f"🎲 {name_o}: <b>{r2}</b>\n\n"
-            f"💰 Забирает банк: <b>${pot:.4f}</b>"
+    if message.from_user and is_admin(message.from_user.id):
+        text += (
+            f"\n<b>🛠 Админ-команды</b>\n"
+            f"/AiAdmin — панель с кнопками (вкл/выкл викторину, вопрос, стата, топ, баны, копилка, xRocket)\n"
+            f"/AiBan &lt;user_id&gt; [время] [причина] — забанить\n"
+            f"    Форматы времени: <code>30m</code>, <code>1h</code>, <code>24h</code>, <code>7d</code>, <code>perm</code>\n"
+            f"    Пример: <code>/AiBan 123456789 24h спам</code>\n"
+            f"/AiUnban &lt;user_id&gt; — разбанить\n"
         )
-    finally:
-        DUEL_BUSY.discard(challenger_id)
-        DUEL_BUSY.discard(opponent_id)
+
+    await safe_send(message.reply, text)
+
+
+@dp.message(Command("AiRules"))
+async def cmd_airules(message: Message):
+    if message.chat.type not in ("group", "supergroup"):
+        return
+    await safe_send(
+        message.reply,
+        f"📜 <b>ПРАВИЛА ПРОЕКТА</b>\n"
+        f"<i>Незнание правил не освобождает от ответственности.</i>\n\n"
+
+        f"<b>1. Оскорбления</b>\n"
+        f"<b>1.1</b> Оскорбление проекта, его названия, логотипа и репутации — <b>бан</b>.\n"
+        f"<b>1.2</b> Оскорбление владельца группы, владельца бота, администрации — <b>бан</b>.\n"
+        f"<b>1.3</b> Оскорбление участников, в том числе по национальному, религиозному и половому признаку — <b>бан</b>.\n"
+        f"<b>1.4</b> Мат в адрес участников без причины — <b>бан</b> на усмотрение админа.\n\n"
+
+        f"<b>2. Обход бана (твинк)</b>\n"
+        f"<b>2.1</b> Создание нового аккаунта после бана для возврата в чат — <b>перманентный бан</b> обоих аккаунтов.\n"
+        f"<b>2.2</b> Просьбы к друзьям писать за забаненного — <b>бан</b> посреднику.\n"
+        f"<b>2.3</b> Имитация другого игрока, подделка имени/аватара для обмана — <b>бан</b>.\n\n"
+
+        f"<b>3. Скрипты и автоматизация</b>\n"
+        f"<b>3.1</b> Использование ботов, скриптов, макросов для автоматического ответа — <b>перманентный бан</b>.\n"
+        f"<b>3.2</b> Спам ответами («4 4 4 4 4») в попытке угадать — <b>бан</b>.\n"
+        f"<b>3.3</b> Ответ быстрее 0.5 сек после вопроса фиксируется как <b>признак бота</b> и передаётся админам.\n"
+        f"<b>3.4</b> Мультиаккаунты для накрутки баланса — <b>бан всех аккаунтов + обнуление баланса</b>.\n\n"
+
+        f"<b>4. Обман и накрутка баланса</b>\n"
+        f"<b>4.1</b> Попытка накрутить баланс через баги, скрипты, эксплойты — <b>бан + сброс баланса</b>.\n"
+        f"<b>4.2</b> Фиктивные дуэли (сговор, «слив» банка) — <b>бан обоим</b>.\n"
+        f"<b>4.3</b> Продажа/передача аккаунта с балансом — <b>бан</b>.\n\n"
+
+        f"<b>5. Выводы</b>\n"
+        f"<b>5.1</b> Минимум — ${MIN_WITHDRAW:.2f} USDT, суточный лимит — ${DAILY_WITHDRAW_LIMIT:.2f}.\n"
+        f"<b>5.2</b> Для выплаты обязательно зарегистрируйся в <b>@xrocket</b> (Pay API).\n"
+        f"<b>5.3</b> Ошибочные выводы по вине игрока (не тот аккаунт) не возвращаются.\n"
+        f"<b>5.4</b> Попытка обмануть систему вывода — <b>бан + обнуление баланса</b>.\n\n"
+
+        f"<b>6. Общие положения</b>\n"
+        f"<b>6.1</b> Незнание правил не освобождает от ответственности.\n"
+        f"<b>6.2</b> Администрация применяет наказание на своё усмотрение.\n"
+        f"<b>6.3</b> Правила могут быть изменены в любой момент.\n"
+        f"<b>6.4</b> Спорные ситуации решаются только в личке с админом.\n"
+        f"<b>6.5</b> Нажатие /AiRules считается ознакомлением.\n\n"
+
+        f"<b>⚖️ Наказания</b>\n"
+        f"• <b>Бан на 1 час</b> / <b>24 часа</b> / <b>7 дней</b> — за мелкие нарушения\n"
+        f"• <b>Перманентный бан</b> — за тяжкие нарушения, без восстановления\n\n"
+
+        f"<i>Вопросы — в личку администрации.</i>"
+    )
 
 
 # ==================== АДМИН-ПАНЕЛЬ ====================
@@ -922,22 +816,79 @@ async def cmd_aiadmin(message: Message):
     await safe_send(message.reply, admin_text(message.chat.id), reply_markup=admin_kb(message.chat.id))
 
 
+def parse_duration(s: str):
+    """Парсит '1h', '24h', '7d', '30m', 'perm' → timedelta или None."""
+    s = s.lower().strip()
+    if s in ("perm", "forever", "навсегда", "permanent"):
+        return None
+    units = {"m": 60, "h": 3600, "d": 86400, "w": 604800}
+    if s and s[-1] in units:
+        try:
+            num = int(s[:-1])
+            return timedelta(seconds=num * units[s[-1]])
+        except ValueError:
+            return "error"
+    return "error"
+
+
 @dp.message(Command("AiBan"))
 async def cmd_aiban(message: Message):
     if not message.from_user or not is_admin(message.from_user.id):
         return
-    parts = (message.text or "").split(maxsplit=2)
+    parts = (message.text or "").split(maxsplit=3)
     if len(parts) < 2:
-        await safe_send(message.reply, "Формат: <code>/AiBan &lt;user_id&gt; [причина]</code>")
+        await safe_send(
+            message.reply,
+            "📛 <b>Формат бана</b>\n\n"
+            "<code>/AiBan &lt;user_id&gt; [время] [причина]</code>\n\n"
+            "<b>Время:</b>\n"
+            "• <code>30m</code> — 30 минут\n"
+            "• <code>1h</code> — 1 час\n"
+            "• <code>24h</code> — сутки\n"
+            "• <code>7d</code> — неделя\n"
+            "• <code>perm</code> — навсегда\n"
+            "• без времени — навсегда\n\n"
+            "<b>Примеры:</b>\n"
+            "<code>/AiBan 123456789 1h флуд</code>\n"
+            "<code>/AiBan 123456789 perm твинк</code>\n"
+            "<code>/AiBan 123456789</code> — навсегда без причины"
+        )
         return
     try:
         target = int(parts[1])
     except ValueError:
         await safe_send(message.reply, "user_id — целое число.")
         return
-    reason = parts[2] if len(parts) > 2 else "без причины"
-    await ban_user(message.chat.id, target, reason, message.from_user.id)
-    await safe_send(message.reply, f"🚫 <code>{target}</code> забанен.\nПричина: {reason}")
+
+    duration = None
+    reason = "без причины"
+    banned_until = None
+
+    if len(parts) >= 3:
+        parsed = parse_duration(parts[2])
+        if parsed == "error":
+            reason = " ".join(parts[2:])
+        else:
+            duration = parsed
+            reason = parts[3] if len(parts) > 3 else "без причины"
+            if duration is not None:
+                banned_until = (datetime.now(timezone.utc) + duration).isoformat()
+
+    await ban_user(message.chat.id, target, reason, message.from_user.id, banned_until)
+
+    if banned_until:
+        until_str = banned_until[:19].replace("T", " ")
+        await safe_send(
+            message.reply,
+            f"🔨 <code>{target}</code> забанен до <b>{until_str} UTC</b>\n"
+            f"Причина: {reason}"
+        )
+    else:
+        await safe_send(
+            message.reply,
+            f"🔨 <code>{target}</code> забанен <b>навсегда</b>\n"
+            f"Причина: {reason}"
+        )
 
 
 @dp.message(Command("AiUnban"))
@@ -1068,7 +1019,12 @@ async def on_admin_cb(cb: CallbackQuery):
             return
         lines = ["🚫 <b>Забаненные</b>"]
         for b in rows:
-            lines.append(f"<code>{b['user_id']}</code> — {b.get('reason','—')}")
+            until = b.get("banned_until")
+            if until:
+                until_str = until[:19].replace("T", " ") + " UTC"
+                lines.append(f"<code>{b['user_id']}</code> — до {until_str} · {b.get('reason','—')}")
+            else:
+                lines.append(f"<code>{b['user_id']}</code> — навсегда · {b.get('reason','—')}")
         await safe_send(cb.message.answer, "\n".join(lines))
         return
 
@@ -1104,28 +1060,6 @@ async def xrocket_debug():
 
 
 # ==================== ИГРОВЫЕ КОМАНДЫ ====================
-
-
-@dp.message(CommandStart())
-async def cmd_start(message: Message):
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="💎 Подписка $0.50/нед", url=XROCKET_SUBSCRIBE_URL)],
-        [InlineKeyboardButton(text="🔗 Партнёрка xRocket", url=XROCKET_REFERRAL_URL)],
-    ])
-    await safe_send(
-        message.reply,
-        f"👋 <b>Викторина с уровнями!</b>\n\n"
-        f"🎯 10 уровней, +${REWARD_STEP:.3f} к награде каждый\n"
-        f"💰 Ур.1: ${BASE_REWARD:.3f} · Ур.10: ${BASE_REWARD + 9*REWARD_STEP:.3f}\n"
-        f"💎 Подписчики ×{SUBSCRIBER_MULTIPLIER}\n"
-        f"🎰 Копилка чата: розыгрыш раз в день\n"
-        f"🎲 Дуэли на кубах: /AiDuel 0.20\n"
-        f"⏰ Вопрос каждый час с 8:00 до 23:00\n"
-        f"💸 Вывод от ${MIN_WITHDRAW:.2f}\n\n"
-        f"<b>Команды:</b>\n"
-        f"/AiBalance · /AiProfile · /AiTop · /AiLevels · /AiWithdraw",
-        reply_markup=kb,
-    )
 
 
 @dp.message(Command("AiSubscribe"))
@@ -1256,6 +1190,227 @@ async def cmd_aitop(message: Message):
         uid = f" · <code>{row['user_id']}</code>" if admin_view else ""
         lines.append(f"{medal} {emoji} {nm} — {ca} отв. · ${float(row['balance']):.4f}{uid}")
     await safe_send(message.reply, "\n".join(lines))
+
+
+# ==================== ДУЭЛИ НА КУБАХ ====================
+
+
+@dp.message(Command("AiDuel"))
+async def cmd_duel(message: Message):
+    if message.chat.type not in ("group", "supergroup") or not message.from_user:
+        return
+    cid = message.chat.id
+    uid = message.from_user.id
+
+    if is_banned_cached(cid, uid):
+        await safe_send(message.reply, "🚫 Ты в бане.")
+        return
+
+    parts = (message.text or "").split()
+    if len(parts) < 2:
+        await safe_send(
+            message.reply,
+            f"🎲 <b>Дуэль на кубах</b>\n\n"
+            f"Формат: <code>/AiDuel 0.20</code> — ответом на сообщение противника\n\n"
+            f"Оба кидают кубик. У кого больше — забирает банк.\n"
+            f"Ставка: от ${DUEL_MIN:.2f} до ${DUEL_MAX:.2f}\n"
+            f"Ничья — возврат ставок."
+        )
+        return
+
+    try:
+        amount = float(parts[1])
+    except ValueError:
+        await safe_send(message.reply, "Ставка — число, например <code>0.20</code>")
+        return
+
+    amount = round(amount, 4)
+    if amount < DUEL_MIN or amount > DUEL_MAX:
+        await safe_send(message.reply, f"Ставка: от ${DUEL_MIN:.2f} до ${DUEL_MAX:.2f}")
+        return
+
+    opponent_id = None
+    opponent_name = None
+    if message.reply_to_message and message.reply_to_message.from_user:
+        opp = message.reply_to_message.from_user
+        opponent_id = opp.id
+        opponent_name = opp.first_name
+    elif message.entities:
+        for ent in message.entities:
+            if ent.type == "text_mention" and ent.user:
+                opponent_id = ent.user.id
+                opponent_name = ent.user.first_name
+                break
+
+    if not opponent_id:
+        await safe_send(message.reply, "Ответь на сообщение противника или упомяни его.")
+        return
+    if opponent_id == uid:
+        await safe_send(message.reply, "Себе нельзя 😄")
+        return
+    if opponent_id == bot.id:
+        await safe_send(message.reply, "С ботом нельзя 😄")
+        return
+
+    p_c = await get_player(cid, uid, message.from_user.username, message.from_user.first_name)
+    p_o = await get_player(cid, opponent_id)
+    bal_c = float(p_c["balance"])
+    bal_o = float(p_o["balance"])
+
+    if bal_c < amount:
+        await safe_send(message.reply, f"❌ У тебя ${bal_c:.4f}, нужно ${amount:.2f}")
+        return
+    if bal_o < amount:
+        await safe_send(message.reply, f"❌ У противника ${bal_o:.4f}, нужно ${amount:.2f}")
+        return
+    if uid in DUEL_BUSY or opponent_id in DUEL_BUSY:
+        await safe_send(message.reply, "⏳ Один из вас уже в дуэли.")
+        return
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="✅ Принять", callback_data=f"duel:a:{uid}:{opponent_id}:{amount}"),
+        InlineKeyboardButton(text="❌ Отклонить", callback_data=f"duel:r:{uid}:{opponent_id}:{amount}"),
+    ]])
+    text = (
+        f"🎲 <b>Дуэль на кубах!</b>\n\n"
+        f"<b>{message.from_user.first_name}</b> вызывает <b>{opponent_name}</b>\n\n"
+        f"💵 Ставка с каждого: <b>${amount:.4f}</b>\n"
+        f"💰 Банк: <b>${amount*2:.4f}</b>\n\n"
+        f"У кого кубик больше — забирает всё.\n"
+        f"<i>У {opponent_name} {DUEL_TTL // 60} мин, чтобы принять.</i>"
+    )
+    sent = await safe_send(message.reply, text, reply_markup=kb)
+    if not sent:
+        return
+
+    async def auto_close():
+        await asyncio.sleep(DUEL_TTL)
+        try:
+            await bot.edit_message_reply_markup(cid, sent.message_id, reply_markup=None)
+            await bot.edit_message_text(
+                chat_id=cid, message_id=sent.message_id,
+                text=f"⌛ <b>Дуэль истекла.</b>\n{opponent_name} не ответил.",
+            )
+        except Exception:
+            pass
+    asyncio.create_task(auto_close())
+
+
+@dp.callback_query(F.data.startswith("duel:"))
+async def on_duel_cb(cb: CallbackQuery):
+    if not cb.from_user or not isinstance(cb.message, Message):
+        await cb.answer()
+        return
+    parts = cb.data.split(":")
+    if len(parts) != 5:
+        await cb.answer("Ошибка", show_alert=True)
+        return
+    _, action, ch_str, op_str, amt_str = parts
+    try:
+        challenger_id = int(ch_str)
+        opponent_id = int(op_str)
+        amount = float(amt_str)
+    except ValueError:
+        await cb.answer("Ошибка", show_alert=True)
+        return
+
+    cid = cb.message.chat.id
+
+    if cb.from_user.id != opponent_id:
+        await cb.answer("Это не твой вызов.", show_alert=True)
+        return
+
+    if action == "r":
+        try:
+            await cb.message.edit_text(
+                f"❌ <b>Дуэль отклонена.</b>\n{cb.from_user.first_name} отказался."
+            )
+        except Exception:
+            pass
+        await cb.answer("Отклонено")
+        return
+
+    await cb.answer("Поехали!")
+    if challenger_id in DUEL_BUSY or opponent_id in DUEL_BUSY:
+        try:
+            await cb.message.edit_text("⏳ Один из вас уже в дуэли.")
+        except Exception:
+            pass
+        return
+
+    DUEL_BUSY.add(challenger_id)
+    DUEL_BUSY.add(opponent_id)
+    try:
+        p_c = await get_player(cid, challenger_id)
+        p_o = await get_player(cid, opponent_id)
+        if float(p_c["balance"]) < amount or float(p_o["balance"]) < amount:
+            try:
+                await cb.message.edit_text("❌ У кого-то не хватает баланса.")
+            except Exception:
+                pass
+            return
+
+        if not await deduct_balance(cid, challenger_id, amount):
+            try:
+                await cb.message.edit_text("❌ Не удалось списать у вызывающего.")
+            except Exception:
+                pass
+            return
+        if not await deduct_balance(cid, opponent_id, amount):
+            await add_balance(cid, challenger_id, amount)
+            try:
+                await cb.message.edit_text("❌ Не удалось списать у соперника. Ставка возвращена.")
+            except Exception:
+                pass
+            return
+
+        name_c = p_c.get("first_name") or str(challenger_id)
+        name_o = p_o.get("first_name") or str(opponent_id)
+
+        try:
+            await cb.message.edit_text(
+                f"🎲 <b>Дуэль началась!</b>\n\n"
+                f"💰 Банк: <b>${amount*2:.4f}</b>\n"
+                f"🎯 {name_c} vs {name_o}\n\n"
+                f"Бросаю кубики..."
+            )
+        except Exception:
+            pass
+
+        await asyncio.sleep(1)
+        m1 = await safe_send(bot.send_dice, cid, emoji="🎲")
+        r1 = m1.dice.value if m1 and m1.dice else 0
+        await asyncio.sleep(2)
+        m2 = await safe_send(bot.send_dice, cid, emoji="🎲")
+        r2 = m2.dice.value if m2 and m2.dice else 0
+        await asyncio.sleep(2)
+
+        if r1 > r2:
+            winner_id, winner_name = challenger_id, name_c
+        elif r2 > r1:
+            winner_id, winner_name = opponent_id, name_o
+        else:
+            await add_balance(cid, challenger_id, amount)
+            await add_balance(cid, opponent_id, amount)
+            await safe_send(
+                bot.send_message, cid,
+                f"🤝 <b>Ничья! {r1} : {r2}</b>\n"
+                f"Ставки возвращены по ${amount:.4f}."
+            )
+            return
+
+        pot = round(amount * 2, 4)
+        await add_balance(cid, winner_id, pot)
+        await safe_send(
+            bot.send_message, cid,
+            f"🏆 <b>{winner_name} победил!</b>\n\n"
+            f"🎲 {name_c}: <b>{r1}</b>\n"
+            f"🎲 {name_o}: <b>{r2}</b>\n\n"
+            f"💰 Забирает банк: <b>${pot:.4f}</b>"
+        )
+    finally:
+        DUEL_BUSY.discard(challenger_id)
+        DUEL_BUSY.discard(opponent_id)
 
 
 # ==================== ВЫВОД ====================
@@ -1472,7 +1627,7 @@ async def handle_answer(message: Message):
 
 async def main():
     print("=" * 50)
-    print("Quiz Bot · уровни · картинки · копилка · дуэли")
+    print("Quiz Bot · уровни · картинки · копилка · дуэли · правила")
     print(f"Вопросов: {len(QUESTIONS)} + {len(MULTI_QUESTIONS)} мульти")
     print(f"Дуэли: ставка ${DUEL_MIN} — ${DUEL_MAX}")
     print(f"Админы: {sorted(ADMIN_IDS)}")
