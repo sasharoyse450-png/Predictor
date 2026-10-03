@@ -7,6 +7,7 @@ import logging
 import os
 import random
 import time
+import uuid
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
@@ -314,11 +315,12 @@ def get_house_by_source_sync():
         return {}
 
 
-def create_invoice_sync(client_invoice_id, user_id, chat_id, amount):
+def create_invoice_sync(client_invoice_id, user_id, chat_id, amount, message_id=None):
     try:
         res = supabase.table("quiz_invoices").insert({
             "client_invoice_id": client_invoice_id,
             "user_id": user_id, "chat_id": chat_id, "amount": amount,
+            "message_id": message_id,
         }).execute()
         return res.data[0]["id"] if res.data else None
     except Exception as e:
@@ -327,7 +329,6 @@ def create_invoice_sync(client_invoice_id, user_id, chat_id, amount):
 
 
 def mark_invoice_paid_sync(client_invoice_id):
-    """Возвращает запись или None. Идемпотентно."""
     try:
         res = supabase.table("quiz_invoices").select("*").eq(
             "client_invoice_id", client_invoice_id
@@ -336,7 +337,7 @@ def mark_invoice_paid_sync(client_invoice_id):
             return None
         inv = res.data[0]
         if inv["status"] == "paid":
-            return None  # уже обработан
+            return None
         supabase.table("quiz_invoices").update({
             "status": "paid",
             "paid_at": datetime.now(timezone.utc).isoformat(),
@@ -511,8 +512,8 @@ async def get_house_by_source():
     return await asyncio.to_thread(get_house_by_source_sync)
 
 
-async def create_invoice(client_invoice_id, uid, cid, amt):
-    return await asyncio.to_thread(create_invoice_sync, client_invoice_id, uid, cid, amt)
+async def create_invoice(client_invoice_id, uid, cid, amt, message_id=None):
+    return await asyncio.to_thread(create_invoice_sync, client_invoice_id, uid, cid, amt, message_id)
 
 
 async def mark_invoice_paid(client_invoice_id):
@@ -590,7 +591,6 @@ async def xrocket_payout(cid, uid, amount):
 
 
 async def xrocket_create_invoice(client_invoice_id: str, amount: float, description: str):
-    """Создаёт инвойс в xRocket Pay. Возвращает (success, url или error)."""
     if not XROCKET_API_KEY:
         return False, "XROCKET_API_KEY не задан"
     payload = {
@@ -599,7 +599,7 @@ async def xrocket_create_invoice(client_invoice_id: str, amount: float, descript
         "numPayments": 1,
         "clientInvoiceId": client_invoice_id,
         "description": description[:1000],
-        "expiresIn": 3600000,  # 1 час
+        "expiresIn": 3600000,
     }
     try:
         s = await get_http()
@@ -623,7 +623,6 @@ async def xrocket_create_invoice(client_invoice_id: str, amount: float, descript
 
 
 def verify_webhook_signature(raw_body: bytes, signature: str, timestamp: str, secret: str) -> bool:
-    """Проверяет HMAC-SHA256 подпись вебхука."""
     if not signature or not timestamp or not secret:
         return False
     signed_string = f"{timestamp}.{raw_body.decode('utf-8')}"
@@ -636,24 +635,20 @@ def verify_webhook_signature(raw_body: bytes, signature: str, timestamp: str, se
 
 
 async def handle_webhook(request: web.Request) -> web.Response:
-    """Принимает вебхуки от xRocket Pay."""
     try:
         raw_body = await request.read()
         signature = request.headers.get("Signature", "")
         sig_version = request.headers.get("Signature-Version", "")
         sig_timestamp = request.headers.get("Signature-Timestamp", "")
 
-        # Проверка версии
         if sig_version != "v1":
             log.warning("Webhook: неподдерживаемая версия подписи %s", sig_version)
             return web.Response(status=401, text="bad signature version")
 
-        # Проверка подписи
         if not verify_webhook_signature(raw_body, signature, sig_timestamp, XROCKET_WEBHOOK_SECRET):
             log.warning("Webhook: неверная подпись")
             return web.Response(status=401, text="bad signature")
 
-        # Парсим тело
         try:
             event = json.loads(raw_body)
         except Exception:
@@ -672,7 +667,6 @@ async def handle_webhook(request: web.Request) -> web.Response:
                 if status == "paid" and client_invoice_id:
                     await process_paid_invoice(client_invoice_id)
 
-        # Всегда отвечаем 200 быстро
         return web.Response(status=200, text="ok")
     except Exception as e:
         log.error("Webhook error: %s", e)
@@ -680,7 +674,6 @@ async def handle_webhook(request: web.Request) -> web.Response:
 
 
 async def process_paid_invoice(client_invoice_id: str):
-    """Зачисляет баланс по оплаченному инвойсу. Идемпотентно."""
     inv = await mark_invoice_paid(client_invoice_id)
     if not inv:
         log.info("Invoice %s уже обработан или не найден", client_invoice_id)
@@ -689,23 +682,43 @@ async def process_paid_invoice(client_invoice_id: str):
     user_id = int(inv["user_id"])
     chat_id = int(inv["chat_id"])
     amount = float(inv["amount"])
+    msg_id = inv.get("message_id")
 
-    await add_balance(chat_id, user_id, amount)
+    new_balance = await add_balance(chat_id, user_id, amount)
     log.info("Invoice %s: зачислено %s юзеру %s", client_invoice_id, amount, user_id)
+
+    if new_balance is None:
+        p = await get_player(chat_id, user_id)
+        new_balance = float(p.get("balance", 0))
+
+    if msg_id:
+        try:
+            await bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=int(msg_id),
+                text=(
+                    f"✅ <b>Пополнение успешно!</b>\n\n"
+                    f"💳 Зачислено: <b>${amount:.4f}</b> USDT\n"
+                    f"💰 Новый баланс: <b>${new_balance:.4f}</b>\n\n"
+                    f"<i>Спасибо за пополнение!</i>"
+                ),
+            )
+        except Exception as e:
+            log.warning("Не смог отредактировать сообщение инвойса: %s", e)
 
     try:
         await bot.send_message(
             user_id,
             f"✅ <b>Баланс пополнен!</b>\n\n"
             f"💰 Сумма: <b>${amount:.4f}</b> USDT\n"
-            f"💼 Проверить: /AiBalance",
+            f"💼 Баланс: <b>${new_balance:.4f}</b>\n"
+            f"Проверить: /AiBalance",
         )
     except Exception as e:
         log.warning("Не смог уведомить юзера %s: %s", user_id, e)
 
 
 async def start_webhook_server():
-    """Запускает aiohttp-сервер для вебхуков."""
     app = web.Application()
     app.router.add_post("/webhook", handle_webhook)
     app.router.add_get("/", lambda r: web.Response(text="ok"))
@@ -1169,8 +1182,7 @@ async def cmd_aibalance(message: Message):
         f"💰 <b>${float(p['balance']):.4f} USDT</b>\n"
         f"🎖 {title_str}\n"
         f"🏆 Очков: <b>{ca}</b>\n"
-        f"<code>{bar}</code>\n"
-        f"🎲 Рейк в дуэлях: <b>{RAKE_PCT*100:.0f}%</b>{sub_line}\n"
+        f"<code>{bar}</code>{sub_line}\n"
         f"💸 Выведено сегодня: ${today:.4f} / ${DAILY_WITHDRAW_LIMIT:.2f}\n"
         f"💳 Пополнить: /AiDeposit")
 
@@ -1274,14 +1286,8 @@ async def cmd_deposit(message: Message):
         await safe_send(message.reply, f"Сумма: ${DEPOSIT_MIN:.2f} — ${DEPOSIT_MAX:.2f}")
         return
 
-    # Генерируем уникальный clientInvoiceId
-    import uuid
     client_inv_id = f"dep_{message.from_user.id}_{uuid.uuid4().hex[:12]}"
 
-    # Сохраняем в БД
-    await create_invoice(client_inv_id, message.from_user.id, message.chat.id, amount)
-
-    # Создаём инвойс в xRocket
     ok, result = await xrocket_create_invoice(
         client_inv_id,
         amount,
@@ -1296,13 +1302,16 @@ async def cmd_deposit(message: Message):
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text=f"💳 Оплатить ${amount:.2f}", url=result)],
     ])
-    await safe_send(message.reply,
+    sent = await safe_send(message.reply,
         f"💳 <b>Счёт на пополнение</b>\n\n"
         f"Сумма: <b>${amount:.4f}</b> USDT\n"
         f"Счёт действителен 1 час.\n\n"
         f"Нажми кнопку ниже, чтобы оплатить в @xrocket. "
         f"Баланс зачислится автоматически после поступления.",
         reply_markup=kb)
+
+    msg_id = sent.message_id if sent else None
+    await create_invoice(client_inv_id, message.from_user.id, message.chat.id, amount, msg_id)
 
 
 # ==================== ДУЭЛИ ====================
@@ -1704,7 +1713,6 @@ async def main():
     me = await bot.get_me()
     print(f"Подключился как @{me.username}")
 
-    # Запускаем вебхук-сервер
     await start_webhook_server()
 
     asyncio.create_task(question_scheduler())
