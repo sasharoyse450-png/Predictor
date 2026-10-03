@@ -1,4 +1,6 @@
 import asyncio
+import hashlib
+import hmac
 import io
 import json
 import logging
@@ -9,6 +11,7 @@ from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 import aiohttp
+from aiohttp import web
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
@@ -37,15 +40,16 @@ SUPABASE_URL = os.getenv("SUPABASE_URL", "")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
 
 XROCKET_API_KEY = os.getenv("XROCKET_API_KEY", "")
+XROCKET_WEBHOOK_SECRET = os.getenv("XROCKET_WEBHOOK_SECRET", "")
 XROCKET_BASE = "https://pay.api.xrocket.exchange"
 XROCKET_SUBSCRIBE_URL = os.getenv("XROCKET_SUBSCRIBE_URL", "https://t.me/xRocket")
 XROCKET_REFERRAL_URL = os.getenv("XROCKET_REFERRAL_URL", "https://t.me/xRocket")
 
+PORT = int(os.getenv("PORT", 8080))
+
 POINTS_PER_ANSWER = 1
 ANSWERS_PER_LEVEL = 10
 MAX_LEVEL = 10
-
-# Рейк дома — ФИКСИРОВАННЫЕ 5%
 RAKE_PCT = 0.05
 
 SUBSCRIBER_MULTIPLIER = 2.0
@@ -54,7 +58,6 @@ SUBSCRIPTION_PRICE = 0.50
 MIN_WITHDRAW = 0.05
 DAILY_WITHDRAW_LIMIT = 5.00
 
-# Депозит от $0.05
 DEPOSIT_MIN = 0.05
 DEPOSIT_MAX = 50.0
 
@@ -311,48 +314,37 @@ def get_house_by_source_sync():
         return {}
 
 
-def create_deposit_sync(user_id, chat_id, amount):
+def create_invoice_sync(client_invoice_id, user_id, chat_id, amount):
     try:
-        res = supabase.table("quiz_deposits").insert({
+        res = supabase.table("quiz_invoices").insert({
+            "client_invoice_id": client_invoice_id,
             "user_id": user_id, "chat_id": chat_id, "amount": amount,
         }).execute()
         return res.data[0]["id"] if res.data else None
     except Exception as e:
-        log.warning("create_deposit: %s", e)
+        log.warning("create_invoice: %s", e)
         return None
 
 
-def list_pending_deposits_sync():
+def mark_invoice_paid_sync(client_invoice_id):
+    """Возвращает запись или None. Идемпотентно."""
     try:
-        res = supabase.table("quiz_deposits").select("*").eq("status", "pending").order("created_at").execute()
-        return res.data or []
-    except Exception:
-        return []
-
-
-def approve_deposit_sync(deposit_id):
-    try:
-        res = supabase.table("quiz_deposits").select("*").eq("id", deposit_id).execute()
+        res = supabase.table("quiz_invoices").select("*").eq(
+            "client_invoice_id", client_invoice_id
+        ).execute()
         if not res.data:
             return None
-        d = res.data[0]
-        if d["status"] != "pending":
-            return None
-        supabase.table("quiz_deposits").update({
-            "status": "approved",
-            "approved_at": datetime.now(timezone.utc).isoformat(),
-        }).eq("id", deposit_id).execute()
-        return d
+        inv = res.data[0]
+        if inv["status"] == "paid":
+            return None  # уже обработан
+        supabase.table("quiz_invoices").update({
+            "status": "paid",
+            "paid_at": datetime.now(timezone.utc).isoformat(),
+        }).eq("client_invoice_id", client_invoice_id).execute()
+        return inv
     except Exception as e:
-        log.warning("approve_deposit: %s", e)
+        log.warning("mark_invoice_paid: %s", e)
         return None
-
-
-def reject_deposit_sync(deposit_id):
-    try:
-        supabase.table("quiz_deposits").update({"status": "rejected"}).eq("id", deposit_id).execute()
-    except Exception as e:
-        log.warning("reject_deposit: %s", e)
 
 
 def load_bans_sync():
@@ -519,20 +511,12 @@ async def get_house_by_source():
     return await asyncio.to_thread(get_house_by_source_sync)
 
 
-async def create_deposit(uid, cid, amt):
-    return await asyncio.to_thread(create_deposit_sync, uid, cid, amt)
+async def create_invoice(client_invoice_id, uid, cid, amt):
+    return await asyncio.to_thread(create_invoice_sync, client_invoice_id, uid, cid, amt)
 
 
-async def list_pending_deposits():
-    return await asyncio.to_thread(list_pending_deposits_sync)
-
-
-async def approve_deposit(dep_id):
-    return await asyncio.to_thread(approve_deposit_sync, dep_id)
-
-
-async def reject_deposit(dep_id):
-    await asyncio.to_thread(reject_deposit_sync, dep_id)
+async def mark_invoice_paid(client_invoice_id):
+    return await asyncio.to_thread(mark_invoice_paid_sync, client_invoice_id)
 
 
 def is_banned_cached(cid, uid):
@@ -605,6 +589,133 @@ async def xrocket_payout(cid, uid, amount):
         return False, str(e)
 
 
+async def xrocket_create_invoice(client_invoice_id: str, amount: float, description: str):
+    """Создаёт инвойс в xRocket Pay. Возвращает (success, url или error)."""
+    if not XROCKET_API_KEY:
+        return False, "XROCKET_API_KEY не задан"
+    payload = {
+        "priceAmount": f"{amount:.4f}",
+        "priceCurrency": "USDT",
+        "numPayments": 1,
+        "clientInvoiceId": client_invoice_id,
+        "description": description[:1000],
+        "expiresIn": 3600000,  # 1 час
+    }
+    try:
+        s = await get_http()
+        async with s.post(
+            f"{XROCKET_BASE}/api/v1/invoices",
+            headers={"Authorization": f"Bearer {XROCKET_API_KEY}", "Content-Type": "application/json"},
+            json=payload,
+        ) as r:
+            data = await r.json()
+            log.info("xRocket invoice [%s] %s", r.status, data)
+            if r.status in (200, 201):
+                inv_id = data.get("id")
+                url = data.get("links", {}).get("telegramBotLink") or f"https://t.me/xRocket?start={inv_id}"
+                return True, url
+            return False, data.get("detail") or data.get("title") or str(data)
+    except Exception as e:
+        return False, str(e)
+
+
+# ==================== WEBHOOK SERVER ====================
+
+
+def verify_webhook_signature(raw_body: bytes, signature: str, timestamp: str, secret: str) -> bool:
+    """Проверяет HMAC-SHA256 подпись вебхука."""
+    if not signature or not timestamp or not secret:
+        return False
+    signed_string = f"{timestamp}.{raw_body.decode('utf-8')}"
+    expected = hmac.new(
+        secret.encode("utf-8"),
+        signed_string.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+    return hmac.compare_digest(expected, signature)
+
+
+async def handle_webhook(request: web.Request) -> web.Response:
+    """Принимает вебхуки от xRocket Pay."""
+    try:
+        raw_body = await request.read()
+        signature = request.headers.get("Signature", "")
+        sig_version = request.headers.get("Signature-Version", "")
+        sig_timestamp = request.headers.get("Signature-Timestamp", "")
+
+        # Проверка версии
+        if sig_version != "v1":
+            log.warning("Webhook: неподдерживаемая версия подписи %s", sig_version)
+            return web.Response(status=401, text="bad signature version")
+
+        # Проверка подписи
+        if not verify_webhook_signature(raw_body, signature, sig_timestamp, XROCKET_WEBHOOK_SECRET):
+            log.warning("Webhook: неверная подпись")
+            return web.Response(status=401, text="bad signature")
+
+        # Парсим тело
+        try:
+            event = json.loads(raw_body)
+        except Exception:
+            return web.Response(status=400, text="bad json")
+
+        ev_type = event.get("type")
+        data = event.get("data", {})
+        log.info("Webhook получен: type=%s id=%s", ev_type, event.get("id"))
+
+        if ev_type == "invoice":
+            ev_name = data.get("event")
+            if ev_name == "invoice_status_changed":
+                inv = data.get("invoice", {})
+                status = inv.get("status")
+                client_invoice_id = inv.get("clientInvoiceId")
+                if status == "paid" and client_invoice_id:
+                    await process_paid_invoice(client_invoice_id)
+
+        # Всегда отвечаем 200 быстро
+        return web.Response(status=200, text="ok")
+    except Exception as e:
+        log.error("Webhook error: %s", e)
+        return web.Response(status=200, text="ok")
+
+
+async def process_paid_invoice(client_invoice_id: str):
+    """Зачисляет баланс по оплаченному инвойсу. Идемпотентно."""
+    inv = await mark_invoice_paid(client_invoice_id)
+    if not inv:
+        log.info("Invoice %s уже обработан или не найден", client_invoice_id)
+        return
+
+    user_id = int(inv["user_id"])
+    chat_id = int(inv["chat_id"])
+    amount = float(inv["amount"])
+
+    await add_balance(chat_id, user_id, amount)
+    log.info("Invoice %s: зачислено %s юзеру %s", client_invoice_id, amount, user_id)
+
+    try:
+        await bot.send_message(
+            user_id,
+            f"✅ <b>Баланс пополнен!</b>\n\n"
+            f"💰 Сумма: <b>${amount:.4f}</b> USDT\n"
+            f"💼 Проверить: /AiBalance",
+        )
+    except Exception as e:
+        log.warning("Не смог уведомить юзера %s: %s", user_id, e)
+
+
+async def start_webhook_server():
+    """Запускает aiohttp-сервер для вебхуков."""
+    app = web.Application()
+    app.router.add_post("/webhook", handle_webhook)
+    app.router.add_get("/", lambda r: web.Response(text="ok"))
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", PORT)
+    await site.start()
+    log.info("Webhook-сервер запущен на порту %s", PORT)
+
+
 # ==================== ВОПРОСЫ ====================
 
 
@@ -616,21 +727,20 @@ async def ask_question(chat_id):
         await bot.send_chat_action(chat_id, "typing")
     except Exception:
         pass
-
     try:
         if is_image:
             png = render_question_image(q)
             buf = BufferedInputFile(png, filename="q.png")
             caption = (f"🧠 <b>Вопрос!</b>\n\n"
                        f"🏆 Первый правильный → <b>+1 очко</b>\n"
-                       f"🎲 Дуэли на кубах: <code>/AiDuel 0.20</code>\n"
+                       f"🎲 Дуэли: <code>/AiDuel 0.20</code>\n"
                        f"🔓 Вопрос открыт, пока кто-то не ответит верно.")
             msg = await safe_send(bot.send_photo, chat_id, buf, caption=caption)
         else:
             msg = await safe_send(bot.send_message, chat_id,
                 f"🧠 <b>Вопрос!</b>\n\n❓ {q}\n\n"
                 f"🏆 Первый правильный → <b>+1 очко</b>\n"
-                f"🎲 Дуэли на кубах: <code>/AiDuel 0.20</code>\n"
+                f"🎲 Дуэли: <code>/AiDuel 0.20</code>\n"
                 f"🔓 Вопрос открыт, пока кто-то не ответит верно.")
         if msg:
             try:
@@ -688,11 +798,11 @@ async def cmd_start(message: Message):
         f"👋 <b>Викторина с дуэлями!</b>\n\n"
         f"🎯 Квиз: правильный ответ → <b>+1 очко</b>\n"
         f"📈 10 уровней за очки\n"
-        f"🎲 Дуэли на кубах на USDT: <code>/AiDuel 0.20</code>\n"
+        f"🎲 Дуэли: <code>/AiDuel 0.20</code>\n"
         f"💳 Пополнить: <code>/AiDeposit 1.0</code>\n"
         f"💸 Вывод от ${MIN_WITHDRAW:.2f}\n\n"
         f"📖 /AiHelp — все команды\n"
-        f"📜 /AiRules — правила проекта",
+        f"📜 /AiRules — правила",
         reply_markup=kb)
 
 
@@ -703,28 +813,25 @@ async def cmd_aihelp(message: Message):
     text = (
         f"📖 <b>СПРАВКА</b>\n\n"
         f"<b>🎮 Игра</b>\n"
-        f"/AiBalance — баланс, очки, уровень\n"
-        f"/AiProfile — полный профиль\n"
-        f"/AiTop — топ-10 по очкам\n"
+        f"/AiBalance — баланс и уровень\n"
+        f"/AiProfile — профиль\n"
+        f"/AiTop — топ-10\n"
         f"/AiLevels — все уровни\n"
         f"/AiDuel 0.20 — дуэль на кубах\n\n"
         f"<b>💰 Деньги</b>\n"
         f"/AiDeposit 0.05 — пополнить (от ${DEPOSIT_MIN:.2f})\n"
-        f"/AiWithdraw — вывести USDT от ${MIN_WITHDRAW:.2f}\n"
+        f"/AiWithdraw — вывод от ${MIN_WITHDRAW:.2f}\n"
         f"/AiSubscribe — подписка ×{SUBSCRIBER_MULTIPLIER}\n\n"
         f"<b>📜 Общее</b>\n"
-        f"/AiRules — правила\n"
-        f"/AiHelp — эта справка\n"
+        f"/AiRules · /AiHelp\n"
     )
     if message.from_user and is_admin(message.from_user.id):
         text += (
-            f"\n<b>🛠 Админ-команды</b>\n"
+            f"\n<b>🛠 Админ</b>\n"
             f"/AiAdmin — панель\n"
-            f"/AiHouse — касса дома\n"
+            f"/AiHouse — касса\n"
             f"/AiBan &lt;id&gt; [время] [причина]\n"
             f"/AiUnban &lt;id&gt;\n"
-            f"/AiApproveDeposit &lt;id&gt;\n"
-            f"/AiRejectDeposit &lt;id&gt;\n"
         )
     await safe_send(message.reply, text)
 
@@ -734,42 +841,17 @@ async def cmd_airules(message: Message):
     if message.chat.type not in ("group", "supergroup"):
         return
     await safe_send(message.reply,
-        f"📜 <b>ПРАВИЛА ПРОЕКТА</b>\n"
-        f"<i>Незнание правил не освобождает от ответственности.</i>\n\n"
-        f"<b>1. Оскорбления</b>\n"
-        f"<b>1.1</b> Оскорбление проекта, названия, логотипа — <b>бан</b>.\n"
-        f"<b>1.2</b> Оскорбление владельца группы, бота, администрации — <b>бан</b>.\n"
-        f"<b>1.3</b> Оскорбление участников (нация, религия, пол) — <b>бан</b>.\n"
-        f"<b>1.4</b> Мат в адрес участников без причины — <b>бан</b>.\n\n"
-        f"<b>2. Обход бана (твинк)</b>\n"
-        f"<b>2.1</b> Новый аккаунт после бана — <b>перманентный бан</b> обоих.\n"
-        f"<b>2.2</b> Просьбы писать за забаненного — <b>бан</b> посреднику.\n"
-        f"<b>2.3</b> Имитация другого игрока — <b>бан</b>.\n\n"
-        f"<b>3. Скрипты и автоматизация</b>\n"
-        f"<b>3.1</b> Боты, скрипты, макросы для ответов — <b>перманентный бан</b>.\n"
-        f"<b>3.2</b> Спам ответами («4 4 4 4 4») — <b>бан</b>.\n"
-        f"<b>3.3</b> Ответ <0.5 сек — признак бота.\n"
-        f"<b>3.4</b> Мультиаккаунты для накрутки — <b>бан + обнуление</b>.\n\n"
-        f"<b>4. Обман и накрутка</b>\n"
-        f"<b>4.1</b> Накрутка через баги — <b>бан + сброс баланса</b>.\n"
-        f"<b>4.2</b> Фиктивные дуэли (сговор) — <b>бан обоим</b>.\n"
-        f"<b>4.3</b> Продажа аккаунта с балансом — <b>бан</b>.\n\n"
-        f"<b>5. Выводы и депозиты</b>\n"
-        f"<b>5.1</b> Минимум вывода — ${MIN_WITHDRAW:.2f} USDT, суточный лимит — ${DAILY_WITHDRAW_LIMIT:.2f}.\n"
-        f"<b>5.2</b> Минимум депозита — ${DEPOSIT_MIN:.2f} USDT.\n"
-        f"<b>5.3</b> Для выплаты обязательно зайти в <b>@xrocket</b>.\n"
-        f"<b>5.4</b> Ошибочные переводы по вине игрока не возвращаются.\n"
-        f"<b>5.5</b> Попытка обмануть систему — <b>бан + обнуление</b>.\n\n"
-        f"<b>6. Общие положения</b>\n"
-        f"<b>6.1</b> Незнание правил не освобождает от ответственности.\n"
-        f"<b>6.2</b> Администрация применяет наказание на своё усмотрение.\n"
-        f"<b>6.3</b> Правила могут быть изменены в любой момент.\n"
-        f"<b>6.4</b> Спорные ситуации решаются только в личке с админом.\n"
-        f"<b>6.5</b> Нажатие /AiRules — ознакомление.\n\n"
-        f"<b>⚖️ Наказания</b>\n"
-        f"• <b>Бан 1ч / 24ч / 7д</b> — за мелкие нарушения\n"
-        f"• <b>Перманентный бан</b> — за тяжкие нарушения\n\n"
-        f"<i>Вопросы — в личку администрации.</i>")
+        f"📜 <b>ПРАВИЛА</b>\n\n"
+        f"<b>1.</b> Оскорбления проекта, админов, участников — <b>бан</b>.\n"
+        f"<b>2.</b> Обход бана (твинк) — <b>перманентный бан</b>.\n"
+        f"<b>3.</b> Скрипты, боты, мультиаккаунты — <b>бан + сброс</b>.\n"
+        f"<b>4.</b> Спам ответами — <b>бан</b>.\n"
+        f"<b>5.</b> Фиктивные дуэли, сговор — <b>бан обоим</b>.\n"
+        f"<b>6.</b> Обман системы вывода — <b>бан + обнуление</b>.\n\n"
+        f"💸 Вывод: от ${MIN_WITHDRAW:.2f} · лимит ${DAILY_WITHDRAW_LIMIT:.2f}/сутки\n"
+        f"💳 Депозит: от ${DEPOSIT_MIN:.2f}\n"
+        f"🎲 Рейк с дуэлей: {RAKE_PCT*100:.0f}%\n\n"
+        f"<i>Незнание правил не освобождает от ответственности.</i>")
 
 
 # ==================== АДМИН-ПАНЕЛЬ ====================
@@ -785,8 +867,7 @@ def admin_kb(cid):
          InlineKeyboardButton(text="💸 Выплаты", callback_data="adm:payouts")],
         [InlineKeyboardButton(text="📋 Топ", callback_data="adm:top"),
          InlineKeyboardButton(text="🚫 Баны", callback_data="adm:bans")],
-        [InlineKeyboardButton(text="💳 Депозиты", callback_data="adm:deposits"),
-         InlineKeyboardButton(text="🧪 xRocket", callback_data="adm:xrdbg")],
+        [InlineKeyboardButton(text="🧪 xRocket", callback_data="adm:xrdbg")],
     ])
 
 
@@ -797,11 +878,10 @@ def admin_text(cid):
     return (f"🛠 <b>Админ-панель</b>\n"
             f"Викторина: {status}\n"
             f"Расписание: 8:00 — 23:00 ({TZ.key})\n"
-            f"Квиз: +1 очко за ответ (без USDT)\n"
-            f"Рейк с дуэлей: <b>{RAKE_PCT*100:.1f}%</b>\n"
-            f"Депозит: от ${DEPOSIT_MIN:.2f}\n"
-            f"Вывод: от ${MIN_WITHDRAW:.2f} · лимит ${DAILY_WITHDRAW_LIMIT:.2f}/сутки\n"
-            f"Вопросов: {len(QUESTIONS)} + {len(MULTI_QUESTIONS)} мульти"
+            f"Квиз: +1 очко за ответ\n"
+            f"Рейк с дуэлей: <b>{RAKE_PCT*100:.0f}%</b>\n"
+            f"Депозит: от ${DEPOSIT_MIN:.2f} (авто)\n"
+            f"Вывод: от ${MIN_WITHDRAW:.2f} · лимит ${DAILY_WITHDRAW_LIMIT:.2f}/сутки"
             f"{cur_txt}")
 
 
@@ -831,7 +911,7 @@ async def cmd_house(message: Message):
         for src, amt in sorted(by.items(), key=lambda x: -x[1]):
             lines.append(f"• {src}: ${amt:.4f}")
     else:
-        lines.append("<i>Пока пусто. Начнут играть дуэли — пойдёт доход.</i>")
+        lines.append("<i>Пока пусто.</i>")
     await safe_send(message.reply, "\n".join(lines))
 
 
@@ -855,8 +935,7 @@ async def cmd_aiban(message: Message):
     parts = (message.text or "").split(maxsplit=3)
     if len(parts) < 2:
         await safe_send(message.reply,
-            "📛 <b>Формат</b>\n"
-            "<code>/AiBan &lt;id&gt; [время] [причина]</code>\n"
+            "📛 <code>/AiBan &lt;id&gt; [время] [причина]</code>\n"
             "Время: 30m / 1h / 24h / 7d / perm")
         return
     try:
@@ -864,11 +943,9 @@ async def cmd_aiban(message: Message):
     except ValueError:
         await safe_send(message.reply, "user_id — целое число.")
         return
-
     duration = None
     reason = "без причины"
     banned_until = None
-
     if len(parts) >= 3:
         parsed = parse_duration(parts[2])
         if parsed == "error":
@@ -878,9 +955,7 @@ async def cmd_aiban(message: Message):
             reason = parts[3] if len(parts) > 3 else "без причины"
             if duration is not None:
                 banned_until = (datetime.now(timezone.utc) + duration).isoformat()
-
     await ban_user(message.chat.id, target, reason, message.from_user.id, banned_until)
-
     if banned_until:
         await safe_send(message.reply,
             f"🔨 <code>{target}</code> забанен до <b>{banned_until[:19].replace('T', ' ')} UTC</b>\n"
@@ -1029,20 +1104,6 @@ async def on_admin_cb(cb: CallbackQuery):
         await safe_send(cb.message.answer, "\n".join(lines))
         return
 
-    if action == "deposits":
-        await cb.answer("Собираю...")
-        rows = await list_pending_deposits()
-        if not rows:
-            await safe_send(cb.message.answer, "Заявок на депозит нет.")
-            return
-        lines = ["💳 <b>Заявки на депозит</b>"]
-        for d in rows:
-            dt = (d.get("created_at") or "")[:19].replace("T", " ")
-            lines.append(f"<code>{d['id']}</code> · ${float(d['amount']):.4f} · <code>{d['user_id']}</code> · {dt}")
-        lines.append("\n<i>Одобрить: /AiApproveDeposit ID\nОтклонить: /AiRejectDeposit ID</i>")
-        await safe_send(cb.message.answer, "\n".join(lines))
-        return
-
     if action == "xrdbg":
         await cb.answer("Проверяю...")
         msg = await safe_send(cb.message.answer, "⏳ Проверяю xRocket...")
@@ -1085,8 +1146,8 @@ async def cmd_aisub(message: Message):
     await safe_send(message.reply,
         f"💎 <b>Подписка ×{SUBSCRIBER_MULTIPLIER}</b>\n\n"
         f"Цена: <b>${SUBSCRIPTION_PRICE:.2f}/нед</b>\n"
-        f"• ×{SUBSCRIBER_MULTIPLIER} к очкам в квизе\n"
-        f"• Бейдж 💎 в профиле\n\n"
+        f"• ×{SUBSCRIBER_MULTIPLIER} к очкам\n"
+        f"• Бейдж 💎\n\n"
         f"Оформить через @xrocket:",
         reply_markup=kb)
 
@@ -1109,8 +1170,9 @@ async def cmd_aibalance(message: Message):
         f"🎖 {title_str}\n"
         f"🏆 Очков: <b>{ca}</b>\n"
         f"<code>{bar}</code>\n"
-        f"🎲 Рейк в дуэлях: <b>{RAKE_PCT*100:.1f}%</b>{sub_line}\n"
-        f"💸 Выведено сегодня: ${today:.4f} / ${DAILY_WITHDRAW_LIMIT:.2f}")
+        f"🎲 Рейк в дуэлях: <b>{RAKE_PCT*100:.0f}%</b>{sub_line}\n"
+        f"💸 Выведено сегодня: ${today:.4f} / ${DAILY_WITHDRAW_LIMIT:.2f}\n"
+        f"💳 Пополнить: /AiDeposit")
 
 
 @dp.message(Command("AiProfile"))
@@ -1143,17 +1205,15 @@ async def cmd_aiprofile(message: Message):
     else:
         in_lvl = ca - (lvl - 1) * ANSWERS_PER_LEVEL
         rem = ANSWERS_PER_LEVEL - in_lvl
-        next_line = (f"⬆️ До {LEVELS[lvl][1]} <b>{LEVELS[lvl][2]}</b>: "
-                     f"<b>{rem}</b> очк.")
+        next_line = f"⬆️ До {LEVELS[lvl][1]} <b>{LEVELS[lvl][2]}</b>: <b>{rem}</b> очк."
 
     sub_line = f"\n💎 Подписка: <b>активна</b>" if sub else "\n💎 Подписка: нет"
     await safe_send(message.reply,
         f"👤 <b>{message.from_user.first_name}</b>\n\n"
-        f"🎖 <b>{title_str}</b>\n"
-        f"🎲 Рейк в дуэлях: <b>{RAKE_PCT*100:.1f}%</b>{sub_line}\n\n"
+        f"🎖 <b>{title_str}</b>{sub_line}\n\n"
         f"<code>{bar}</code>\n{next_line}\n\n"
         f"💰 Баланс: <b>${float(p['balance']):.4f}</b>\n"
-        f"💸 Выведено: ${today:.4f}\n\n"
+        f"💸 Выведено: ${today:.4f}\n"
         f"🏆 Очков: <b>{ca}</b>\n"
         f"📍 Место: <b>{place_str}</b>")
 
@@ -1162,8 +1222,7 @@ async def cmd_aiprofile(message: Message):
 async def cmd_ailevels(message: Message):
     if message.chat.type not in ("group", "supergroup"):
         return
-    lines = [f"🎖 <b>Уровни</b>\n",
-             f"<i>Рейк в дуэлях одинаковый для всех: {RAKE_PCT*100:.1f}%</i>\n"]
+    lines = [f"🎖 <b>Уровни</b>\n"]
     for lvl, emoji, name in LEVELS:
         mn = (lvl - 1) * ANSWERS_PER_LEVEL
         req = f"{mn}+" if lvl == MAX_LEVEL else f"{mn}-{mn + ANSWERS_PER_LEVEL - 1}"
@@ -1191,7 +1250,7 @@ async def cmd_aitop(message: Message):
     await safe_send(message.reply, "\n".join(lines))
 
 
-# ==================== ДЕПОЗИТЫ ====================
+# ==================== ДЕПОЗИТ (АВТО) ====================
 
 
 @dp.message(Command("AiDeposit"))
@@ -1204,9 +1263,7 @@ async def cmd_deposit(message: Message):
             f"💳 <b>Пополнение баланса</b>\n\n"
             f"Формат: <code>/AiDeposit 1.0</code>\n"
             f"Мин: ${DEPOSIT_MIN:.2f} · Макс: ${DEPOSIT_MAX:.2f}\n\n"
-            f"После создания заявки переведи USDT админу "
-            f"через <a href=\"{XROCKET_REFERRAL_URL}\">@xrocket</a>.\n"
-            f"Админ подтвердит — баланс зачислится.")
+            f"Оплата в USDT через @xrocket — баланс зачислится автоматически.")
         return
     try:
         amount = round(float(parts[1]), 4)
@@ -1217,82 +1274,35 @@ async def cmd_deposit(message: Message):
         await safe_send(message.reply, f"Сумма: ${DEPOSIT_MIN:.2f} — ${DEPOSIT_MAX:.2f}")
         return
 
-    dep_id = await create_deposit(message.from_user.id, message.chat.id, amount)
-    if not dep_id:
-        await safe_send(message.reply, "Ошибка создания заявки.")
+    # Генерируем уникальный clientInvoiceId
+    import uuid
+    client_inv_id = f"dep_{message.from_user.id}_{uuid.uuid4().hex[:12]}"
+
+    # Сохраняем в БД
+    await create_invoice(client_inv_id, message.from_user.id, message.chat.id, amount)
+
+    # Создаём инвойс в xRocket
+    ok, result = await xrocket_create_invoice(
+        client_inv_id,
+        amount,
+        f"Deposit for quiz bot (user {message.from_user.id})",
+    )
+    if not ok:
+        await safe_send(message.reply,
+            f"❌ Не удалось создать счёт:\n<code>{result}</code>\n\n"
+            f"Попробуй позже или обратись к админу.")
         return
 
-    for admin_id in ADMIN_IDS:
-        try:
-            await bot.send_message(
-                admin_id,
-                f"💳 <b>Новая заявка на депозит</b>\n\n"
-                f"ID: <code>{dep_id}</code>\n"
-                f"От: {message.from_user.first_name} (<code>{message.from_user.id}</code>)\n"
-                f"Сумма: <b>${amount:.4f}</b>\n\n"
-                f"Подтвердить: <code>/AiApproveDeposit {dep_id}</code>\n"
-                f"Отклонить: <code>/AiRejectDeposit {dep_id}</code>"
-            )
-        except Exception:
-            pass
-
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"💳 Оплатить ${amount:.2f}", url=result)],
+    ])
     await safe_send(message.reply,
-        f"✅ Заявка создана (ID <code>{dep_id}</code>)\n\n"
-        f"<b>Что делать:</b>\n"
-        f"1. Открой @xrocket\n"
-        f"2. Переведи <b>${amount:.4f}</b> USDT админу\n"
-        f"3. Напиши админу номер заявки\n"
-        f"4. Баланс зачислится после подтверждения.")
-
-
-@dp.message(Command("AiApproveDeposit"))
-async def cmd_approve_deposit(message: Message):
-    if not message.from_user or not is_admin(message.from_user.id):
-        return
-    parts = (message.text or "").split()
-    if len(parts) != 2:
-        await safe_send(message.reply, "Формат: <code>/AiApproveDeposit 15</code>")
-        return
-    try:
-        dep_id = int(parts[1])
-    except ValueError:
-        await safe_send(message.reply, "ID — число.")
-        return
-
-    d = await approve_deposit(dep_id)
-    if not d:
-        await safe_send(message.reply, "Заявка не найдена или уже обработана.")
-        return
-
-    await add_balance(d["chat_id"], d["user_id"], float(d["amount"]))
-    await safe_send(message.reply,
-        f"✅ Заявка <code>{dep_id}</code> подтверждена\n"
-        f"💰 <code>{d['user_id']}</code> зачислено <b>${float(d['amount']):.4f}</b>")
-
-    try:
-        await bot.send_message(
-            d["user_id"],
-            f"✅ Твой депозит подтверждён!\n"
-            f"💰 Зачислено: <b>${float(d['amount']):.4f}</b>")
-    except Exception:
-        pass
-
-
-@dp.message(Command("AiRejectDeposit"))
-async def cmd_reject_deposit(message: Message):
-    if not message.from_user or not is_admin(message.from_user.id):
-        return
-    parts = (message.text or "").split()
-    if len(parts) != 2:
-        await safe_send(message.reply, "Формат: <code>/AiRejectDeposit 15</code>")
-        return
-    try:
-        dep_id = int(parts[1])
-    except ValueError:
-        await safe_send(message.reply, "ID — число.")
-        return
-    await reject_deposit(dep_id)
-    await safe_send(message.reply, f"❌ Заявка <code>{dep_id}</code> отклонена.")
+        f"💳 <b>Счёт на пополнение</b>\n\n"
+        f"Сумма: <b>${amount:.4f}</b> USDT\n"
+        f"Счёт действителен 1 час.\n\n"
+        f"Нажми кнопку ниже, чтобы оплатить в @xrocket. "
+        f"Баланс зачислится автоматически после поступления.",
+        reply_markup=kb)
 
 
 # ==================== ДУЭЛИ ====================
@@ -1311,9 +1321,9 @@ async def cmd_duel(message: Message):
         await safe_send(message.reply,
             f"🎲 <b>Дуэль на кубах</b>\n\n"
             f"Формат: <code>/AiDuel 0.20</code> — ответом на сообщение\n"
-            f"Ставка: от ${DUEL_MIN:.2f} до ${DUEL_MAX:.2f}\n"
+            f"Ставка: ${DUEL_MIN:.2f} — ${DUEL_MAX:.2f}\n"
             f"Ничья — возврат.\n"
-            f"Рейк дома: {RAKE_PCT*100:.1f}% с банка.")
+            f"Рейк дома: {RAKE_PCT*100:.0f}% с банка.")
         return
     try:
         amount = round(float(parts[1]), 4)
@@ -1364,7 +1374,7 @@ async def cmd_duel(message: Message):
             f"<b>{message.from_user.first_name}</b> вызывает <b>{opponent_name}</b>\n\n"
             f"💵 Ставка: <b>${amount:.4f}</b>\n"
             f"💰 Банк: <b>${amount*2:.4f}</b>\n"
-            f"<i>Рейк дома {RAKE_PCT*100:.1f}% с банка</i>")
+            f"<i>Рейк дома {RAKE_PCT*100:.0f}%</i>")
     sent = await safe_send(message.reply, text, reply_markup=kb)
     if not sent:
         return
@@ -1464,7 +1474,6 @@ async def on_duel_cb(cb: CallbackQuery):
 
         winner_id, winner_name = (challenger_id, name_c) if r1 > r2 else (opponent_id, name_o)
 
-        # рейк дома — фиксированные 5%
         total_pot = round(amount * 2, 4)
         rake = round(total_pot * RAKE_PCT, 4)
         payout = round(total_pot - rake, 4)
@@ -1475,7 +1484,7 @@ async def on_duel_cb(cb: CallbackQuery):
             f"🏆 <b>{winner_name} победил!</b>\n\n"
             f"🎲 {name_c}: <b>{r1}</b>\n🎲 {name_o}: <b>{r2}</b>\n\n"
             f"💰 Забирает: <b>${payout:.4f}</b>\n"
-            f"<i>рейк дома {RAKE_PCT*100:.1f}% = ${rake:.4f}</i>")
+            f"<i>рейк дома {RAKE_PCT*100:.0f}% = ${rake:.4f}</i>")
     finally:
         DUEL_BUSY.discard(challenger_id)
         DUEL_BUSY.discard(opponent_id)
@@ -1669,10 +1678,10 @@ async def handle_answer(message: Message):
 
 async def main():
     print("=" * 50)
-    print("Quiz Bot · очки · дуэли · рейк 5% · депозиты от $0.05")
+    print("Quiz Bot · автопополнение · очки · дуэли · рейк 5%")
     print(f"Вопросов: {len(QUESTIONS)} + {len(MULTI_QUESTIONS)} мульти")
-    print(f"Рейк дома: {RAKE_PCT*100:.1f}% (фиксированный)")
-    print(f"Депозит от: ${DEPOSIT_MIN:.2f}")
+    print(f"Рейк дома: {RAKE_PCT*100:.0f}%")
+    print(f"Депозит: от ${DEPOSIT_MIN:.2f} (авто через xRocket)")
     print(f"Админы: {sorted(ADMIN_IDS)}")
 
     await get_http()
@@ -1694,6 +1703,10 @@ async def main():
 
     me = await bot.get_me()
     print(f"Подключился как @{me.username}")
+
+    # Запускаем вебхук-сервер
+    await start_webhook_server()
+
     asyncio.create_task(question_scheduler())
     asyncio.create_task(caches_refresh_loop())
     print("Запущен.")
