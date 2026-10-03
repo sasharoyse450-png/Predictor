@@ -21,6 +21,7 @@ from aiogram.filters import Command, CommandStart
 from aiogram.types import (
     Message, CallbackQuery, BufferedInputFile,
     InlineKeyboardMarkup, InlineKeyboardButton,
+    MessageEntity,
 )
 from PIL import Image, ImageDraw, ImageFont
 from supabase import create_client, Client
@@ -72,6 +73,42 @@ TZ = ZoneInfo(os.getenv("TZ", "Europe/Moscow"))
 WORK_HOURS = list(range(8, 24))
 WITHDRAW_CONFIRM_TTL = 120
 
+# ==================== АЛФАВИТ ПРЕМИУМ-ЭМОДЗИ ====================
+
+LETTERS = {
+    "A": "5357372145800334358",
+    "B": "5357051925923648418",
+    "C": "5359451970828520680",
+    "D": "5359648590136361323",
+    "E": "5361794927028096622",
+    "F": "5359293061333535340",
+    "G": "5361583129305829231",
+    "H": "5359299520964348572",
+    "I": "5359552223955145217",
+    "J": "5361888806423251732",
+    "K": "5359549406456598104",
+    "L": "5359354676934364278",
+    "M": "5361625615122319358",
+    "N": "5359808152466378462",
+    "O": "5375319963726793021",
+    "P": "5361767233078973238",
+    "Q": "5361871785467857730",
+    "R": "5364023048687078741",
+    "S": "5364149466754468020",
+    "T": "5364207225474664109",
+    "U": "5363965015088974268",
+    "V": "5364245085611379930",
+    "W": "5364095856972681395",
+    "X": "5364166015263458850",
+    "Y": "5301218364687927258",
+    "Z": "5364299206494276184",
+}
+
+
+def word_ids(word: str) -> list:
+    return [LETTERS.get(ch.upper(), "") for ch in word]
+
+
 CORRECT_PHRASES = [
     "🎉 <b>Правильно!</b>", "🔥 <b>В точку!</b>", "💎 <b>Красавчик!</b>",
     "⚡ <b>Молниеносно!</b>", "🧠 <b>Умница!</b>", "🏆 <b>Есть!</b>",
@@ -100,6 +137,7 @@ PENDING_WITHDRAWS = {}
 BANNED_CACHE = {}
 SUBSCRIBERS_CACHE = {}
 DUEL_BUSY = set()
+TOP_CACHE = {}
 HTTP_SESSION = None
 _FONT_PATH = None
 
@@ -130,6 +168,48 @@ def make_progress_bar(c):
         return "▓" * 10 + " 10/10"
     in_level = c - (lvl - 1) * ANSWERS_PER_LEVEL
     return f"{'▓' * in_level}{'▒' * (ANSWERS_PER_LEVEL - in_level)} {in_level}/{ANSWERS_PER_LEVEL}"
+
+
+# ==================== ПРЕМИУМ-СЛОВО СВЕРХУ СООБЩЕНИЯ ====================
+
+
+def utf16_len(s: str) -> int:
+    return len(s.encode("utf-16-le")) // 2
+
+
+async def send_word(chat_id: int, word: str, extra_text: str = "", **kwargs):
+    """
+    Отправляет сообщение, где СВЕРХУ идёт слово из премиум-эмодзи,
+    а под ним — обычный текст.
+    """
+    emoji_ids = word_ids(word)
+    word_line = word  # fallback-символы
+    full_text = word_line + ("\n\n" + extra_text if extra_text else "")
+
+    if not all(emoji_ids):
+        # какая-то буква не найдена — обычный текст
+        return await safe_send(bot.send_message, chat_id, full_text, **kwargs)
+
+    entities = []
+    pos = 0
+    for i, ch in enumerate(word_line):
+        entities.append(MessageEntity(
+            type="custom_emoji",
+            offset=pos,
+            length=1,
+            custom_emoji_id=emoji_ids[i],
+        ))
+        pos += utf16_len(ch)
+
+    try:
+        return await safe_send(
+            bot.send_message, chat_id, full_text,
+            entities=entities,
+            **kwargs,
+        )
+    except Exception as e:
+        log.warning("send_word failed: %s", e)
+        return await safe_send(bot.send_message, chat_id, full_text, **kwargs)
 
 
 # ==================== FONT ====================
@@ -440,6 +520,11 @@ def get_top_sync(chat_id, limit=10):
         return []
 
 
+def get_top1_sync(chat_id):
+    rows = get_top_sync(chat_id, 1)
+    return int(rows[0]["user_id"]) if rows else None
+
+
 def get_stats_sync():
     try:
         players = supabase.table("quiz_players").select("balance,total_won,correct_answers").execute().data or []
@@ -518,6 +603,10 @@ async def create_invoice(client_invoice_id, uid, cid, amt, message_id=None):
 
 async def mark_invoice_paid(client_invoice_id):
     return await asyncio.to_thread(mark_invoice_paid_sync, client_invoice_id)
+
+
+async def get_top1(cid):
+    return await asyncio.to_thread(get_top1_sync, cid)
 
 
 def is_banned_cached(cid, uid):
@@ -619,7 +708,7 @@ async def xrocket_create_invoice(client_invoice_id: str, amount: float, descript
         return False, str(e)
 
 
-# ==================== WEBHOOK SERVER ====================
+# ==================== WEBHOOK ====================
 
 
 def verify_webhook_signature(raw_body: bytes, signature: str, timestamp: str, secret: str) -> bool:
@@ -627,9 +716,7 @@ def verify_webhook_signature(raw_body: bytes, signature: str, timestamp: str, se
         return False
     signed_string = f"{timestamp}.{raw_body.decode('utf-8')}"
     expected = hmac.new(
-        secret.encode("utf-8"),
-        signed_string.encode("utf-8"),
-        hashlib.sha256,
+        secret.encode("utf-8"), signed_string.encode("utf-8"), hashlib.sha256,
     ).hexdigest()
     return hmac.compare_digest(expected, signature)
 
@@ -642,9 +729,7 @@ async def handle_webhook(request: web.Request) -> web.Response:
         sig_timestamp = request.headers.get("Signature-Timestamp", "")
 
         if sig_version != "v1":
-            log.warning("Webhook: неподдерживаемая версия подписи %s", sig_version)
             return web.Response(status=401, text="bad signature version")
-
         if not verify_webhook_signature(raw_body, signature, sig_timestamp, XROCKET_WEBHOOK_SECRET):
             log.warning("Webhook: неверная подпись")
             return web.Response(status=401, text="bad signature")
@@ -656,16 +741,15 @@ async def handle_webhook(request: web.Request) -> web.Response:
 
         ev_type = event.get("type")
         data = event.get("data", {})
-        log.info("Webhook получен: type=%s id=%s", ev_type, event.get("id"))
+        log.info("Webhook: type=%s id=%s", ev_type, event.get("id"))
 
         if ev_type == "invoice":
-            ev_name = data.get("event")
-            if ev_name == "invoice_status_changed":
+            if data.get("event") == "invoice_status_changed":
                 inv = data.get("invoice", {})
-                status = inv.get("status")
-                client_invoice_id = inv.get("clientInvoiceId")
-                if status == "paid" and client_invoice_id:
-                    await process_paid_invoice(client_invoice_id)
+                if inv.get("status") == "paid":
+                    cid = inv.get("clientInvoiceId")
+                    if cid:
+                        await process_paid_invoice(cid)
 
         return web.Response(status=200, text="ok")
     except Exception as e:
@@ -676,7 +760,6 @@ async def handle_webhook(request: web.Request) -> web.Response:
 async def process_paid_invoice(client_invoice_id: str):
     inv = await mark_invoice_paid(client_invoice_id)
     if not inv:
-        log.info("Invoice %s уже обработан или не найден", client_invoice_id)
         return
 
     user_id = int(inv["user_id"])
@@ -685,8 +768,6 @@ async def process_paid_invoice(client_invoice_id: str):
     msg_id = inv.get("message_id")
 
     new_balance = await add_balance(chat_id, user_id, amount)
-    log.info("Invoice %s: зачислено %s юзеру %s", client_invoice_id, amount, user_id)
-
     if new_balance is None:
         p = await get_player(chat_id, user_id)
         new_balance = float(p.get("balance", 0))
@@ -696,37 +777,43 @@ async def process_paid_invoice(client_invoice_id: str):
             await bot.edit_message_text(
                 chat_id=chat_id,
                 message_id=int(msg_id),
-                text=(
-                    f"✅ <b>Пополнение успешно!</b>\n\n"
-                    f"💳 Зачислено: <b>${amount:.4f}</b> USDT\n"
-                    f"💰 Новый баланс: <b>${new_balance:.4f}</b>\n\n"
-                    f"<i>Спасибо за пополнение!</i>"
-                ),
+                text=(f"✅ <b>Пополнение успешно!</b>\n\n"
+                      f"💳 Зачислено: <b>${amount:.4f}</b> USDT\n"
+                      f"💰 Новый баланс: <b>${new_balance:.4f}</b>\n\n"
+                      f"<i>Спасибо за пополнение!</i>"),
             )
         except Exception as e:
-            log.warning("Не смог отредактировать сообщение инвойса: %s", e)
+            log.warning("edit invoice msg: %s", e)
 
+    # DEP слово в ЛС
     try:
-        await bot.send_message(
-            user_id,
-            f"✅ <b>Баланс пополнен!</b>\n\n"
-            f"💰 Сумма: <b>${amount:.4f}</b> USDT\n"
-            f"💼 Баланс: <b>${new_balance:.4f}</b>\n"
-            f"Проверить: /AiBalance",
+        await send_word(
+            user_id, "DEP",
+            f"💰 Зачислено: <b>${amount:.4f}</b>\n"
+            f"💼 Баланс: <b>${new_balance:.4f}</b>"
         )
     except Exception as e:
-        log.warning("Не смог уведомить юзера %s: %s", user_id, e)
+        log.warning("DEP в ЛС: %s", e)
+
+    # DEP в чат
+    try:
+        await send_word(
+            chat_id, "DEP",
+            f"👤 {inv.get('first_name', 'Игрок')} пополнил на <b>${amount:.4f}</b>"
+        )
+    except Exception as e:
+        log.warning("DEP в чат: %s", e)
 
 
 async def start_webhook_server():
     app = web.Application()
     app.router.add_post("/webhook", handle_webhook)
-    app.router.add_get("/", lambda r: web.Response(text="ok"))
+    app.router.get("/", lambda r: web.Response(text="ok"))
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", PORT)
     await site.start()
-    log.info("Webhook-сервер запущен на порту %s", PORT)
+    log.info("Webhook-сервер на порту %s", PORT)
 
 
 # ==================== ВОПРОСЫ ====================
@@ -740,21 +827,26 @@ async def ask_question(chat_id):
         await bot.send_chat_action(chat_id, "typing")
     except Exception:
         pass
+
     try:
         if is_image:
             png = render_question_image(q)
             buf = BufferedInputFile(png, filename="q.png")
-            caption = (f"🧠 <b>Вопрос!</b>\n\n"
-                       f"🏆 Первый правильный → <b>+1 очко</b>\n"
-                       f"🎲 Дуэли: <code>/AiDuel 0.20</code>\n"
-                       f"🔓 Вопрос открыт, пока кто-то не ответит верно.")
-            msg = await safe_send(bot.send_photo, chat_id, buf, caption=caption)
+            msg = await safe_send(
+                bot.send_photo, chat_id, buf,
+                caption="🧠 <b>Вопрос!</b>\n\n"
+                        "🏆 Первый правильный → <b>+1 очко</b>\n"
+                        "🎲 Дуэли: <code>/AiDuel 0.20</code>\n"
+                        "🔓 Вопрос открыт, пока кто-то не ответит верно."
+            )
         else:
-            msg = await safe_send(bot.send_message, chat_id,
+            msg = await safe_send(
+                bot.send_message, chat_id,
                 f"🧠 <b>Вопрос!</b>\n\n❓ {q}\n\n"
                 f"🏆 Первый правильный → <b>+1 очко</b>\n"
                 f"🎲 Дуэли: <code>/AiDuel 0.20</code>\n"
-                f"🔓 Вопрос открыт, пока кто-то не ответит верно.")
+                f"🔓 Вопрос открыт, пока кто-то не ответит верно."
+            )
         if msg:
             try:
                 await bot.set_message_reaction(chat_id, msg.message_id, ["🧠"])
@@ -807,16 +899,18 @@ async def cmd_start(message: Message):
         [InlineKeyboardButton(text="💎 Подписка $0.50/нед", url=XROCKET_SUBSCRIBE_URL)],
         [InlineKeyboardButton(text="🔗 Партнёрка xRocket", url=XROCKET_REFERRAL_URL)],
     ])
-    await safe_send(message.reply,
-        f"👋 <b>Викторина с дуэлями!</b>\n\n"
-        f"🎯 Квиз: правильный ответ → <b>+1 очко</b>\n"
-        f"📈 10 уровней за очки\n"
-        f"🎲 Дуэли: <code>/AiDuel 0.20</code>\n"
-        f"💳 Пополнить: <code>/AiDeposit 1.0</code>\n"
-        f"💸 Вывод от ${MIN_WITHDRAW:.2f}\n\n"
-        f"📖 /AiHelp — все команды\n"
-        f"📜 /AiRules — правила",
-        reply_markup=kb)
+    await send_word(
+        message.chat.id, "HELLO",
+        "👋 <b>Викторина с дуэлями!</b>\n\n"
+        "🎯 Квиз: правильный ответ → <b>+1 очко</b>\n"
+        "📈 10 уровней за очки\n"
+        "🎲 Дуэли: <code>/AiDuel 0.20</code>\n"
+        "💳 Пополнить: <code>/AiDeposit 1.0</code>\n"
+        "💸 Вывод от " + f"${MIN_WITHDRAW:.2f}\n\n"
+        "📖 /AiHelp — все команды\n"
+        "📜 /AiRules — правила",
+        reply_markup=kb,
+    )
 
 
 @dp.message(Command("AiHelp"))
@@ -824,27 +918,27 @@ async def cmd_aihelp(message: Message):
     if message.chat.type not in ("group", "supergroup"):
         return
     text = (
-        f"📖 <b>СПРАВКА</b>\n\n"
-        f"<b>🎮 Игра</b>\n"
-        f"/AiBalance — баланс и уровень\n"
-        f"/AiProfile — профиль\n"
-        f"/AiTop — топ-10\n"
-        f"/AiLevels — все уровни\n"
-        f"/AiDuel 0.20 — дуэль на кубах\n\n"
-        f"<b>💰 Деньги</b>\n"
+        "📖 <b>СПРАВКА</b>\n\n"
+        "<b>🎮 Игра</b>\n"
+        "/AiBalance — баланс и уровень\n"
+        "/AiProfile — профиль\n"
+        "/AiTop — топ-10\n"
+        "/AiLevels — все уровни\n"
+        "/AiDuel 0.20 — дуэль на кубах\n\n"
+        "<b>💰 Деньги</b>\n"
         f"/AiDeposit 0.05 — пополнить (от ${DEPOSIT_MIN:.2f})\n"
         f"/AiWithdraw — вывод от ${MIN_WITHDRAW:.2f}\n"
         f"/AiSubscribe — подписка ×{SUBSCRIBER_MULTIPLIER}\n\n"
-        f"<b>📜 Общее</b>\n"
-        f"/AiRules · /AiHelp\n"
+        "<b>📜 Общее</b>\n"
+        "/AiRules · /AiHelp\n"
     )
     if message.from_user and is_admin(message.from_user.id):
         text += (
-            f"\n<b>🛠 Админ</b>\n"
-            f"/AiAdmin — панель\n"
-            f"/AiHouse — касса\n"
-            f"/AiBan &lt;id&gt; [время] [причина]\n"
-            f"/AiUnban &lt;id&gt;\n"
+            "\n<b>🛠 Админ</b>\n"
+            "/AiAdmin — панель\n"
+            "/AiHouse — касса\n"
+            "/AiBan &lt;id&gt; [время] [причина]\n"
+            "/AiUnban &lt;id&gt;\n"
         )
     await safe_send(message.reply, text)
 
@@ -854,17 +948,17 @@ async def cmd_airules(message: Message):
     if message.chat.type not in ("group", "supergroup"):
         return
     await safe_send(message.reply,
-        f"📜 <b>ПРАВИЛА</b>\n\n"
-        f"<b>1.</b> Оскорбления проекта, админов, участников — <b>бан</b>.\n"
-        f"<b>2.</b> Обход бана (твинк) — <b>перманентный бан</b>.\n"
-        f"<b>3.</b> Скрипты, боты, мультиаккаунты — <b>бан + сброс</b>.\n"
-        f"<b>4.</b> Спам ответами — <b>бан</b>.\n"
-        f"<b>5.</b> Фиктивные дуэли, сговор — <b>бан обоим</b>.\n"
-        f"<b>6.</b> Обман системы вывода — <b>бан + обнуление</b>.\n\n"
+        "📜 <b>ПРАВИЛА</b>\n\n"
+        "<b>1.</b> Оскорбления проекта, админов, участников — <b>бан</b>.\n"
+        "<b>2.</b> Обход бана (твинк) — <b>перманентный бан</b>.\n"
+        "<b>3.</b> Скрипты, боты, мультиаккаунты — <b>бан + сброс</b>.\n"
+        "<b>4.</b> Спам ответами — <b>бан</b>.\n"
+        "<b>5.</b> Фиктивные дуэли, сговор — <b>бан обоим</b>.\n"
+        "<b>6.</b> Обман системы вывода — <b>бан + обнуление</b>.\n\n"
         f"💸 Вывод: от ${MIN_WITHDRAW:.2f} · лимит ${DAILY_WITHDRAW_LIMIT:.2f}/сутки\n"
         f"💳 Депозит: от ${DEPOSIT_MIN:.2f}\n"
         f"🎲 Рейк с дуэлей: {RAKE_PCT*100:.0f}%\n\n"
-        f"<i>Незнание правил не освобождает от ответственности.</i>")
+        "<i>Незнание правил не освобождает от ответственности.</i>")
 
 
 # ==================== АДМИН-ПАНЕЛЬ ====================
@@ -969,12 +1063,14 @@ async def cmd_aiban(message: Message):
             if duration is not None:
                 banned_until = (datetime.now(timezone.utc) + duration).isoformat()
     await ban_user(message.chat.id, target, reason, message.from_user.id, banned_until)
+
+    # Слово BAN сверху
     if banned_until:
-        await safe_send(message.reply,
+        await send_word(message.chat.id, "BAN",
             f"🔨 <code>{target}</code> забанен до <b>{banned_until[:19].replace('T', ' ')} UTC</b>\n"
             f"Причина: {reason}")
     else:
-        await safe_send(message.reply,
+        await send_word(message.chat.id, "BAN",
             f"🔨 <code>{target}</code> забанен <b>навсегда</b>\nПричина: {reason}")
 
 
@@ -1234,7 +1330,7 @@ async def cmd_aiprofile(message: Message):
 async def cmd_ailevels(message: Message):
     if message.chat.type not in ("group", "supergroup"):
         return
-    lines = [f"🎖 <b>Уровни</b>\n"]
+    lines = ["🎖 <b>Уровни</b>\n"]
     for lvl, emoji, name in LEVELS:
         mn = (lvl - 1) * ANSWERS_PER_LEVEL
         req = f"{mn}+" if lvl == MAX_LEVEL else f"{mn}-{mn + ANSWERS_PER_LEVEL - 1}"
@@ -1262,7 +1358,7 @@ async def cmd_aitop(message: Message):
     await safe_send(message.reply, "\n".join(lines))
 
 
-# ==================== ДЕПОЗИТ (АВТО) ====================
+# ==================== ДЕПОЗИТ ====================
 
 
 @dp.message(Command("AiDeposit"))
@@ -1289,14 +1385,12 @@ async def cmd_deposit(message: Message):
     client_inv_id = f"dep_{message.from_user.id}_{uuid.uuid4().hex[:12]}"
 
     ok, result = await xrocket_create_invoice(
-        client_inv_id,
-        amount,
+        client_inv_id, amount,
         f"Deposit for quiz bot (user {message.from_user.id})",
     )
     if not ok:
         await safe_send(message.reply,
-            f"❌ Не удалось создать счёт:\n<code>{result}</code>\n\n"
-            f"Попробуй позже или обратись к админу.")
+            f"❌ Не удалось создать счёт:\n<code>{result}</code>")
         return
 
     kb = InlineKeyboardMarkup(inline_keyboard=[
@@ -1477,11 +1571,13 @@ async def on_duel_cb(cb: CallbackQuery):
         if r1 == r2:
             await add_balance(cid, challenger_id, amount)
             await add_balance(cid, opponent_id, amount)
-            await safe_send(bot.send_message, cid,
-                f"🤝 <b>Ничья! {r1} : {r2}</b>\nСтавки возвращены по ${amount:.4f}.")
+            await send_word(cid, "DRAW",
+                f"🤝 Ничья {r1} : {r2}\nСтавки возвращены по ${amount:.4f}")
             return
 
         winner_id, winner_name = (challenger_id, name_c) if r1 > r2 else (opponent_id, name_o)
+        loser_id = opponent_id if winner_id == challenger_id else challenger_id
+        loser_name = name_o if winner_id == challenger_id else name_c
 
         total_pot = round(amount * 2, 4)
         rake = round(total_pot * RAKE_PCT, 4)
@@ -1489,11 +1585,20 @@ async def on_duel_cb(cb: CallbackQuery):
         await add_balance(cid, winner_id, payout)
         await log_house_income(cid, rake, "duel")
 
-        await safe_send(bot.send_message, cid,
+        # WIN сверху в общий чат
+        await send_word(cid, "WIN",
             f"🏆 <b>{winner_name} победил!</b>\n\n"
             f"🎲 {name_c}: <b>{r1}</b>\n🎲 {name_o}: <b>{r2}</b>\n\n"
             f"💰 Забирает: <b>${payout:.4f}</b>\n"
-            f"<i>рейк дома {RAKE_PCT*100:.0f}% = ${rake:.4f}</i>")
+            f"<i>рейк {RAKE_PCT*100:.0f}% = ${rake:.4f}</i>")
+
+        # LOSE проигравшему в ЛС
+        try:
+            await send_word(loser_id, "LOSE",
+                f"💔 Ты проиграл дуэль против {winner_name}\n"
+                f"Ставка ${amount:.4f} списана.")
+        except Exception:
+            pass
     finally:
         DUEL_BUSY.discard(challenger_id)
         DUEL_BUSY.discard(opponent_id)
@@ -1607,14 +1712,22 @@ async def on_withdraw_cb(cb: CallbackQuery):
         if ok:
             await deduct_balance(cid, uid, amount)
             await log_payout(cid, uid, amount, result, "finished")
-            text = f"✅ <b>Выплачено ${amount:.4f}</b>\nID: <code>{result}</code>"
+            try:
+                await cb.message.edit_text(f"✅ <b>Выплачено ${amount:.4f}</b>\nID: <code>{result}</code>")
+            except Exception:
+                pass
+            # Слово WIT в ЛС
+            try:
+                await send_word(uid, "WIT",
+                    f"💸 Выплачено ${amount:.4f} USDT\nID: {result}")
+            except Exception:
+                pass
         else:
             await log_payout(cid, uid, amount, "", "failed")
-            text = f"❌ <b>Ошибка</b>\n<code>{result}</code>"
-        try:
-            await cb.message.edit_text(text)
-        except Exception:
-            await safe_send(bot.send_message, cid, text)
+            try:
+                await cb.message.edit_text(f"❌ <b>Ошибка</b>\n<code>{result}</code>")
+            except Exception:
+                pass
     finally:
         await unlock_withdraw(cid, uid)
 
@@ -1646,6 +1759,7 @@ async def handle_answer(message: Message):
 
     p = await get_player(cid, uid, message.from_user.username, message.from_user.first_name)
     old_lvl = level_from_correct(int(p["correct_answers"]))
+    old_top1 = TOP_CACHE.get(cid)
 
     await asyncio.gather(
         clear_active(cid),
@@ -1655,26 +1769,46 @@ async def handle_answer(message: Message):
 
     new_correct = int(p["correct_answers"]) + 1
     new_lvl = level_from_correct(new_correct)
+
+    # Проверка нового топ-1
+    new_top1 = await get_top1(cid)
+    if new_top1 and new_top1 != old_top1:
+        TOP_CACHE[cid] = new_top1
+        if old_top1 is not None:  # не первый раз
+            try:
+                tp = await get_player(cid, new_top1)
+                nm = tp.get("first_name") or tp.get("username") or str(new_top1)
+                await send_word(cid, "TOP",
+                    f"👑 <b>{nm}</b> вышел на первое место!")
+            except Exception:
+                pass
+
     phrase = random.choice(CORRECT_PHRASES)
     if q["is_multi"]:
         answer_shown = "любой из: " + ", ".join(q["answers"][:5]) + ("..." if len(q["answers"]) > 5 else "")
     else:
         answer_shown = q["answers"][0]
-    msg = (f"{phrase}\n"
-           f"{message.from_user.first_name} +1 очко\n"
-           f"<i>Ответ: {answer_shown}</i>")
+
+    # Если уровень — отдельное сообщение LEVEL
     if new_lvl > old_lvl:
         n_emoji = LEVELS[new_lvl - 1][1]
         n_name = LEVELS[new_lvl - 1][2]
-        msg += (f"\n\n{n_emoji} <b>НОВЫЙ УРОВЕНЬ {new_lvl}!</b>\n"
+        try:
+            await send_word(cid, "LEVEL",
+                f"{n_emoji} <b>{message.from_user.first_name}, новый уровень {new_lvl}!</b>\n"
                 f"🎖 {n_name}")
+        except Exception:
+            pass
 
     try:
         await bot.send_chat_action(cid, "typing")
     except Exception:
         pass
 
-    sent = await safe_send(message.reply, msg)
+    sent = await safe_send(message.reply,
+        f"{phrase}\n"
+        f"{message.from_user.first_name} +1 очко\n"
+        f"<i>Ответ: {answer_shown}</i>")
     if sent:
         try:
             await bot.set_message_reaction(cid, message.message_id, ["✅"])
@@ -1687,10 +1821,9 @@ async def handle_answer(message: Message):
 
 async def main():
     print("=" * 50)
-    print("Quiz Bot · автопополнение · очки · дуэли · рейк 5%")
+    print("Quiz Bot · премиум-слова · дуэли · рейк 5%")
     print(f"Вопросов: {len(QUESTIONS)} + {len(MULTI_QUESTIONS)} мульти")
-    print(f"Рейк дома: {RAKE_PCT*100:.0f}%")
-    print(f"Депозит: от ${DEPOSIT_MIN:.2f} (авто через xRocket)")
+    print(f"Алфавит премиум-эмодзи: {len(LETTERS)} букв")
     print(f"Админы: {sorted(ADMIN_IDS)}")
 
     await get_http()
@@ -1709,6 +1842,15 @@ async def main():
             "is_multi": row.get("is_multi", False),
         }
         QUIZ_ENABLED.add(int(row["chat_id"]))
+
+    # Прогрев TOP_CACHE
+    for cid in QUIZ_ENABLED:
+        try:
+            t = await get_top1(cid)
+            if t:
+                TOP_CACHE[cid] = t
+        except Exception:
+            pass
 
     me = await bot.get_me()
     print(f"Подключился как @{me.username}")
