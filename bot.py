@@ -78,13 +78,6 @@ POT_HOUR = 21
 SPONSOR_PRICE = 5.00
 SPONSOR_QUESTIONS = 20
 
-DIFFICULTY_REWARDS = {
-    "easy": 1,
-    "medium": 2,
-    "hard": 3,
-    "extreme": 5,
-}
-
 ADMIN_IDS = {8130244626, 6173495222}
 
 TZ = ZoneInfo(os.getenv("TZ", "Europe/Moscow"))
@@ -292,22 +285,6 @@ def add_score_sync(chat_id, user_id):
         "p_amount": 0, "p_count_correct": True,
     })
     return bool(r)
-
-
-def add_score_multi_sync(chat_id, user_id, points):
-    """Начисляет points очков."""
-    try:
-        get_player_sync(chat_id, user_id)
-        res = supabase.table("quiz_players").select("correct_answers").eq(
-            "chat_id", chat_id).eq("user_id", user_id).execute()
-        cur = int(res.data[0]["correct_answers"]) if res.data else 0
-        supabase.table("quiz_players").update({
-            "correct_answers": cur + points,
-        }).eq("chat_id", chat_id).eq("user_id", user_id).execute()
-        return True
-    except Exception as e:
-        log.warning("add_score_multi: %s", e)
-        return False
 
 
 def add_balance_sync(chat_id, user_id, amount, count_correct=False):
@@ -601,9 +578,6 @@ def get_coins_stats_sync(chat_id=None):
         return None
 
 
-# ==================== НАСТРОЙКИ ЧАТА (сложность викторины) ====================
-
-
 def get_chat_settings_sync(chat_id):
     try:
         res = supabase.table("quiz_settings").select("*").eq("chat_id", chat_id).execute()
@@ -627,9 +601,6 @@ def update_chat_setting_sync(chat_id, field, value):
     except Exception as e:
         log.warning("update_chat_setting: %s", e)
         return False
-
-
-# ==================== ТУРНИР (sync) ====================
 
 
 def tournament_create_sync(chat_id, prize):
@@ -713,9 +684,6 @@ def update_t_setting_sync(chat_id, field, value):
         return False
 
 
-# ==================== СПОНСОР (sync) ====================
-
-
 def sponsor_add_sync(user_id, chat_id, question, answer, position):
     try:
         res = supabase.table("quiz_sponsor_questions").insert({
@@ -756,10 +724,6 @@ async def get_player(cid, uid, un=None, fn=None):
 
 async def add_score(cid, uid):
     return await asyncio.to_thread(add_score_sync, cid, uid)
-
-
-async def add_score_multi(cid, uid, points):
-    return await asyncio.to_thread(add_score_multi_sync, cid, uid, points)
 
 
 async def add_balance(cid, uid, amt, count_correct=False):
@@ -1086,7 +1050,6 @@ async def ask_question(chat_id):
 
     chat_settings = await get_chat_settings(chat_id)
     difficulty = chat_settings.get("difficulty", "medium")
-    reward_points = DIFFICULTY_REWARDS.get(difficulty, 2)
     diff_label = DIFFICULTY_LABELS.get(difficulty, "🟡 Средне")
 
     sponsor_q = await sponsor_get_next(chat_id)
@@ -1127,14 +1090,14 @@ async def ask_question(chat_id):
             png = render_question_image(q)
             buf = BufferedInputFile(png, filename="q.png")
             caption = (f"🧠 <b>Вопрос!</b>{sponsor_note}\n\n"
-                       f"{diff_label} · 🏆 +{reward_points} очк. за правильный\n"
+                       f"{diff_label} · 🏆 +1 очко за правильный\n"
                        f"🔓 Вопрос открыт до правильного ответа."
                        f"{pot_line}{timer_line}")
             msg = await safe_send(bot.send_photo, chat_id, buf, caption=caption)
         else:
             msg = await safe_send(bot.send_message, chat_id,
                 f"🧠 <b>Вопрос!</b>{sponsor_note}\n\n❓ {q}\n\n"
-                f"{diff_label} · 🏆 +{reward_points} очк. за правильный\n"
+                f"{diff_label} · 🏆 +1 очко за правильный\n"
                 f"🔓 Вопрос открыт до правильного ответа."
                 f"{pot_line}{timer_line}")
         if msg:
@@ -1592,7 +1555,7 @@ async def cmd_start(message: Message):
     ])
     await safe_send(message.reply,
         f"👋 <b>Викторина с дуэлями!</b>\n\n"
-        f"🎯 Квиз: правильный ответ → очки\n"
+        f"🎯 Квиз: правильный ответ → <b>+1 очко</b>\n"
         f"📈 10 уровней за очки\n"
         f"🎲 Дуэли: <code>/AiDuel 0.20</code>\n"
         f"💳 Пополнить: <code>/AiDeposit 1.0</code>\n"
@@ -1626,7 +1589,7 @@ async def cmd_aihelp(message: Message):
     if message.from_user and is_admin(message.from_user.id):
         text += (
             "\n<b>🛠 Админ</b>\n"
-            "/AiAdmin — панель (сложность викторины, касса, баны)\n"
+            "/AiAdmin — панель (сложность, касса, баны)\n"
             "/AiTurik — настройка турниров\n"
             "\n<b>🎰 Управление копилкой</b>\n"
             "/AiPot — сколько сейчас в фонде\n"
@@ -1836,9 +1799,6 @@ async def cmd_house(message: Message):
     await safe_send(message.reply, "\n".join(lines))
 
 
-# ==================== КОПИЛКА ====================
-
-
 @dp.message(Command("AiPot"))
 async def cmd_aipot(message: Message):
     if not message.from_user or not is_admin(message.from_user.id):
@@ -1920,9 +1880,6 @@ async def cmd_aipotgive(message: Message):
         await safe_send(message.reply, f"❌ {info}")
 
 
-# ==================== BAN ====================
-
-
 def parse_duration(s):
     s = s.lower().strip()
     if s in ("perm", "forever", "навсегда", "permanent"):
@@ -1989,9 +1946,6 @@ async def cmd_aiunban(message: Message):
     await safe_send(message.reply, f"✅ <code>{target}</code> разбанен.")
 
 
-# ==================== CALLBACK ====================
-
-
 @dp.callback_query(F.data.startswith("adm:"))
 async def on_admin_cb(cb: CallbackQuery):
     if not cb.from_user or not is_admin(cb.from_user.id):
@@ -2041,11 +1995,8 @@ async def on_admin_cb(cb: CallbackQuery):
             await cb.message.edit_text(
                 f"🎯 <b>Сложность викторины</b>\n\n"
                 f"Текущая: <b>{DIFFICULTY_LABELS.get(cur, cur)}</b>\n\n"
-                f"Награда за ответ:\n"
-                f"🟢 Легко — +1 очко\n"
-                f"🟡 Средне — +2 очка\n"
-                f"🟠 Сложно — +3 очка\n"
-                f"🔴 Экстрим — +5 очков",
+                f"🟢 Легко\n🟡 Средне\n🟠 Сложно\n🔴 Экстрим\n\n"
+                f"<i>+1 очко за любой правильный ответ</i>",
                 reply_markup=kb,
             )
         except Exception:
@@ -2737,21 +2688,17 @@ async def handle_answer(message: Message):
     if tsk:
         tsk.cancel()
 
-    chat_settings = await get_chat_settings(cid)
-    difficulty = chat_settings.get("difficulty", "medium")
-    reward_points = DIFFICULTY_REWARDS.get(difficulty, 2)
-
     p = await get_player(cid, uid, message.from_user.username, message.from_user.first_name)
     old_lvl = level_from_correct(int(p["correct_answers"]))
     old_top1 = TOP_CACHE.get(cid)
 
     await asyncio.gather(
         clear_active(cid),
-        add_score_multi(cid, uid, reward_points),
+        add_score(cid, uid),
         return_exceptions=True,
     )
 
-    new_correct = int(p["correct_answers"]) + reward_points
+    new_correct = int(p["correct_answers"]) + 1
     new_lvl = level_from_correct(new_correct)
 
     new_top1 = await get_top1(cid)
@@ -2772,7 +2719,7 @@ async def handle_answer(message: Message):
         answer_shown = q["answers"][0]
 
     msg = (f"{phrase}\n"
-           f"{message.from_user.first_name} +{reward_points} очк.\n"
+           f"{message.from_user.first_name} +1 очко\n"
            f"<i>Ответ: {answer_shown}</i>")
 
     if new_lvl > old_lvl:
