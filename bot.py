@@ -118,7 +118,6 @@ _FONT_PATH = None
 
 TOURNAMENT_STATE = {}
 TOURNAMENT_ACTIVE = {}
-TOURNAMENT_LOBBY = {}
 TOURNAMENT_EDIT = {}
 
 SPONSOR_SESSION = {}
@@ -606,35 +605,12 @@ def update_chat_setting_sync(chat_id, field, value):
 def tournament_create_sync(chat_id, prize):
     try:
         res = supabase.table("quiz_tournaments").insert({
-            "chat_id": chat_id, "prize": prize, "status": "lobby",
+            "chat_id": chat_id, "prize": prize, "status": "active",
         }).execute()
         return res.data[0]["id"] if res.data else None
     except Exception as e:
         log.warning("tournament_create: %s", e)
         return None
-
-
-def tournament_add_player_sync(tid, uid):
-    try:
-        supabase.table("quiz_tournament_players").upsert({
-            "tournament_id": tid, "user_id": uid, "correct": 0,
-        }).execute()
-        return True
-    except Exception as e:
-        log.warning("tourn_add_player: %s", e)
-        return False
-
-
-def tournament_inc_correct_sync(tid, uid):
-    try:
-        res = supabase.table("quiz_tournament_players").select("correct").eq(
-            "tournament_id", tid).eq("user_id", uid).execute()
-        current = int(res.data[0]["correct"]) if res.data else 0
-        supabase.table("quiz_tournament_players").update({
-            "correct": current + 1,
-        }).eq("tournament_id", tid).eq("user_id", uid).execute()
-    except Exception as e:
-        log.warning("tourn_inc: %s", e)
 
 
 def tournament_finish_sync(tid, winner_id):
@@ -648,15 +624,6 @@ def tournament_finish_sync(tid, winner_id):
         log.warning("tourn_finish: %s", e)
 
 
-def tournament_get_players_sync(tid):
-    try:
-        res = supabase.table("quiz_tournament_players").select("*").eq(
-            "tournament_id", tid).order("correct", desc=True).execute()
-        return res.data or []
-    except Exception:
-        return []
-
-
 def get_t_settings_sync(chat_id):
     try:
         res = supabase.table("quiz_tournament_settings").select("*").eq("chat_id", chat_id).execute()
@@ -664,9 +631,8 @@ def get_t_settings_sync(chat_id):
             return res.data[0]
     except Exception as e:
         log.warning("get_t_settings: %s", e)
-    default = {"chat_id": chat_id, "min_players": 2, "lobby_seconds": 60,
-               "question_seconds": 30, "questions": 10, "prize": 0.30,
-               "difficulty": "medium"}
+    default = {"chat_id": chat_id, "question_seconds": 30,
+               "questions": 10, "prize": 0.30, "difficulty": "medium"}
     try:
         supabase.table("quiz_tournament_settings").insert(default).execute()
     except Exception:
@@ -802,20 +768,8 @@ async def tournament_create(cid, prize):
     return await asyncio.to_thread(tournament_create_sync, cid, prize)
 
 
-async def tournament_add_player(tid, uid):
-    return await asyncio.to_thread(tournament_add_player_sync, tid, uid)
-
-
-async def tournament_inc_correct(tid, uid):
-    await asyncio.to_thread(tournament_inc_correct_sync, tid, uid)
-
-
 async def tournament_finish(tid, winner_id):
     await asyncio.to_thread(tournament_finish_sync, tid, winner_id)
-
-
-async def tournament_get_players(tid):
-    return await asyncio.to_thread(tournament_get_players_sync, tid)
 
 
 async def get_t_settings(cid):
@@ -1196,12 +1150,15 @@ async def pot_payout_loop():
 
 
 async def run_tournament(tid, chat_id, settings):
+    """Турнир без лобби. Любой может отвечать. 10 вопросов подряд."""
     TOURNAMENT_ACTIVE[chat_id] = tid
     total_q = int(settings["questions"])
     q_secs = int(settings["question_seconds"])
     prize = float(settings["prize"])
     difficulty = settings.get("difficulty", "medium")
     diff_label = DIFFICULTY_LABELS.get(difficulty, "🟡 Средне")
+
+    scores = {}  # user_id -> correct count
 
     try:
         await safe_send(bot.send_message, chat_id,
@@ -1210,7 +1167,9 @@ async def run_tournament(tid, chat_id, settings):
             f"❓ {total_q} вопросов подряд\n"
             f"⏱ {q_secs} сек на каждый\n"
             f"💰 Приз: <b>${prize:.2f}</b>\n\n"
-            f"Побеждает тот, у кого больше правильных!")
+            f"Отвечать может любой. Побеждает тот, у кого больше правильных!")
+
+        await asyncio.sleep(2)
 
         for q_num in range(total_q):
             q, answers, is_multi, _ = random_question(difficulty=difficulty)
@@ -1232,7 +1191,7 @@ async def run_tournament(tid, chat_id, settings):
             winner_uid = st.get("answered_by")
 
             if winner_uid:
-                await tournament_inc_correct(tid, winner_uid)
+                scores[winner_uid] = scores.get(winner_uid, 0) + 1
                 try:
                     p = await get_player(chat_id, winner_uid)
                     nm = p.get("first_name") or p.get("username") or str(winner_uid)
@@ -1243,24 +1202,20 @@ async def run_tournament(tid, chat_id, settings):
             else:
                 await safe_send(bot.send_message, chat_id,
                     f"⌛ Никто не ответил. Правильный: <b>{answers[0]}</b>")
+
             await asyncio.sleep(2)
 
-        players = await tournament_get_players(tid)
-        if not players:
-            await safe_send(bot.send_message, chat_id, "❌ Никто не участвовал.")
-            return
-
-        top_correct = int(players[0]["correct"])
-        winners = [p for p in players if int(p["correct"]) == top_correct]
-
-        if top_correct == 0:
+        # финал
+        if not scores:
             await safe_send(bot.send_message, chat_id,
                 "🏁 <b>Турнир окончен.</b>\nНикто не ответил. Приз не вручён.")
             await tournament_finish(tid, None)
             return
 
-        winner = random.choice(winners) if len(winners) > 1 else winners[0]
-        winner_id = int(winner["user_id"])
+        max_score = max(scores.values())
+        winners = [uid for uid, s in scores.items() if s == max_score]
+        winner_id = random.choice(winners) if len(winners) > 1 else winners[0]
+
         await add_balance(chat_id, winner_id, prize)
         await tournament_finish(tid, winner_id)
 
@@ -1270,17 +1225,17 @@ async def run_tournament(tid, chat_id, settings):
         except Exception:
             nm = str(winner_id)
 
+        sorted_scores = sorted(scores.items(), key=lambda x: -x[1])
         lines = ["🏆 <b>ТУРНИР ЗАВЕРШЁН!</b>", ""]
         medals = ["🥇", "🥈", "🥉"]
-        for i, pl in enumerate(players[:10]):
-            uid_p = int(pl["user_id"])
+        for i, (uid_p, cnt) in enumerate(sorted_scores[:10]):
             try:
                 pp = await get_player(chat_id, uid_p)
                 pnm = pp.get("first_name") or pp.get("username") or str(uid_p)
             except Exception:
                 pnm = str(uid_p)
             med = medals[i] if i < 3 else f"{i + 1}."
-            lines.append(f"{med} {pnm} — {pl['correct']} прав.")
+            lines.append(f"{med} {pnm} — {cnt} прав.")
         lines.append("")
         lines.append(f"👑 <b>Победитель: {nm}</b>")
         lines.append(f"💰 Приз: <b>${prize:.2f}</b>")
@@ -1296,8 +1251,6 @@ async def run_tournament(tid, chat_id, settings):
 def turik_kb(s):
     diff = s.get("difficulty", "medium")
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=f"👥 Мин. игроков: {s['min_players']}", callback_data="turik:set:min_players"),
-         InlineKeyboardButton(text=f"⏱ Лобби: {s['lobby_seconds']}с", callback_data="turik:set:lobby_seconds")],
         [InlineKeyboardButton(text=f"⏱ На вопрос: {s['question_seconds']}с", callback_data="turik:set:question_seconds"),
          InlineKeyboardButton(text=f"❓ Вопросов: {s['questions']}", callback_data="turik:set:questions")],
         [InlineKeyboardButton(text=f"💰 Приз: ${float(s['prize']):.2f}", callback_data="turik:set:prize")],
@@ -1310,12 +1263,11 @@ def turik_kb(s):
 def turik_text(s):
     diff = s.get("difficulty", "medium")
     return (f"🏁 <b>Настройки турнира</b>\n\n"
-            f"👥 Минимум игроков: <b>{s['min_players']}</b>\n"
-            f"⏱ Лобби: <b>{s['lobby_seconds']}</b> сек\n"
             f"⏱ На вопрос: <b>{s['question_seconds']}</b> сек\n"
             f"❓ Вопросов: <b>{s['questions']}</b>\n"
             f"💰 Приз: <b>${float(s['prize']):.2f}</b>\n"
             f"🎯 Сложность: <b>{DIFFICULTY_LABELS.get(diff, diff)}</b>\n\n"
+            f"<i>Турнир запускается сразу. Отвечать может любой.</i>\n\n"
             f"Жми кнопку → напиши число в чат.")
 
 
@@ -1350,8 +1302,6 @@ async def turik_value_input(message: Message):
         else:
             val = int(raw)
             ranges = {
-                "min_players": (2, 50),
-                "lobby_seconds": (10, 600),
                 "question_seconds": (5, 300),
                 "questions": (3, 50),
             }
@@ -1419,10 +1369,7 @@ async def on_turik_cb(cb: CallbackQuery):
         try:
             await cb.message.edit_text(
                 f"🎯 <b>Сложность турнира</b>\n\n"
-                f"🟢 Легко — простые вопросы\n"
-                f"🟡 Средне — обычные\n"
-                f"🟠 Сложно — посложнее\n"
-                f"🔴 Экстрим — только хардкор",
+                f"🟢 Легко\n🟡 Средне\n🟠 Сложно\n🔴 Экстрим",
                 reply_markup=kb,
             )
         except Exception:
@@ -1446,13 +1393,11 @@ async def on_turik_cb(cb: CallbackQuery):
 
     if action == "set":
         field = parts[2]
-        if field not in ("min_players", "lobby_seconds", "question_seconds", "questions", "prize"):
+        if field not in ("question_seconds", "questions", "prize"):
             await cb.answer("Ошибка", show_alert=True)
             return
         TOURNAMENT_EDIT[cb.from_user.id] = {"chat_id": cid, "field": field}
         prompts = {
-            "min_players": "👥 Сколько минимум игроков для старта? (2-50)",
-            "lobby_seconds": "⏱ Сколько секунд на регистрацию? (10-600)",
             "question_seconds": "⏱ Сколько секунд на один вопрос? (5-300)",
             "questions": "❓ Сколько всего вопросов? (3-50)",
             "prize": "💰 Какой приз в USDT? (0.1-10)",
@@ -1462,86 +1407,19 @@ async def on_turik_cb(cb: CallbackQuery):
         return
 
     if action == "start":
-        if cid in TOURNAMENT_ACTIVE or cid in TOURNAMENT_LOBBY:
-            await cb.answer("⏳ Уже идёт.", show_alert=True)
+        if cid in TOURNAMENT_ACTIVE:
+            await cb.answer("⏳ Турнир уже идёт.", show_alert=True)
             return
 
         s = await get_t_settings(cid)
         tid = await tournament_create(cid, float(s["prize"]))
         if not tid:
-            await cb.answer("Ошибка", show_alert=True)
+            await cb.answer("Ошибка создания", show_alert=True)
             return
 
-        TOURNAMENT_LOBBY[tid] = {"chat_id": cid, "players": set(), "started": False, "settings": s}
-        kb = InlineKeyboardMarkup(inline_keyboard=[[
-            InlineKeyboardButton(text="🎮 Участвовать", callback_data=f"tourn:join:{tid}"),
-        ]])
-        sent = await safe_send(cb.message.answer,
-            f"🏁 <b>ТУРНИР!</b>\n\n"
-            f"🎯 Сложность: <b>{DIFFICULTY_LABELS.get(s.get('difficulty','medium'), '?')}</b>\n"
-            f"📝 Вопросов: <b>{s['questions']}</b>\n"
-            f"⏱ Секунд на вопрос: <b>{s['question_seconds']}</b>\n"
-            f"👥 Минимум участников: <b>{s['min_players']}</b>\n"
-            f"💰 Приз: <b>${float(s['prize']):.2f}</b>\n\n"
-            f"Регистрация: <b>{s['lobby_seconds']} сек</b>\n"
-            f"Жми «🎮 Участвовать»!",
-            reply_markup=kb)
-        await cb.answer("Запущено")
-
-        if not sent:
-            return
-
-        lobby_seconds = int(s["lobby_seconds"])
-        min_players = int(s["min_players"])
-
-        async def start_after_lobby():
-            await asyncio.sleep(lobby_seconds)
-            lobby = TOURNAMENT_LOBBY.pop(tid, None)
-            if not lobby or lobby["started"]:
-                return
-            try:
-                await bot.edit_message_reply_markup(cid, sent.message_id, reply_markup=None)
-            except Exception:
-                pass
-
-            if len(lobby["players"]) < min_players:
-                await safe_send(bot.send_message, cid,
-                    f"❌ Турнир отменён: набралось {len(lobby['players'])}/{min_players}.")
-                return
-
-            await safe_send(bot.send_message, cid,
-                f"👥 Участников: <b>{len(lobby['players'])}</b>\nЗапускаю через 3 сек...")
-            await asyncio.sleep(3)
-            asyncio.create_task(run_tournament(tid, cid, lobby["settings"]))
-
-        asyncio.create_task(start_after_lobby())
+        await cb.answer("Запускаю!")
+        asyncio.create_task(run_tournament(tid, cid, s))
         return
-
-
-@dp.callback_query(F.data.startswith("tourn:join:"))
-async def on_tournament_join(cb: CallbackQuery):
-    if not cb.from_user or not isinstance(cb.message, Message):
-        await cb.answer()
-        return
-    try:
-        tid = int(cb.data.split(":")[2])
-    except (ValueError, IndexError):
-        await cb.answer("Ошибка", show_alert=True)
-        return
-
-    lobby = TOURNAMENT_LOBBY.get(tid)
-    if not lobby:
-        await cb.answer("Регистрация закрыта.", show_alert=True)
-        return
-
-    uid = cb.from_user.id
-    if uid in lobby["players"]:
-        await cb.answer("Ты уже участвуешь.")
-        return
-
-    lobby["players"].add(uid)
-    await tournament_add_player(tid, uid)
-    await cb.answer(f"✅ Записан! Всего: {len(lobby['players'])}")
 
 
 # ==================== START / HELP / RULES ====================
@@ -1589,13 +1467,13 @@ async def cmd_aihelp(message: Message):
     if message.from_user and is_admin(message.from_user.id):
         text += (
             "\n<b>🛠 Админ</b>\n"
-            "/AiAdmin — панель (сложность, касса, баны)\n"
-            "/AiTurik — настройка турниров\n"
-            "\n<b>🎰 Управление копилкой</b>\n"
-            "/AiPot — сколько сейчас в фонде\n"
-            "/AiPotAdd &lt;сумма&gt; — пополнить фонд\n"
-            "/AiPotTake &lt;сумма&gt; — снять из фонда себе\n"
-            "/AiPotGive — раздать фонд сейчас\n"
+            "/AiAdmin — панель\n"
+            "/AiTurik — турниры (сразу старт, для всех)\n"
+            "\n<b>🎰 Копилка</b>\n"
+            "/AiPot — сколько в фонде\n"
+            "/AiPotAdd &lt;сумма&gt;\n"
+            "/AiPotTake &lt;сумма&gt;\n"
+            "/AiPotGive — раздать сейчас\n"
             "\n/AiBan &lt;id&gt; [время] [причина]\n"
             "/AiUnban &lt;id&gt;\n"
         )
@@ -1618,9 +1496,6 @@ async def cmd_airules(message: Message):
         f"💳 Депозит: от ${DEPOSIT_MIN:.2f}\n"
         f"🎲 Рейк с дуэлей: {RAKE_PCT*100:.0f}%\n\n"
         "<i>Незнание правил не освобождает от ответственности.</i>")
-
-
-# ==================== /AiCoins ====================
 
 
 @dp.message(Command("AiCoins"))
@@ -2661,6 +2536,7 @@ async def handle_answer(message: Message):
     cid, uid = message.chat.id, message.from_user.id
     text = (message.text or "").strip().lower()
 
+    # турнир в приоритете
     if cid in TOURNAMENT_ACTIVE:
         st = TOURNAMENT_STATE.get(cid)
         if st and not st.get("answered_by"):
@@ -2745,7 +2621,7 @@ async def handle_answer(message: Message):
 
 async def main():
     print("=" * 50)
-    print("Quiz Bot · сложности · турниры · копилка · спонсоры")
+    print("Quiz Bot · турниры без лобби · сложности · копилка")
     print(f"Easy: {len(EASY_QUESTIONS)} · Medium: {len(MEDIUM_QUESTIONS)} · Hard: {len(HARD_QUESTIONS)} · Extreme: {len(EXTREME_QUESTIONS)}")
     print(f"Админы: {sorted(ADMIN_IDS)}")
 
