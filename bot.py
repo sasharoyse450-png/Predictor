@@ -170,7 +170,7 @@ def make_progress_bar(c):
     return f"{'▓' * in_level}{'▒' * (ANSWERS_PER_LEVEL - in_level)} {in_level}/{ANSWERS_PER_LEVEL}"
 
 
-# ==================== ПРЕМИУМ-СЛОВО СВЕРХУ СООБЩЕНИЯ ====================
+# ==================== ПРЕМИУМ-СЛОВО ====================
 
 
 def utf16_len(s: str) -> int:
@@ -178,21 +178,16 @@ def utf16_len(s: str) -> int:
 
 
 async def send_word(chat_id: int, word: str, extra_text: str = "", **kwargs):
-    """
-    Отправляет сообщение, где СВЕРХУ идёт слово из премиум-эмодзи,
-    а под ним — обычный текст.
-    """
+    """Отправляет сообщение со СЛОВОМ из премиум-эмодзи сверху."""
     emoji_ids = word_ids(word)
-    word_line = word  # fallback-символы
-    full_text = word_line + ("\n\n" + extra_text if extra_text else "")
+    full_text = word + ("\n\n" + extra_text if extra_text else "")
 
     if not all(emoji_ids):
-        # какая-то буква не найдена — обычный текст
         return await safe_send(bot.send_message, chat_id, full_text, **kwargs)
 
     entities = []
     pos = 0
-    for i, ch in enumerate(word_line):
+    for i, ch in enumerate(word):
         entities.append(MessageEntity(
             type="custom_emoji",
             offset=pos,
@@ -311,12 +306,27 @@ def _rpc(name, params):
 
 
 def get_player_sync(chat_id, user_id, username=None, first_name=None):
+    """Возвращает игрока. Если имя пустое — обновляет из переданных данных."""
     try:
         res = supabase.table("quiz_players").select("*").eq("chat_id", chat_id).eq("user_id", user_id).execute()
         if res.data:
-            return res.data[0]
+            row = res.data[0]
+            upd = {}
+            if not row.get("first_name") and first_name:
+                upd["first_name"] = first_name
+            if not row.get("username") and username:
+                upd["username"] = username
+            if upd:
+                try:
+                    supabase.table("quiz_players").update(upd).eq(
+                        "chat_id", chat_id
+                    ).eq("user_id", user_id).execute()
+                    row.update(upd)
+                except Exception as e:
+                    log.warning("update name: %s", e)
+            return row
     except Exception as e:
-        log.warning("get_player: %s", e)
+        log.warning("get_player select: %s", e)
     try:
         supabase.table("quiz_players").insert({
             "chat_id": chat_id, "user_id": user_id,
@@ -785,7 +795,6 @@ async def process_paid_invoice(client_invoice_id: str):
         except Exception as e:
             log.warning("edit invoice msg: %s", e)
 
-    # DEP слово в ЛС
     try:
         await send_word(
             user_id, "DEP",
@@ -795,20 +804,11 @@ async def process_paid_invoice(client_invoice_id: str):
     except Exception as e:
         log.warning("DEP в ЛС: %s", e)
 
-    # DEP в чат
-    try:
-        await send_word(
-            chat_id, "DEP",
-            f"👤 {inv.get('first_name', 'Игрок')} пополнил на <b>${amount:.4f}</b>"
-        )
-    except Exception as e:
-        log.warning("DEP в чат: %s", e)
-
 
 async def start_webhook_server():
     app = web.Application()
     app.router.add_post("/webhook", handle_webhook)
-    app.router.get("/", lambda r: web.Response(text="ok"))
+    app.router.add_get("/", lambda r: web.Response(text="ok"))
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", PORT)
@@ -899,16 +899,16 @@ async def cmd_start(message: Message):
         [InlineKeyboardButton(text="💎 Подписка $0.50/нед", url=XROCKET_SUBSCRIBE_URL)],
         [InlineKeyboardButton(text="🔗 Партнёрка xRocket", url=XROCKET_REFERRAL_URL)],
     ])
-    await send_word(
-        message.chat.id, "HELLO",
-        "👋 <b>Викторина с дуэлями!</b>\n\n"
-        "🎯 Квиз: правильный ответ → <b>+1 очко</b>\n"
-        "📈 10 уровней за очки\n"
-        "🎲 Дуэли: <code>/AiDuel 0.20</code>\n"
-        "💳 Пополнить: <code>/AiDeposit 1.0</code>\n"
-        "💸 Вывод от " + f"${MIN_WITHDRAW:.2f}\n\n"
-        "📖 /AiHelp — все команды\n"
-        "📜 /AiRules — правила",
+    await safe_send(
+        message.reply,
+        f"👋 <b>Викторина с дуэлями!</b>\n\n"
+        f"🎯 Квиз: правильный ответ → <b>+1 очко</b>\n"
+        f"📈 10 уровней за очки\n"
+        f"🎲 Дуэли: <code>/AiDuel 0.20</code>\n"
+        f"💳 Пополнить: <code>/AiDeposit 1.0</code>\n"
+        f"💸 Вывод от ${MIN_WITHDRAW:.2f}\n\n"
+        f"📖 /AiHelp — все команды\n"
+        f"📜 /AiRules — правила",
         reply_markup=kb,
     )
 
@@ -1064,13 +1064,12 @@ async def cmd_aiban(message: Message):
                 banned_until = (datetime.now(timezone.utc) + duration).isoformat()
     await ban_user(message.chat.id, target, reason, message.from_user.id, banned_until)
 
-    # Слово BAN сверху
     if banned_until:
-        await send_word(message.chat.id, "BAN",
+        await safe_send(message.reply,
             f"🔨 <code>{target}</code> забанен до <b>{banned_until[:19].replace('T', ' ')} UTC</b>\n"
             f"Причина: {reason}")
     else:
-        await send_word(message.chat.id, "BAN",
+        await safe_send(message.reply,
             f"🔨 <code>{target}</code> забанен <b>навсегда</b>\nПричина: {reason}")
 
 
@@ -1355,7 +1354,12 @@ async def cmd_aitop(message: Message):
         medal = ["🥇", "🥈", "🥉"][i-1] if i <= 3 else f"{i}."
         uid = f" · <code>{row['user_id']}</code>" if admin_view else ""
         lines.append(f"{medal} {emoji} {nm} — {ca} очк. · ${float(row['balance']):.4f}{uid}")
-    await safe_send(message.reply, "\n".join(lines))
+
+    # Сверху слово TOP из премиум-эмодзи
+    await send_word(
+        message.chat.id, "TOP",
+        "\n".join(lines[1:]),
+    )
 
 
 # ==================== ДЕПОЗИТ ====================
@@ -1577,7 +1581,6 @@ async def on_duel_cb(cb: CallbackQuery):
 
         winner_id, winner_name = (challenger_id, name_c) if r1 > r2 else (opponent_id, name_o)
         loser_id = opponent_id if winner_id == challenger_id else challenger_id
-        loser_name = name_o if winner_id == challenger_id else name_c
 
         total_pot = round(amount * 2, 4)
         rake = round(total_pot * RAKE_PCT, 4)
@@ -1585,14 +1588,12 @@ async def on_duel_cb(cb: CallbackQuery):
         await add_balance(cid, winner_id, payout)
         await log_house_income(cid, rake, "duel")
 
-        # WIN сверху в общий чат
         await send_word(cid, "WIN",
             f"🏆 <b>{winner_name} победил!</b>\n\n"
             f"🎲 {name_c}: <b>{r1}</b>\n🎲 {name_o}: <b>{r2}</b>\n\n"
             f"💰 Забирает: <b>${payout:.4f}</b>\n"
             f"<i>рейк {RAKE_PCT*100:.0f}% = ${rake:.4f}</i>")
 
-        # LOSE проигравшему в ЛС
         try:
             await send_word(loser_id, "LOSE",
                 f"💔 Ты проиграл дуэль против {winner_name}\n"
@@ -1716,7 +1717,6 @@ async def on_withdraw_cb(cb: CallbackQuery):
                 await cb.message.edit_text(f"✅ <b>Выплачено ${amount:.4f}</b>\nID: <code>{result}</code>")
             except Exception:
                 pass
-            # Слово WIT в ЛС
             try:
                 await send_word(uid, "WIT",
                     f"💸 Выплачено ${amount:.4f} USDT\nID: {result}")
@@ -1770,11 +1770,11 @@ async def handle_answer(message: Message):
     new_correct = int(p["correct_answers"]) + 1
     new_lvl = level_from_correct(new_correct)
 
-    # Проверка нового топ-1
+    # проверка нового топ-1
     new_top1 = await get_top1(cid)
     if new_top1 and new_top1 != old_top1:
         TOP_CACHE[cid] = new_top1
-        if old_top1 is not None:  # не первый раз
+        if old_top1 is not None:
             try:
                 tp = await get_player(cid, new_top1)
                 nm = tp.get("first_name") or tp.get("username") or str(new_top1)
@@ -1789,7 +1789,6 @@ async def handle_answer(message: Message):
     else:
         answer_shown = q["answers"][0]
 
-    # Если уровень — отдельное сообщение LEVEL
     if new_lvl > old_lvl:
         n_emoji = LEVELS[new_lvl - 1][1]
         n_name = LEVELS[new_lvl - 1][2]
@@ -1823,7 +1822,7 @@ async def main():
     print("=" * 50)
     print("Quiz Bot · премиум-слова · дуэли · рейк 5%")
     print(f"Вопросов: {len(QUESTIONS)} + {len(MULTI_QUESTIONS)} мульти")
-    print(f"Алфавит премиум-эмодзи: {len(LETTERS)} букв")
+    print(f"Алфавит: {len(LETTERS)} букв")
     print(f"Админы: {sorted(ADMIN_IDS)}")
 
     await get_http()
@@ -1843,7 +1842,6 @@ async def main():
         }
         QUIZ_ENABLED.add(int(row["chat_id"]))
 
-    # Прогрев TOP_CACHE
     for cid in QUIZ_ENABLED:
         try:
             t = await get_top1(cid)
