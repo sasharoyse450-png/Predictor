@@ -26,7 +26,10 @@ from aiogram.types import (
 from PIL import Image, ImageDraw, ImageFont
 from supabase import create_client, Client
 
-from questions import QUESTIONS, MULTI_QUESTIONS, random_question
+from questions import (
+    EASY_QUESTIONS, MEDIUM_QUESTIONS, HARD_QUESTIONS, EXTREME_QUESTIONS,
+    DIFFICULTY_LABELS, random_question,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -74,6 +77,13 @@ POT_HOUR = 21
 
 SPONSOR_PRICE = 5.00
 SPONSOR_QUESTIONS = 20
+
+DIFFICULTY_REWARDS = {
+    "easy": 1,
+    "medium": 2,
+    "hard": 3,
+    "extreme": 5,
+}
 
 ADMIN_IDS = {8130244626, 6173495222}
 
@@ -284,6 +294,22 @@ def add_score_sync(chat_id, user_id):
     return bool(r)
 
 
+def add_score_multi_sync(chat_id, user_id, points):
+    """Начисляет points очков."""
+    try:
+        get_player_sync(chat_id, user_id)
+        res = supabase.table("quiz_players").select("correct_answers").eq(
+            "chat_id", chat_id).eq("user_id", user_id).execute()
+        cur = int(res.data[0]["correct_answers"]) if res.data else 0
+        supabase.table("quiz_players").update({
+            "correct_answers": cur + points,
+        }).eq("chat_id", chat_id).eq("user_id", user_id).execute()
+        return True
+    except Exception as e:
+        log.warning("add_score_multi: %s", e)
+        return False
+
+
 def add_balance_sync(chat_id, user_id, amount, count_correct=False):
     r = _rpc("add_balance_atomic", {
         "p_chat_id": chat_id, "p_user_id": user_id,
@@ -342,9 +368,6 @@ def get_house_by_source_sync():
         return {}
 
 
-# ==================== КОПИЛКА (sync) ====================
-
-
 def add_to_pot_sync(chat_id, amount):
     try:
         res = supabase.table("quiz_pot").select("amount").eq("chat_id", chat_id).execute()
@@ -393,9 +416,6 @@ def pot_take_sync(chat_id, amount):
     except Exception as e:
         log.warning("pot_take: %s", e)
         return False, 0.0
-
-
-# ==================== ИНВОЙСЫ ====================
 
 
 def create_invoice_sync(client_invoice_id, user_id, chat_id, amount, message_id=None, kind="deposit"):
@@ -581,6 +601,34 @@ def get_coins_stats_sync(chat_id=None):
         return None
 
 
+# ==================== НАСТРОЙКИ ЧАТА (сложность викторины) ====================
+
+
+def get_chat_settings_sync(chat_id):
+    try:
+        res = supabase.table("quiz_settings").select("*").eq("chat_id", chat_id).execute()
+        if res.data:
+            return res.data[0]
+    except Exception:
+        pass
+    default = {"chat_id": chat_id, "difficulty": "medium"}
+    try:
+        supabase.table("quiz_settings").insert(default).execute()
+    except Exception:
+        pass
+    return default
+
+
+def update_chat_setting_sync(chat_id, field, value):
+    try:
+        get_chat_settings_sync(chat_id)
+        supabase.table("quiz_settings").update({field: value}).eq("chat_id", chat_id).execute()
+        return True
+    except Exception as e:
+        log.warning("update_chat_setting: %s", e)
+        return False
+
+
 # ==================== ТУРНИР (sync) ====================
 
 
@@ -646,7 +694,8 @@ def get_t_settings_sync(chat_id):
     except Exception as e:
         log.warning("get_t_settings: %s", e)
     default = {"chat_id": chat_id, "min_players": 2, "lobby_seconds": 60,
-               "question_seconds": 30, "questions": 10, "prize": 0.30}
+               "question_seconds": 30, "questions": 10, "prize": 0.30,
+               "difficulty": "medium"}
     try:
         supabase.table("quiz_tournament_settings").insert(default).execute()
     except Exception:
@@ -656,6 +705,7 @@ def get_t_settings_sync(chat_id):
 
 def update_t_setting_sync(chat_id, field, value):
     try:
+        get_t_settings_sync(chat_id)
         supabase.table("quiz_tournament_settings").update({field: value}).eq("chat_id", chat_id).execute()
         return True
     except Exception as e:
@@ -706,6 +756,10 @@ async def get_player(cid, uid, un=None, fn=None):
 
 async def add_score(cid, uid):
     return await asyncio.to_thread(add_score_sync, cid, uid)
+
+
+async def add_score_multi(cid, uid, points):
+    return await asyncio.to_thread(add_score_multi_sync, cid, uid, points)
 
 
 async def add_balance(cid, uid, amt, count_correct=False):
@@ -770,6 +824,14 @@ async def get_top1(cid):
 
 async def get_coins_stats(cid=None):
     return await asyncio.to_thread(get_coins_stats_sync, cid)
+
+
+async def get_chat_settings(cid):
+    return await asyncio.to_thread(get_chat_settings_sync, cid)
+
+
+async def update_chat_setting(cid, field, value):
+    return await asyncio.to_thread(update_chat_setting_sync, cid, field, value)
 
 
 async def tournament_create(cid, prize):
@@ -1022,6 +1084,11 @@ async def ask_question(chat_id):
     if chat_id in TOURNAMENT_ACTIVE:
         return False
 
+    chat_settings = await get_chat_settings(chat_id)
+    difficulty = chat_settings.get("difficulty", "medium")
+    reward_points = DIFFICULTY_REWARDS.get(difficulty, 2)
+    diff_label = DIFFICULTY_LABELS.get(difficulty, "🟡 Средне")
+
     sponsor_q = await sponsor_get_next(chat_id)
     if sponsor_q:
         q = sponsor_q["question"]
@@ -1031,7 +1098,7 @@ async def ask_question(chat_id):
         await sponsor_mark_used(sponsor_q["id"])
         sponsor_note = "\n🎁 <i>Спонсорский вопрос</i>"
     else:
-        q, answers, is_multi, is_image = random_question()
+        q, answers, is_multi, is_image = random_question(difficulty=difficulty)
         sponsor_note = ""
 
     ACTIVE_QUESTIONS[chat_id] = {
@@ -1060,14 +1127,14 @@ async def ask_question(chat_id):
             png = render_question_image(q)
             buf = BufferedInputFile(png, filename="q.png")
             caption = (f"🧠 <b>Вопрос!</b>{sponsor_note}\n\n"
-                       f"🏆 +1 очко за первый правильный\n"
+                       f"{diff_label} · 🏆 +{reward_points} очк. за правильный\n"
                        f"🔓 Вопрос открыт до правильного ответа."
                        f"{pot_line}{timer_line}")
             msg = await safe_send(bot.send_photo, chat_id, buf, caption=caption)
         else:
             msg = await safe_send(bot.send_message, chat_id,
                 f"🧠 <b>Вопрос!</b>{sponsor_note}\n\n❓ {q}\n\n"
-                f"🏆 +1 очко за первый правильный\n"
+                f"{diff_label} · 🏆 +{reward_points} очк. за правильный\n"
                 f"🔓 Вопрос открыт до правильного ответа."
                 f"{pot_line}{timer_line}")
         if msg:
@@ -1124,9 +1191,6 @@ async def caches_refresh_loop():
         await asyncio.sleep(60)
 
 
-# ==================== КОПИЛКА (раздача) ====================
-
-
 async def distribute_pot(cid, reason="manual"):
     amount = await payout_pot(cid)
     if amount < 0.01:
@@ -1173,17 +1237,20 @@ async def run_tournament(tid, chat_id, settings):
     total_q = int(settings["questions"])
     q_secs = int(settings["question_seconds"])
     prize = float(settings["prize"])
+    difficulty = settings.get("difficulty", "medium")
+    diff_label = DIFFICULTY_LABELS.get(difficulty, "🟡 Средне")
 
     try:
         await safe_send(bot.send_message, chat_id,
             f"🏁 <b>ТУРНИР НАЧАЛСЯ!</b>\n\n"
+            f"🎯 Сложность: <b>{diff_label}</b>\n"
             f"❓ {total_q} вопросов подряд\n"
             f"⏱ {q_secs} сек на каждый\n"
             f"💰 Приз: <b>${prize:.2f}</b>\n\n"
             f"Побеждает тот, у кого больше правильных!")
 
         for q_num in range(total_q):
-            q, answers, is_multi, _ = random_question()
+            q, answers, is_multi, _ = random_question(difficulty=difficulty)
             TOURNAMENT_STATE[chat_id] = {
                 "tid": tid, "q_num": q_num,
                 "answers": answers, "answered_by": None,
@@ -1264,24 +1331,28 @@ async def run_tournament(tid, chat_id, settings):
 
 
 def turik_kb(s):
+    diff = s.get("difficulty", "medium")
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text=f"👥 Мин. игроков: {s['min_players']}", callback_data="turik:set:min_players"),
          InlineKeyboardButton(text=f"⏱ Лобби: {s['lobby_seconds']}с", callback_data="turik:set:lobby_seconds")],
         [InlineKeyboardButton(text=f"⏱ На вопрос: {s['question_seconds']}с", callback_data="turik:set:question_seconds"),
          InlineKeyboardButton(text=f"❓ Вопросов: {s['questions']}", callback_data="turik:set:questions")],
         [InlineKeyboardButton(text=f"💰 Приз: ${float(s['prize']):.2f}", callback_data="turik:set:prize")],
+        [InlineKeyboardButton(text=f"🎯 Сложность: {DIFFICULTY_LABELS.get(diff, diff)}", callback_data="turik:difficulty")],
         [InlineKeyboardButton(text="🚀 Запустить турнир", callback_data="turik:start")],
         [InlineKeyboardButton(text="🔄 Обновить", callback_data="turik:refresh")],
     ])
 
 
 def turik_text(s):
+    diff = s.get("difficulty", "medium")
     return (f"🏁 <b>Настройки турнира</b>\n\n"
             f"👥 Минимум игроков: <b>{s['min_players']}</b>\n"
             f"⏱ Лобби: <b>{s['lobby_seconds']}</b> сек\n"
             f"⏱ На вопрос: <b>{s['question_seconds']}</b> сек\n"
             f"❓ Вопросов: <b>{s['questions']}</b>\n"
-            f"💰 Приз: <b>${float(s['prize']):.2f}</b>\n\n"
+            f"💰 Приз: <b>${float(s['prize']):.2f}</b>\n"
+            f"🎯 Сложность: <b>{DIFFICULTY_LABELS.get(diff, diff)}</b>\n\n"
             f"Жми кнопку → напиши число в чат.")
 
 
@@ -1360,6 +1431,56 @@ async def on_turik_cb(cb: CallbackQuery):
         await cb.answer()
         return
 
+    if action == "menu":
+        s = await get_t_settings(cid)
+        try:
+            await cb.message.edit_text(turik_text(s), reply_markup=turik_kb(s))
+        except Exception:
+            pass
+        await cb.answer()
+        return
+
+    if action == "difficulty":
+        s = await get_t_settings(cid)
+        cur = s.get("difficulty", "medium")
+        def m(d):
+            mark = "✅ " if d == cur else ""
+            return f"{mark}{DIFFICULTY_LABELS[d]}"
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text=m("easy"), callback_data="turik:diff_set:easy")],
+            [InlineKeyboardButton(text=m("medium"), callback_data="turik:diff_set:medium")],
+            [InlineKeyboardButton(text=m("hard"), callback_data="turik:diff_set:hard")],
+            [InlineKeyboardButton(text=m("extreme"), callback_data="turik:diff_set:extreme")],
+            [InlineKeyboardButton(text="⬅️ Назад", callback_data="turik:menu")],
+        ])
+        try:
+            await cb.message.edit_text(
+                f"🎯 <b>Сложность турнира</b>\n\n"
+                f"🟢 Легко — простые вопросы\n"
+                f"🟡 Средне — обычные\n"
+                f"🟠 Сложно — посложнее\n"
+                f"🔴 Экстрим — только хардкор",
+                reply_markup=kb,
+            )
+        except Exception:
+            pass
+        await cb.answer()
+        return
+
+    if action == "diff_set":
+        d = parts[2] if len(parts) > 2 else ""
+        if d not in ("easy", "medium", "hard", "extreme"):
+            await cb.answer("Ошибка", show_alert=True)
+            return
+        await update_t_setting(cid, "difficulty", d)
+        await cb.answer(f"Сложность: {DIFFICULTY_LABELS[d]}")
+        s = await get_t_settings(cid)
+        try:
+            await cb.message.edit_text(turik_text(s), reply_markup=turik_kb(s))
+        except Exception:
+            pass
+        return
+
     if action == "set":
         field = parts[2]
         if field not in ("min_players", "lobby_seconds", "question_seconds", "questions", "prize"):
@@ -1394,6 +1515,7 @@ async def on_turik_cb(cb: CallbackQuery):
         ]])
         sent = await safe_send(cb.message.answer,
             f"🏁 <b>ТУРНИР!</b>\n\n"
+            f"🎯 Сложность: <b>{DIFFICULTY_LABELS.get(s.get('difficulty','medium'), '?')}</b>\n"
             f"📝 Вопросов: <b>{s['questions']}</b>\n"
             f"⏱ Секунд на вопрос: <b>{s['question_seconds']}</b>\n"
             f"👥 Минимум участников: <b>{s['min_players']}</b>\n"
@@ -1470,7 +1592,7 @@ async def cmd_start(message: Message):
     ])
     await safe_send(message.reply,
         f"👋 <b>Викторина с дуэлями!</b>\n\n"
-        f"🎯 Квиз: правильный ответ → <b>+1 очко</b>\n"
+        f"🎯 Квиз: правильный ответ → очки\n"
         f"📈 10 уровней за очки\n"
         f"🎲 Дуэли: <code>/AiDuel 0.20</code>\n"
         f"💳 Пополнить: <code>/AiDeposit 1.0</code>\n"
@@ -1504,8 +1626,7 @@ async def cmd_aihelp(message: Message):
     if message.from_user and is_admin(message.from_user.id):
         text += (
             "\n<b>🛠 Админ</b>\n"
-            "/AiAdmin — панель\n"
-            "/AiHouse — касса\n"
+            "/AiAdmin — панель (сложность викторины, касса, баны)\n"
             "/AiTurik — настройка турниров\n"
             "\n<b>🎰 Управление копилкой</b>\n"
             "/AiPot — сколько сейчас в фонде\n"
@@ -1670,8 +1791,9 @@ def admin_kb(cid):
          InlineKeyboardButton(text="💸 Выплаты", callback_data="adm:payouts")],
         [InlineKeyboardButton(text="📋 Топ", callback_data="adm:top"),
          InlineKeyboardButton(text="🚫 Баны", callback_data="adm:bans")],
-        [InlineKeyboardButton(text="🎰 Копилка", callback_data="adm:pot"),
-         InlineKeyboardButton(text="🧪 xRocket", callback_data="adm:xrdbg")],
+        [InlineKeyboardButton(text="🎯 Сложность", callback_data="adm:difficulty"),
+         InlineKeyboardButton(text="🎰 Копилка", callback_data="adm:pot")],
+        [InlineKeyboardButton(text="🧪 xRocket", callback_data="adm:xrdbg")],
     ])
 
 
@@ -1714,7 +1836,7 @@ async def cmd_house(message: Message):
     await safe_send(message.reply, "\n".join(lines))
 
 
-# ==================== КОПИЛКА (команды) ====================
+# ==================== КОПИЛКА ====================
 
 
 @dp.message(Command("AiPot"))
@@ -1798,7 +1920,7 @@ async def cmd_aipotgive(message: Message):
         await safe_send(message.reply, f"❌ {info}")
 
 
-# ==================== BAN/UNBAN ====================
+# ==================== BAN ====================
 
 
 def parse_duration(s):
@@ -1902,6 +2024,68 @@ async def on_admin_cb(cb: CallbackQuery):
         asyncio.create_task(ask_question(cid))
         return
 
+    if action == "difficulty":
+        s = await get_chat_settings(cid)
+        cur = s.get("difficulty", "medium")
+        def m(d):
+            mark = "✅ " if d == cur else ""
+            return f"{mark}{DIFFICULTY_LABELS[d]}"
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text=m("easy"), callback_data="adm:diff_set:easy")],
+            [InlineKeyboardButton(text=m("medium"), callback_data="adm:diff_set:medium")],
+            [InlineKeyboardButton(text=m("hard"), callback_data="adm:diff_set:hard")],
+            [InlineKeyboardButton(text=m("extreme"), callback_data="adm:diff_set:extreme")],
+            [InlineKeyboardButton(text="⬅️ Назад", callback_data="adm:menu")],
+        ])
+        try:
+            await cb.message.edit_text(
+                f"🎯 <b>Сложность викторины</b>\n\n"
+                f"Текущая: <b>{DIFFICULTY_LABELS.get(cur, cur)}</b>\n\n"
+                f"Награда за ответ:\n"
+                f"🟢 Легко — +1 очко\n"
+                f"🟡 Средне — +2 очка\n"
+                f"🟠 Сложно — +3 очка\n"
+                f"🔴 Экстрим — +5 очков",
+                reply_markup=kb,
+            )
+        except Exception:
+            pass
+        await cb.answer()
+        return
+
+    if action == "diff_set":
+        d = cb.data.split(":")[2]
+        if d not in ("easy", "medium", "hard", "extreme"):
+            await cb.answer("Ошибка", show_alert=True)
+            return
+        await update_chat_setting(cid, "difficulty", d)
+        await cb.answer(f"Установлено: {DIFFICULTY_LABELS[d]}")
+        s = await get_chat_settings(cid)
+        cur = s.get("difficulty", "medium")
+        def m(x):
+            mark = "✅ " if x == cur else ""
+            return f"{mark}{DIFFICULTY_LABELS[x]}"
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text=m("easy"), callback_data="adm:diff_set:easy")],
+            [InlineKeyboardButton(text=m("medium"), callback_data="adm:diff_set:medium")],
+            [InlineKeyboardButton(text=m("hard"), callback_data="adm:diff_set:hard")],
+            [InlineKeyboardButton(text=m("extreme"), callback_data="adm:diff_set:extreme")],
+            [InlineKeyboardButton(text="⬅️ Назад", callback_data="adm:menu")],
+        ])
+        try:
+            await cb.message.edit_reply_markup(reply_markup=kb)
+        except Exception:
+            pass
+        return
+
+    if action == "menu":
+        try:
+            await cb.message.edit_text(admin_text(cid), reply_markup=admin_kb(cid))
+        except Exception:
+            pass
+        await cb.answer()
+        return
+
     if action == "stats":
         await cb.answer("Собираю...")
         players, payouts, bans, subs = await get_stats()
@@ -1929,6 +2113,7 @@ async def on_admin_cb(cb: CallbackQuery):
         kb = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="🎉 Раздать сейчас", callback_data="adm:potgive")],
             [InlineKeyboardButton(text="🔄 Обновить", callback_data="adm:pot")],
+            [InlineKeyboardButton(text="⬅️ Назад", callback_data="adm:menu")],
         ])
         await safe_send(cb.message.answer,
             f"🎰 <b>Копилка чата</b>\n\n"
@@ -2552,17 +2737,21 @@ async def handle_answer(message: Message):
     if tsk:
         tsk.cancel()
 
+    chat_settings = await get_chat_settings(cid)
+    difficulty = chat_settings.get("difficulty", "medium")
+    reward_points = DIFFICULTY_REWARDS.get(difficulty, 2)
+
     p = await get_player(cid, uid, message.from_user.username, message.from_user.first_name)
     old_lvl = level_from_correct(int(p["correct_answers"]))
     old_top1 = TOP_CACHE.get(cid)
 
     await asyncio.gather(
         clear_active(cid),
-        add_score(cid, uid),
+        add_score_multi(cid, uid, reward_points),
         return_exceptions=True,
     )
 
-    new_correct = int(p["correct_answers"]) + 1
+    new_correct = int(p["correct_answers"]) + reward_points
     new_lvl = level_from_correct(new_correct)
 
     new_top1 = await get_top1(cid)
@@ -2583,7 +2772,7 @@ async def handle_answer(message: Message):
         answer_shown = q["answers"][0]
 
     msg = (f"{phrase}\n"
-           f"{message.from_user.first_name} +1 очко\n"
+           f"{message.from_user.first_name} +{reward_points} очк.\n"
            f"<i>Ответ: {answer_shown}</i>")
 
     if new_lvl > old_lvl:
@@ -2609,8 +2798,8 @@ async def handle_answer(message: Message):
 
 async def main():
     print("=" * 50)
-    print("Quiz Bot · копилка · турниры · таймер · спонсоры · /AiCoins")
-    print(f"Вопросов: {len(QUESTIONS)} + {len(MULTI_QUESTIONS)} мульти")
+    print("Quiz Bot · сложности · турниры · копилка · спонсоры")
+    print(f"Easy: {len(EASY_QUESTIONS)} · Medium: {len(MEDIUM_QUESTIONS)} · Hard: {len(HARD_QUESTIONS)} · Extreme: {len(EXTREME_QUESTIONS)}")
     print(f"Админы: {sorted(ADMIN_IDS)}")
 
     await get_http()
