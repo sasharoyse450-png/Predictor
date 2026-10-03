@@ -41,15 +41,12 @@ XROCKET_BASE = "https://pay.api.xrocket.exchange"
 XROCKET_SUBSCRIBE_URL = os.getenv("XROCKET_SUBSCRIBE_URL", "https://t.me/xRocket")
 XROCKET_REFERRAL_URL = os.getenv("XROCKET_REFERRAL_URL", "https://t.me/xRocket")
 
-# Очки за правильный ответ (без USDT)
 POINTS_PER_ANSWER = 1
 ANSWERS_PER_LEVEL = 10
 MAX_LEVEL = 10
 
-# Рейк дома с дуэлей
-RAKE_BASE_PCT = 0.06  # на 1 уровне 6%
-RAKE_STEP_PCT = 0.005  # -0.5% за уровень
-RAKE_MIN_PCT = 0.01   # на 10 уровне 1%
+# Рейк дома — ФИКСИРОВАННЫЕ 5%
+RAKE_PCT = 0.05
 
 SUBSCRIBER_MULTIPLIER = 2.0
 SUBSCRIPTION_PRICE = 0.50
@@ -57,8 +54,8 @@ SUBSCRIPTION_PRICE = 0.50
 MIN_WITHDRAW = 0.05
 DAILY_WITHDRAW_LIMIT = 5.00
 
-# Депозиты
-DEPOSIT_MIN = 0.50
+# Депозит от $0.05
+DEPOSIT_MIN = 0.05
 DEPOSIT_MAX = 50.0
 
 DUEL_MIN = 0.05
@@ -121,13 +118,6 @@ def level_info(c):
         in_level = c - (lvl - 1) * ANSWERS_PER_LEVEL
         progress = f"до след. уровня: {ANSWERS_PER_LEVEL - in_level} отв."
     return lvl, emoji, name, 0, title_str, progress
-
-
-def rake_pct_for(correct_answers):
-    """Рейк с дуэли: L1=5.5% → L10=1%."""
-    lvl = level_from_correct(correct_answers)
-    pct = RAKE_BASE_PCT - RAKE_STEP_PCT * (lvl - 1)
-    return max(RAKE_MIN_PCT, pct)
 
 
 def make_progress_bar(c):
@@ -256,7 +246,6 @@ def get_player_sync(chat_id, user_id, username=None, first_name=None):
 
 
 def add_score_sync(chat_id, user_id):
-    """+1 очко за правильный ответ. USDT не начисляется."""
     r = _rpc("add_balance_atomic", {
         "p_chat_id": chat_id, "p_user_id": user_id,
         "p_amount": 0, "p_count_correct": True,
@@ -698,7 +687,7 @@ async def cmd_start(message: Message):
     await safe_send(message.reply,
         f"👋 <b>Викторина с дуэлями!</b>\n\n"
         f"🎯 Квиз: правильный ответ → <b>+1 очко</b>\n"
-        f"📈 10 уровней, чем выше — тем ниже рейк в дуэлях\n"
+        f"📈 10 уровней за очки\n"
         f"🎲 Дуэли на кубах на USDT: <code>/AiDuel 0.20</code>\n"
         f"💳 Пополнить: <code>/AiDeposit 1.0</code>\n"
         f"💸 Вывод от ${MIN_WITHDRAW:.2f}\n\n"
@@ -720,7 +709,7 @@ async def cmd_aihelp(message: Message):
         f"/AiLevels — все уровни\n"
         f"/AiDuel 0.20 — дуэль на кубах\n\n"
         f"<b>💰 Деньги</b>\n"
-        f"/AiDeposit 1.0 — пополнить баланс\n"
+        f"/AiDeposit 0.05 — пополнить (от ${DEPOSIT_MIN:.2f})\n"
         f"/AiWithdraw — вывести USDT от ${MIN_WITHDRAW:.2f}\n"
         f"/AiSubscribe — подписка ×{SUBSCRIBER_MULTIPLIER}\n\n"
         f"<b>📜 Общее</b>\n"
@@ -734,8 +723,8 @@ async def cmd_aihelp(message: Message):
             f"/AiHouse — касса дома\n"
             f"/AiBan &lt;id&gt; [время] [причина]\n"
             f"/AiUnban &lt;id&gt;\n"
-            f"/AiApproveDeposit &lt;id&gt; — подтвердить депозит\n"
-            f"/AiRejectDeposit &lt;id&gt; — отклонить депозит\n"
+            f"/AiApproveDeposit &lt;id&gt;\n"
+            f"/AiRejectDeposit &lt;id&gt;\n"
         )
     await safe_send(message.reply, text)
 
@@ -762,14 +751,15 @@ async def cmd_airules(message: Message):
         f"<b>3.3</b> Ответ <0.5 сек — признак бота.\n"
         f"<b>3.4</b> Мультиаккаунты для накрутки — <b>бан + обнуление</b>.\n\n"
         f"<b>4. Обман и накрутка</b>\n"
-        f"<b>4.1</b> Накуртка через баги — <b>бан + сброс баланса</b>.\n"
+        f"<b>4.1</b> Накрутка через баги — <b>бан + сброс баланса</b>.\n"
         f"<b>4.2</b> Фиктивные дуэли (сговор) — <b>бан обоим</b>.\n"
         f"<b>4.3</b> Продажа аккаунта с балансом — <b>бан</b>.\n\n"
         f"<b>5. Выводы и депозиты</b>\n"
         f"<b>5.1</b> Минимум вывода — ${MIN_WITHDRAW:.2f} USDT, суточный лимит — ${DAILY_WITHDRAW_LIMIT:.2f}.\n"
-        f"<b>5.2</b> Для выплаты обязательно зайти в <b>@xrocket</b>.\n"
-        f"<b>5.3</b> Ошибочные переводы по вине игрока не возвращаются.\n"
-        f"<b>5.4</b> Попытка обмануть систему — <b>бан + обнуление</b>.\n\n"
+        f"<b>5.2</b> Минимум депозита — ${DEPOSIT_MIN:.2f} USDT.\n"
+        f"<b>5.3</b> Для выплаты обязательно зайти в <b>@xrocket</b>.\n"
+        f"<b>5.4</b> Ошибочные переводы по вине игрока не возвращаются.\n"
+        f"<b>5.5</b> Попытка обмануть систему — <b>бан + обнуление</b>.\n\n"
         f"<b>6. Общие положения</b>\n"
         f"<b>6.1</b> Незнание правил не освобождает от ответственности.\n"
         f"<b>6.2</b> Администрация применяет наказание на своё усмотрение.\n"
@@ -808,8 +798,9 @@ def admin_text(cid):
             f"Викторина: {status}\n"
             f"Расписание: 8:00 — 23:00 ({TZ.key})\n"
             f"Квиз: +1 очко за ответ (без USDT)\n"
-            f"Рейк с дуэлей: 5.5% → 1% (зависит от уровня)\n"
-            f"Вывод от: ${MIN_WITHDRAW:.2f} · лимит ${DAILY_WITHDRAW_LIMIT:.2f}/сутки\n"
+            f"Рейк с дуэлей: <b>{RAKE_PCT*100:.1f}%</b>\n"
+            f"Депозит: от ${DEPOSIT_MIN:.2f}\n"
+            f"Вывод: от ${MIN_WITHDRAW:.2f} · лимит ${DAILY_WITHDRAW_LIMIT:.2f}/сутки\n"
             f"Вопросов: {len(QUESTIONS)} + {len(MULTI_QUESTIONS)} мульти"
             f"{cur_txt}")
 
@@ -1111,7 +1102,6 @@ async def cmd_aibalance(message: Message):
     lvl, _, _, _, title_str, _ = level_info(ca)
     bar = make_progress_bar(ca)
     sub = is_subscriber_cached(message.chat.id, message.from_user.id)
-    rake_pct = rake_pct_for(ca) * 100
 
     sub_line = f"\n💎 Подписка · ×{SUBSCRIBER_MULTIPLIER}" if sub else ""
     await safe_send(message.reply,
@@ -1119,7 +1109,7 @@ async def cmd_aibalance(message: Message):
         f"🎖 {title_str}\n"
         f"🏆 Очков: <b>{ca}</b>\n"
         f"<code>{bar}</code>\n"
-        f"🎲 Рейк в дуэлях: <b>{rake_pct:.1f}%</b>{sub_line}\n"
+        f"🎲 Рейк в дуэлях: <b>{RAKE_PCT*100:.1f}%</b>{sub_line}\n"
         f"💸 Выведено сегодня: ${today:.4f} / ${DAILY_WITHDRAW_LIMIT:.2f}")
 
 
@@ -1133,7 +1123,6 @@ async def cmd_aiprofile(message: Message):
     lvl, _, _, _, title_str, _ = level_info(ca)
     bar = make_progress_bar(ca)
     sub = is_subscriber_cached(message.chat.id, message.from_user.id)
-    rake_pct = rake_pct_for(ca) * 100
 
     def _place():
         try:
@@ -1154,15 +1143,14 @@ async def cmd_aiprofile(message: Message):
     else:
         in_lvl = ca - (lvl - 1) * ANSWERS_PER_LEVEL
         rem = ANSWERS_PER_LEVEL - in_lvl
-        next_rake = rake_pct_for(ca + rem) * 100
         next_line = (f"⬆️ До {LEVELS[lvl][1]} <b>{LEVELS[lvl][2]}</b>: "
-                     f"<b>{rem}</b> очк. → рейк {next_rake:.1f}%")
+                     f"<b>{rem}</b> очк.")
 
     sub_line = f"\n💎 Подписка: <b>активна</b>" if sub else "\n💎 Подписка: нет"
     await safe_send(message.reply,
         f"👤 <b>{message.from_user.first_name}</b>\n\n"
         f"🎖 <b>{title_str}</b>\n"
-        f"🎲 Рейк в дуэлях: <b>{rake_pct:.1f}%</b>{sub_line}\n\n"
+        f"🎲 Рейк в дуэлях: <b>{RAKE_PCT*100:.1f}%</b>{sub_line}\n\n"
         f"<code>{bar}</code>\n{next_line}\n\n"
         f"💰 Баланс: <b>${float(p['balance']):.4f}</b>\n"
         f"💸 Выведено: ${today:.4f}\n\n"
@@ -1174,13 +1162,12 @@ async def cmd_aiprofile(message: Message):
 async def cmd_ailevels(message: Message):
     if message.chat.type not in ("group", "supergroup"):
         return
-    lines = ["🎖 <b>Уровни · рейк в дуэлях</b>\n"]
+    lines = [f"🎖 <b>Уровни</b>\n",
+             f"<i>Рейк в дуэлях одинаковый для всех: {RAKE_PCT*100:.1f}%</i>\n"]
     for lvl, emoji, name in LEVELS:
-        rake_pct = (RAKE_BASE_PCT - RAKE_STEP_PCT * (lvl - 1)) * 100
-        rake_pct = max(RAKE_MIN_PCT * 100, rake_pct)
         mn = (lvl - 1) * ANSWERS_PER_LEVEL
         req = f"{mn}+" if lvl == MAX_LEVEL else f"{mn}-{mn + ANSWERS_PER_LEVEL - 1}"
-        lines.append(f"{emoji} <b>Ур. {lvl}</b> · {name} · рейк <b>{rake_pct:.1f}%</b> · <i>{req}</i>")
+        lines.append(f"{emoji} <b>Ур. {lvl}</b> · {name} · <i>{req} очк.</i>")
     await safe_send(message.reply, "\n".join(lines))
 
 
@@ -1325,7 +1312,8 @@ async def cmd_duel(message: Message):
             f"🎲 <b>Дуэль на кубах</b>\n\n"
             f"Формат: <code>/AiDuel 0.20</code> — ответом на сообщение\n"
             f"Ставка: от ${DUEL_MIN:.2f} до ${DUEL_MAX:.2f}\n"
-            f"Ничья — возврат.")
+            f"Ничья — возврат.\n"
+            f"Рейк дома: {RAKE_PCT*100:.1f}% с банка.")
         return
     try:
         amount = round(float(parts[1]), 4)
@@ -1375,7 +1363,8 @@ async def cmd_duel(message: Message):
     text = (f"🎲 <b>Дуэль на кубах!</b>\n\n"
             f"<b>{message.from_user.first_name}</b> вызывает <b>{opponent_name}</b>\n\n"
             f"💵 Ставка: <b>${amount:.4f}</b>\n"
-            f"💰 Банк: <b>${amount*2:.4f}</b>")
+            f"💰 Банк: <b>${amount*2:.4f}</b>\n"
+            f"<i>Рейк дома {RAKE_PCT*100:.1f}% с банка</i>")
     sent = await safe_send(message.reply, text, reply_markup=kb)
     if not sent:
         return
@@ -1475,13 +1464,9 @@ async def on_duel_cb(cb: CallbackQuery):
 
         winner_id, winner_name = (challenger_id, name_c) if r1 > r2 else (opponent_id, name_o)
 
-        # рейк дома (зависит от уровня победителя)
-        p_w = await get_player(cid, winner_id)
-        lvl_w = level_from_correct(int(p_w.get("correct_answers", 0)))
-        rake_pct = max(RAKE_MIN_PCT, RAKE_BASE_PCT - RAKE_STEP_PCT * (lvl_w - 1))
-
+        # рейк дома — фиксированные 5%
         total_pot = round(amount * 2, 4)
-        rake = round(total_pot * rake_pct, 4)
+        rake = round(total_pot * RAKE_PCT, 4)
         payout = round(total_pot - rake, 4)
         await add_balance(cid, winner_id, payout)
         await log_house_income(cid, rake, "duel")
@@ -1490,7 +1475,7 @@ async def on_duel_cb(cb: CallbackQuery):
             f"🏆 <b>{winner_name} победил!</b>\n\n"
             f"🎲 {name_c}: <b>{r1}</b>\n🎲 {name_o}: <b>{r2}</b>\n\n"
             f"💰 Забирает: <b>${payout:.4f}</b>\n"
-            f"<i>рейк дома {rake_pct*100:.1f}% = ${rake:.4f}</i>")
+            f"<i>рейк дома {RAKE_PCT*100:.1f}% = ${rake:.4f}</i>")
     finally:
         DUEL_BUSY.discard(challenger_id)
         DUEL_BUSY.discard(opponent_id)
@@ -1644,7 +1629,6 @@ async def handle_answer(message: Message):
     p = await get_player(cid, uid, message.from_user.username, message.from_user.first_name)
     old_lvl = level_from_correct(int(p["correct_answers"]))
 
-    # начисляем очки (без USDT)
     await asyncio.gather(
         clear_active(cid),
         add_score(cid, uid),
@@ -1664,9 +1648,8 @@ async def handle_answer(message: Message):
     if new_lvl > old_lvl:
         n_emoji = LEVELS[new_lvl - 1][1]
         n_name = LEVELS[new_lvl - 1][2]
-        new_rake = rake_pct_for(new_correct) * 100
         msg += (f"\n\n{n_emoji} <b>НОВЫЙ УРОВЕНЬ {new_lvl}!</b>\n"
-                f"🎖 {n_name} · рейк в дуэлях <b>{new_rake:.1f}%</b>")
+                f"🎖 {n_name}")
 
     try:
         await bot.send_chat_action(cid, "typing")
@@ -1686,9 +1669,10 @@ async def handle_answer(message: Message):
 
 async def main():
     print("=" * 50)
-    print("Quiz Bot · очки · дуэли с рейком · депозиты")
+    print("Quiz Bot · очки · дуэли · рейк 5% · депозиты от $0.05")
     print(f"Вопросов: {len(QUESTIONS)} + {len(MULTI_QUESTIONS)} мульти")
-    print(f"Рейк: {RAKE_BASE_PCT*100:.1f}% (ур.1) → {RAKE_MIN_PCT*100:.1f}% (ур.10)")
+    print(f"Рейк дома: {RAKE_PCT*100:.1f}% (фиксированный)")
+    print(f"Депозит от: ${DEPOSIT_MIN:.2f}")
     print(f"Админы: {sorted(ADMIN_IDS)}")
 
     await get_http()
