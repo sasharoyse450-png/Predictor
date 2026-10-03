@@ -178,7 +178,10 @@ def utf16_len(s: str) -> int:
 
 
 async def send_word(chat_id: int, word: str, extra_text: str = "", **kwargs):
-    """Отправляет сообщение со СЛОВОМ из премиум-эмодзи сверху."""
+    """
+    Отправляет сообщение со СЛОВОМ из премиум-эмодзи сверху.
+    ВАЖНО: parse_mode=None — иначе Telegram игнорирует entities.
+    """
     emoji_ids = word_ids(word)
     full_text = word + ("\n\n" + extra_text if extra_text else "")
 
@@ -197,9 +200,12 @@ async def send_word(chat_id: int, word: str, extra_text: str = "", **kwargs):
         pos += utf16_len(ch)
 
     try:
-        return await safe_send(
-            bot.send_message, chat_id, full_text,
+        # КЛЮЧЕВОЕ: parse_mode=None — без него entities отбрасываются
+        return await bot.send_message(
+            chat_id,
+            full_text,
             entities=entities,
+            parse_mode=None,
             **kwargs,
         )
     except Exception as e:
@@ -306,7 +312,6 @@ def _rpc(name, params):
 
 
 def get_player_sync(chat_id, user_id, username=None, first_name=None):
-    """Возвращает игрока. Если имя пустое — обновляет из переданных данных."""
     try:
         res = supabase.table("quiz_players").select("*").eq("chat_id", chat_id).eq("user_id", user_id).execute()
         if res.data:
@@ -1355,7 +1360,7 @@ async def cmd_aitop(message: Message):
         uid = f" · <code>{row['user_id']}</code>" if admin_view else ""
         lines.append(f"{medal} {emoji} {nm} — {ca} очк. · ${float(row['balance']):.4f}{uid}")
 
-    # Сверху слово TOP из премиум-эмодзи
+    # Слово TOP сверху из премиум-эмодзи
     await send_word(
         message.chat.id, "TOP",
         "\n".join(lines[1:]),
@@ -1770,7 +1775,6 @@ async def handle_answer(message: Message):
     new_correct = int(p["correct_answers"]) + 1
     new_lvl = level_from_correct(new_correct)
 
-    # проверка нового топ-1
     new_top1 = await get_top1(cid)
     if new_top1 and new_top1 != old_top1:
         TOP_CACHE[cid] = new_top1
