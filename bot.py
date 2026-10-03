@@ -662,6 +662,21 @@ def get_t_settings_sync(chat_id):
 
 
 def update_t_setting_sync(chat_id, field, value):
+    if field == "winners_count":
+        try:
+            log.info("RPC winners_count: chat_id=%s value=%s", chat_id, value)
+            r = supabase.rpc("set_tournament_winners_count", {
+                "p_chat_id": chat_id, "p_value": int(value)
+            }).execute()
+            log.info("RPC winners_count response: %r", r.data)
+            if r.data is not None:
+                return True
+            log.warning("update_t_setting rpc winners_count: пустой ответ")
+            return False
+        except Exception as e:
+            log.warning("update_t_setting rpc winners_count: %s", e)
+            return False
+
     try:
         get_t_settings_sync(chat_id)
         supabase.table("quiz_tournament_settings").update({field: value}).eq("chat_id", chat_id).execute()
