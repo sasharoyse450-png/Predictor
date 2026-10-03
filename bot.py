@@ -18,11 +18,11 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramRetryAfter, TelegramBadRequest
 from aiogram.filters import Command, CommandStart
+from aiogram.dispatcher.event.bases import SkipHandler
 from aiogram.types import (
     Message, CallbackQuery, BufferedInputFile,
     InlineKeyboardMarkup, InlineKeyboardButton,
 )
-from aiogram.dispatcher.event.bases import SkipHandler
 from PIL import Image, ImageDraw, ImageFont
 from supabase import create_client, Client
 
@@ -69,6 +69,9 @@ DUEL_TTL = 120
 TIMER_PROBABILITY = 0.20
 TIMER_SECONDS = 10
 
+POT_PERCENT = 0.05
+POT_HOUR = 21
+
 SPONSOR_PRICE = 5.00
 SPONSOR_QUESTIONS = 20
 
@@ -113,7 +116,7 @@ _FONT_PATH = None
 TOURNAMENT_STATE = {}
 TOURNAMENT_ACTIVE = {}
 TOURNAMENT_LOBBY = {}
-TOURNAMENT_EDIT = {}      # admin_id -> {"chat_id", "field"}
+TOURNAMENT_EDIT = {}
 
 SPONSOR_SESSION = {}
 
@@ -337,6 +340,62 @@ def get_house_by_source_sync():
         return by
     except Exception:
         return {}
+
+
+# ==================== КОПИЛКА (sync) ====================
+
+
+def add_to_pot_sync(chat_id, amount):
+    try:
+        res = supabase.table("quiz_pot").select("amount").eq("chat_id", chat_id).execute()
+        current = float(res.data[0]["amount"]) if res.data else 0.0
+        new_amount = round(current + amount, 4)
+        if res.data:
+            supabase.table("quiz_pot").update({"amount": new_amount}).eq("chat_id", chat_id).execute()
+        else:
+            supabase.table("quiz_pot").insert({"chat_id": chat_id, "amount": new_amount}).execute()
+        return new_amount
+    except Exception as e:
+        log.warning("add_to_pot: %s", e)
+        return None
+
+
+def payout_pot_sync(chat_id):
+    try:
+        res = supabase.table("quiz_pot").select("amount").eq("chat_id", chat_id).execute()
+        if not res.data:
+            return 0.0
+        amount = float(res.data[0]["amount"])
+        supabase.table("quiz_pot").update({"amount": 0}).eq("chat_id", chat_id).execute()
+        return amount
+    except Exception as e:
+        log.warning("payout_pot: %s", e)
+        return 0.0
+
+
+def get_pot_sync(chat_id):
+    try:
+        res = supabase.table("quiz_pot").select("amount").eq("chat_id", chat_id).execute()
+        return float(res.data[0]["amount"]) if res.data else 0.0
+    except Exception:
+        return 0.0
+
+
+def pot_take_sync(chat_id, amount):
+    try:
+        res = supabase.table("quiz_pot").select("amount").eq("chat_id", chat_id).execute()
+        current = float(res.data[0]["amount"]) if res.data else 0.0
+        if current < amount:
+            return False, current
+        new_amount = round(current - amount, 4)
+        supabase.table("quiz_pot").update({"amount": new_amount}).eq("chat_id", chat_id).execute()
+        return True, new_amount
+    except Exception as e:
+        log.warning("pot_take: %s", e)
+        return False, 0.0
+
+
+# ==================== ИНВОЙСЫ ====================
 
 
 def create_invoice_sync(client_invoice_id, user_id, chat_id, amount, message_id=None, kind="deposit"):
@@ -681,6 +740,22 @@ async def get_house_by_source():
     return await asyncio.to_thread(get_house_by_source_sync)
 
 
+async def add_to_pot(cid, amt):
+    return await asyncio.to_thread(add_to_pot_sync, cid, amt)
+
+
+async def payout_pot(cid):
+    return await asyncio.to_thread(payout_pot_sync, cid)
+
+
+async def get_pot(cid):
+    return await asyncio.to_thread(get_pot_sync, cid)
+
+
+async def pot_take(cid, amt):
+    return await asyncio.to_thread(pot_take_sync, cid, amt)
+
+
 async def create_invoice(client_invoice_id, uid, cid, amt, message_id=None, kind="deposit"):
     return await asyncio.to_thread(create_invoice_sync, client_invoice_id, uid, cid, amt, message_id, kind)
 
@@ -898,7 +973,7 @@ async def process_paid_invoice(client_invoice_id: str):
         try:
             await bot.send_message(user_id,
                 f"✅ <b>Оплата ${amount:.2f} получена!</b>\n\n"
-                f"Теперь напиши <b>ID чата</b>, куда поститься вопросы.\n"
+                f"Теперь напиши <b>ID чата</b>, куда постить вопросы.\n"
                 f"<i>(например: -1002712583382)</i>")
         except Exception:
             pass
@@ -965,6 +1040,9 @@ async def ask_question(chat_id):
     }
     await save_active(chat_id, q, answers, is_multi)
 
+    pot = await get_pot(chat_id)
+    pot_line = f"\n🎰 Копилка: <b>${pot:.3f}</b>" if pot >= 0.01 else ""
+
     use_timer = random.random() < TIMER_PROBABILITY
     if use_timer:
         ACTIVE_QUESTIONS[chat_id]["timer"] = True
@@ -984,14 +1062,14 @@ async def ask_question(chat_id):
             caption = (f"🧠 <b>Вопрос!</b>{sponsor_note}\n\n"
                        f"🏆 +1 очко за первый правильный\n"
                        f"🔓 Вопрос открыт до правильного ответа."
-                       f"{timer_line}")
+                       f"{pot_line}{timer_line}")
             msg = await safe_send(bot.send_photo, chat_id, buf, caption=caption)
         else:
             msg = await safe_send(bot.send_message, chat_id,
                 f"🧠 <b>Вопрос!</b>{sponsor_note}\n\n❓ {q}\n\n"
                 f"🏆 +1 очко за первый правильный\n"
                 f"🔓 Вопрос открыт до правильного ответа."
-                f"{timer_line}")
+                f"{pot_line}{timer_line}")
         if msg:
             try:
                 await bot.set_message_reaction(chat_id, msg.message_id, ["🧠"])
@@ -1043,6 +1121,47 @@ async def caches_refresh_loop():
             SUBSCRIBERS_CACHE = await asyncio.to_thread(load_subscribers_sync)
         except Exception as e:
             log.warning("caches refresh: %s", e)
+        await asyncio.sleep(60)
+
+
+# ==================== КОПИЛКА (раздача) ====================
+
+
+async def distribute_pot(cid, reason="manual"):
+    amount = await payout_pot(cid)
+    if amount < 0.01:
+        return False, "Копилка пуста (меньше $0.01)"
+    rows = await get_top(cid, 10)
+    if not rows:
+        await add_to_pot(cid, amount)
+        return False, "Нет игроков"
+    winner = random.choice(rows)
+    wuid = int(winner["user_id"])
+    wname = winner.get("first_name") or winner.get("username") or str(wuid)
+    await add_balance(cid, wuid, amount)
+
+    head = "🎰 <b>Розыгрыш копилки!</b>" if reason == "auto" else "🎉 <b>Копилка разыграна вручную!</b>"
+    await safe_send(bot.send_message, cid,
+        f"{head}\n\n"
+        f"💰 Выигрыш: <b>${amount:.4f}</b>\n"
+        f"🏆 Получатель: <b>{wname}</b> (ID <code>{wuid}</code>)\n"
+        f"<i>Случайный из топ-10</i>")
+    return True, f"${amount:.4f} → {wname}"
+
+
+async def pot_payout_loop():
+    await asyncio.sleep(30)
+    last = None
+    while True:
+        now = datetime.now(TZ)
+        today = now.date()
+        if now.hour == POT_HOUR and last != today:
+            last = today
+            for cid in list(QUIZ_ENABLED):
+                try:
+                    await distribute_pot(cid, reason="auto")
+                except Exception as e:
+                    log.warning("pot auto: %s", e)
         await asyncio.sleep(60)
 
 
@@ -1179,7 +1298,6 @@ async def cmd_turik(message: Message):
 
 @dp.message(F.chat.type.in_({"group", "supergroup"}), F.text, ~F.text.startswith("/"))
 async def turik_value_input(message: Message):
-    """Ловит ввод значения от админа, который редактирует настройку."""
     if not message.from_user or message.from_user.id not in TOURNAMENT_EDIT:
         raise SkipHandler()
     edit = TOURNAMENT_EDIT[message.from_user.id]
@@ -1389,7 +1507,12 @@ async def cmd_aihelp(message: Message):
             "/AiAdmin — панель\n"
             "/AiHouse — касса\n"
             "/AiTurik — настройка турниров\n"
-            "/AiBan &lt;id&gt; [время] [причина]\n"
+            "\n<b>🎰 Управление копилкой</b>\n"
+            "/AiPot — сколько сейчас в фонде\n"
+            "/AiPotAdd &lt;сумма&gt; — пополнить фонд\n"
+            "/AiPotTake &lt;сумма&gt; — снять из фонда себе\n"
+            "/AiPotGive — раздать фонд сейчас\n"
+            "\n/AiBan &lt;id&gt; [время] [причина]\n"
             "/AiUnban &lt;id&gt;\n"
         )
     await safe_send(message.reply, text)
@@ -1547,7 +1670,8 @@ def admin_kb(cid):
          InlineKeyboardButton(text="💸 Выплаты", callback_data="adm:payouts")],
         [InlineKeyboardButton(text="📋 Топ", callback_data="adm:top"),
          InlineKeyboardButton(text="🚫 Баны", callback_data="adm:bans")],
-        [InlineKeyboardButton(text="🧪 xRocket", callback_data="adm:xrdbg")],
+        [InlineKeyboardButton(text="🎰 Копилка", callback_data="adm:pot"),
+         InlineKeyboardButton(text="🧪 xRocket", callback_data="adm:xrdbg")],
     ])
 
 
@@ -1588,6 +1712,93 @@ async def cmd_house(message: Message):
         for src, amt in sorted(by.items(), key=lambda x: -x[1]):
             lines.append(f"• {src}: ${amt:.4f}")
     await safe_send(message.reply, "\n".join(lines))
+
+
+# ==================== КОПИЛКА (команды) ====================
+
+
+@dp.message(Command("AiPot"))
+async def cmd_aipot(message: Message):
+    if not message.from_user or not is_admin(message.from_user.id):
+        return
+    if message.chat.type not in ("group", "supergroup"):
+        return
+    pot = await get_pot(message.chat.id)
+    await safe_send(message.reply,
+        f"🎰 <b>Копилка чата</b>\n\n"
+        f"Сейчас в фонде: <b>${pot:.4f}</b>\n\n"
+        f"/AiPotAdd &lt;сумма&gt; — пополнить\n"
+        f"/AiPotTake &lt;сумма&gt; — снять себе\n"
+        f"/AiPotGive — раздать сейчас\n\n"
+        f"Авто-раздача в <b>{POT_HOUR}:00 МСК</b>\n"
+        f"Пополнение: {int(POT_PERCENT*100)}% с каждой награды.")
+
+
+@dp.message(Command("AiPotAdd"))
+async def cmd_aipotadd(message: Message):
+    if not message.from_user or not is_admin(message.from_user.id):
+        return
+    parts = (message.text or "").split()
+    if len(parts) != 2:
+        await safe_send(message.reply, "Формат: <code>/AiPotAdd 0.50</code>")
+        return
+    try:
+        amount = round(float(parts[1]), 4)
+    except ValueError:
+        await safe_send(message.reply, "Сумма — число.")
+        return
+    if amount <= 0:
+        await safe_send(message.reply, "Сумма должна быть больше нуля.")
+        return
+    new_pot = await add_to_pot(message.chat.id, amount)
+    if new_pot is None:
+        await safe_send(message.reply, "Ошибка при пополнении.")
+        return
+    await safe_send(message.reply,
+        f"✅ В копилку добавлено <b>${amount:.4f}</b>\n"
+        f"🎰 Теперь в фонде: <b>${new_pot:.4f}</b>")
+
+
+@dp.message(Command("AiPotTake"))
+async def cmd_aipottake(message: Message):
+    if not message.from_user or not is_admin(message.from_user.id):
+        return
+    parts = (message.text or "").split()
+    if len(parts) != 2:
+        await safe_send(message.reply, "Формат: <code>/AiPotTake 0.50</code>")
+        return
+    try:
+        amount = round(float(parts[1]), 4)
+    except ValueError:
+        await safe_send(message.reply, "Сумма — число.")
+        return
+    if amount <= 0:
+        await safe_send(message.reply, "Сумма должна быть больше нуля.")
+        return
+    ok, new_pot = await pot_take(message.chat.id, amount)
+    if not ok:
+        await safe_send(message.reply,
+            f"❌ В копилке только <b>${new_pot:.4f}</b>, снять ${amount:.4f} нельзя.")
+        return
+    await add_balance(message.chat.id, message.from_user.id, amount)
+    await safe_send(message.reply,
+        f"✅ Из копилки снято <b>${amount:.4f}</b>\n"
+        f"💰 Зачислено тебе на баланс\n"
+        f"🎰 Осталось в фонде: <b>${new_pot:.4f}</b>")
+
+
+@dp.message(Command("AiPotGive"))
+async def cmd_aipotgive(message: Message):
+    if not message.from_user or not is_admin(message.from_user.id):
+        return
+    if message.chat.type not in ("group", "supergroup"):
+        return
+    ok, info = await distribute_pot(message.chat.id, reason="manual")
+    if not ok:
+        await safe_send(message.reply, f"❌ {info}")
+
+
+# ==================== BAN/UNBAN ====================
 
 
 def parse_duration(s):
@@ -1656,6 +1867,9 @@ async def cmd_aiunban(message: Message):
     await safe_send(message.reply, f"✅ <code>{target}</code> разбанен.")
 
 
+# ==================== CALLBACK ====================
+
+
 @dp.callback_query(F.data.startswith("adm:"))
 async def on_admin_cb(cb: CallbackQuery):
     if not cb.from_user or not is_admin(cb.from_user.id):
@@ -1696,6 +1910,7 @@ async def on_admin_cb(cb: CallbackQuery):
         fin = [p for p in payouts if p["status"] == "finished"]
         ps = sum(float(p["amount"]) for p in fin)
         house = await get_house_total(cid)
+        pot = await get_pot(cid)
         await safe_send(cb.message.answer,
             f"📊 <b>Статистика</b>\n\n"
             f"👥 Игроков: {len(players)}\n"
@@ -1704,7 +1919,31 @@ async def on_admin_cb(cb: CallbackQuery):
             f"🚫 Забанено: {len(bans)}\n\n"
             f"💰 Балансов: ${tb:.4f}\n"
             f"💼 Касса: ${house:.4f}\n"
+            f"🎰 Копилка: ${pot:.4f}\n"
             f"💸 Выплат: {len(fin)} (${ps:.4f})")
+        return
+
+    if action == "pot":
+        await cb.answer()
+        pot = await get_pot(cid)
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🎉 Раздать сейчас", callback_data="adm:potgive")],
+            [InlineKeyboardButton(text="🔄 Обновить", callback_data="adm:pot")],
+        ])
+        await safe_send(cb.message.answer,
+            f"🎰 <b>Копилка чата</b>\n\n"
+            f"Сейчас в фонде: <b>${pot:.4f}</b>\n\n"
+            f"Пополнить: <code>/AiPotAdd 0.50</code>\n"
+            f"Снять: <code>/AiPotTake 0.50</code>\n"
+            f"Авто-раздача в <b>{POT_HOUR}:00 МСК</b>",
+            reply_markup=kb)
+        return
+
+    if action == "potgive":
+        await cb.answer("Раздаю...")
+        ok, info = await distribute_pot(cid, reason="manual")
+        if not ok:
+            await safe_send(cb.message.answer, f"❌ {info}")
         return
 
     if action == "house":
@@ -2279,10 +2518,13 @@ async def on_withdraw_cb(cb: CallbackQuery):
 async def handle_answer(message: Message):
     if not message.from_user:
         return
+
+    if message.from_user.id in TOURNAMENT_EDIT:
+        raise SkipHandler()
+
     cid, uid = message.chat.id, message.from_user.id
     text = (message.text or "").strip().lower()
 
-    # турнир в приоритете
     if cid in TOURNAMENT_ACTIVE:
         st = TOURNAMENT_STATE.get(cid)
         if st and not st.get("answered_by"):
@@ -2367,7 +2609,7 @@ async def handle_answer(message: Message):
 
 async def main():
     print("=" * 50)
-    print("Quiz Bot · таймер · турниры /AiTurik · спонсоры · /AiCoins")
+    print("Quiz Bot · копилка · турниры · таймер · спонсоры · /AiCoins")
     print(f"Вопросов: {len(QUESTIONS)} + {len(MULTI_QUESTIONS)} мульти")
     print(f"Админы: {sorted(ADMIN_IDS)}")
 
@@ -2405,6 +2647,7 @@ async def main():
 
     asyncio.create_task(question_scheduler())
     asyncio.create_task(caches_refresh_loop())
+    asyncio.create_task(pot_payout_loop())
     print("Запущен.")
     print("=" * 50)
 
