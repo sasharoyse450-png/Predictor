@@ -82,7 +82,7 @@ TZ = ZoneInfo(os.getenv("TZ", "Europe/Moscow"))
 WORK_HOURS = list(range(8, 24))
 WITHDRAW_CONFIRM_TTL = 120
 
-WEBHOOK_MAX_AGE_SEC = 300  # анти-replay: 5 минут
+WEBHOOK_MAX_AGE_SEC = 300
 
 CORRECT_PHRASES = [
     "🎉 <b>Правильно!</b>", "🔥 <b>В точку!</b>", "💎 <b>Красавчик!</b>",
@@ -180,7 +180,6 @@ def render_question_image(text: str) -> bytes:
     font = get_font(80)
     bbox = draw.textbbox((0, 0), text, font=font)
     tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
-    # Безопасный цикл: у load_default() может не быть .size
     while tw > W - 60:
         cur_size = getattr(font, "size", 0)
         if cur_size <= 20:
@@ -233,7 +232,6 @@ async def safe_send(coro_func, *args, **kwargs):
 
 
 async def safe_edit(coro_func, *args, **kwargs):
-    """Безопасное редактирование. Глушит 'message is not modified'."""
     try:
         return await coro_func(*args, **kwargs)
     except TelegramBadRequest as e:
@@ -254,6 +252,28 @@ def _rpc(name, params):
         log.warning("rpc %s: %s", name, e)
         return None
 
+
+# ===== ХАК: winners_count хранится в difficulty как "medium#w3" =====
+
+def _pack_difficulty(diff: str, winners: int) -> str:
+    diff = (diff or "medium").split("#")[0]
+    if int(winners) == 1:
+        return diff
+    return f"{diff}#w{int(winners)}"
+
+
+def _unpack_difficulty(raw: str):
+    raw = raw or "medium"
+    if "#w" in raw:
+        d, w = raw.split("#w", 1)
+        try:
+            return (d or "medium"), int(w)
+        except ValueError:
+            return (d or "medium"), 1
+    return raw, 1
+
+
+# ===== БАЗА =====
 
 def get_player_sync(chat_id, user_id, username=None, first_name=None):
     try:
@@ -276,20 +296,12 @@ def get_player_sync(chat_id, user_id, username=None, first_name=None):
         log.warning("get_player select: %s", e)
 
     try:
-        supabase.table("quiz_players").upsert({
+        supabase.table("quiz_players").insert({
             "chat_id": chat_id, "user_id": user_id,
             "username": username, "first_name": first_name,
-        }, on_conflict="chat_id,user_id", ignore_duplicates=True).execute()
+        }).execute()
     except Exception as e:
-        log.warning("get_player upsert: %s", e)
-        # Fallback: просто insert, чтобы не терять игрока
-        try:
-            supabase.table("quiz_players").insert({
-                "chat_id": chat_id, "user_id": user_id,
-                "username": username, "first_name": first_name,
-            }).execute()
-        except Exception as e2:
-            log.warning("get_player insert fallback: %s", e2)
+        log.warning("get_player insert: %s", e)
     return {"chat_id": chat_id, "user_id": user_id, "username": username,
             "first_name": first_name, "balance": 0, "total_won": 0,
             "correct_answers": 0, "is_withdrawing": False}
@@ -594,7 +606,6 @@ def get_chat_settings_sync(chat_id):
             return ins.data[0]
     except Exception as e:
         log.warning("get_chat_settings insert: %s", e)
-        # Retry-select: возможно, кто-то вставил строку параллельно
         try:
             res = supabase.table("quiz_settings").select("*").eq("chat_id", chat_id).execute()
             if res.data:
@@ -636,10 +647,19 @@ def tournament_finish_sync(tid, winner_id):
 
 
 def get_t_settings_sync(chat_id):
+    """
+    Возвращает настройки турнира.
+    winners_count хранится ВНУТРИ difficulty как "medium#w3".
+    Здесь он распаковывается в отдельное поле winners_count.
+    """
     try:
         res = supabase.table("quiz_tournament_settings").select("*").eq("chat_id", chat_id).execute()
         if res.data:
-            return res.data[0]
+            row = res.data[0]
+            diff, wc = _unpack_difficulty(row.get("difficulty", "medium"))
+            row["difficulty"] = diff
+            row["winners_count"] = wc
+            return row
     except Exception as e:
         log.warning("get_t_settings select: %s", e)
 
@@ -648,38 +668,53 @@ def get_t_settings_sync(chat_id):
     try:
         ins = supabase.table("quiz_tournament_settings").insert(default).execute()
         if ins.data:
-            return ins.data[0]
+            row = ins.data[0]
+            row["difficulty"] = "medium"
+            row["winners_count"] = 1
+            return row
     except Exception as e:
         log.warning("get_t_settings insert: %s", e)
-        # Retry-select
         try:
             res = supabase.table("quiz_tournament_settings").select("*").eq("chat_id", chat_id).execute()
             if res.data:
-                return res.data[0]
+                row = res.data[0]
+                diff, wc = _unpack_difficulty(row.get("difficulty", "medium"))
+                row["difficulty"] = diff
+                row["winners_count"] = wc
+                return row
         except Exception:
             pass
     return default
 
 
 def update_t_setting_sync(chat_id, field, value):
-    if field == "winners_count":
-        try:
-            log.info("RPC winners_count: chat_id=%s value=%s", chat_id, value)
-            r = supabase.rpc("set_tournament_winners_count", {
-                "p_chat_id": chat_id, "p_value": int(value)
-            }).execute()
-            log.info("RPC winners_count response: %r", r.data)
-            if r.data is not None:
-                return True
-            log.warning("update_t_setting rpc winners_count: пустой ответ")
-            return False
-        except Exception as e:
-            log.warning("update_t_setting rpc winners_count: %s", e)
-            return False
-
+    """
+    winners_count и difficulty пакуются В difficulty как "medium#w3".
+    Остальные поля (prize, questions, question_seconds) пишутся напрямую.
+    """
     try:
-        get_t_settings_sync(chat_id)
-        supabase.table("quiz_tournament_settings").update({field: value}).eq("chat_id", chat_id).execute()
+        current = get_t_settings_sync(chat_id)
+
+        if field == "winners_count":
+            diff = current.get("difficulty", "medium")
+            new_diff = _pack_difficulty(diff, int(value))
+            supabase.table("quiz_tournament_settings").update(
+                {"difficulty": new_diff}
+            ).eq("chat_id", chat_id).execute()
+            return True
+
+        if field == "difficulty":
+            wc = current.get("winners_count", 1)
+            new_diff = _pack_difficulty(value, wc)
+            supabase.table("quiz_tournament_settings").update(
+                {"difficulty": new_diff}
+            ).eq("chat_id", chat_id).execute()
+            return True
+
+        # Остальные поля — обычные колонки, PostgREST их знает
+        supabase.table("quiz_tournament_settings").update(
+            {field: value}
+        ).eq("chat_id", chat_id).execute()
         return True
     except Exception as e:
         log.warning("update_t_setting (%s=%s): %s", field, value, e)
@@ -716,6 +751,8 @@ def sponsor_mark_used_sync(qid):
     except Exception as e:
         log.warning("sponsor_mark_used: %s", e)
 
+
+# ===== ASYNC-ОБЁРТКИ =====
 
 async def get_player(cid, uid, un=None, fn=None):
     return await asyncio.to_thread(get_player_sync, cid, uid, un, fn)
@@ -867,6 +904,8 @@ async def log_payout(cid, uid, amt, pid, status):
     await asyncio.to_thread(log_payout_sync, cid, uid, amt, pid, status)
 
 
+# ===== xROCKET =====
+
 async def xrocket_payout(cid, uid, amount):
     if not XROCKET_API_KEY:
         return False, "XROCKET_API_KEY не задан"
@@ -919,18 +958,15 @@ async def xrocket_create_invoice(client_invoice_id: str, amount: float, descript
 def verify_webhook_signature(raw_body, signature, timestamp, secret):
     if not signature or not timestamp or not secret:
         return False
-    # Анти-replay: проверяем свежесть timestamp (5 минут)
     try:
         ts = int(timestamp)
     except (ValueError, TypeError):
         return False
-    # Если timestamp в миллисекундах — приводим к секундам
     if ts > 10_000_000_000:
         ts //= 1000
     if abs(int(time.time()) - ts) > WEBHOOK_MAX_AGE_SEC:
         log.warning("Webhook: timestamp устарел (%s)", timestamp)
         return False
-    # Подпись считается по исходной строке timestamp
     signed = f"{timestamp}.{raw_body.decode('utf-8')}"
     expected = hmac.new(secret.encode(), signed.encode(), hashlib.sha256).hexdigest()
     return hmac.compare_digest(expected, signature)
@@ -1027,6 +1063,8 @@ async def start_webhook_server():
     await site.start()
     log.info("Webhook-сервер на порту %s", PORT)
 
+
+# ===== ВИКТОРИНА =====
 
 async def ask_question(chat_id):
     if chat_id in TOURNAMENT_ACTIVE:
@@ -1171,11 +1209,6 @@ async def pot_payout_loop():
 
 
 def split_prize(prize: float, top_scores: list) -> list:
-    """
-    Делит приз пропорционально очкам.
-    top_scores: [(uid, points), ...] в порядке убывания очков.
-    Возвращает: [(uid, share), ...] — сумма долей ровно = prize.
-    """
     total_points = sum(p for _, p in top_scores)
     if total_points == 0:
         return []
@@ -1248,7 +1281,6 @@ async def run_tournament(tid, chat_id, settings):
         top_n = sorted_scores[:winners_count]
         shares = split_prize(prize, top_n)
 
-        # Начисление
         winner_ids = []
         for uid, share in shares:
             if share > 0:
@@ -1268,7 +1300,6 @@ async def run_tournament(tid, chat_id, settings):
             med = medals[i] if i < len(medals) else f"{i+1}."
             lines.append(f"{med} {pnm} — {scores[uid]} прав. · <b>${share:.4f}</b>")
 
-        # покажем остальных, кто не в топ-N, но что-то заработал
         rest = sorted_scores[winners_count:]
         if rest:
             lines.append("")
@@ -1358,8 +1389,7 @@ async def turik_value_input(message: Message):
     TOURNAMENT_EDIT.pop(message.from_user.id, None)
 
     if not ok:
-        await safe_send(message.reply,
-            "❌ Не удалось сохранить настройку в БД. Проверь логи (get_t_settings/update_t_setting).")
+        await safe_send(message.reply, "❌ Не удалось сохранить настройку в БД. Проверь логи.")
         return
 
     s = await get_t_settings(edit["chat_id"])
@@ -1489,10 +1519,11 @@ async def on_turik_cb(cb: CallbackQuery):
         return
 
 
+# ===== ПРОЧИЕ ХЕНДЛЕРЫ =====
+
 @dp.message(CommandStart())
 async def cmd_start(message: Message):
     if message.from_user:
-        # Сбрасываем незавершённый ввод турнирных настроек
         TOURNAMENT_EDIT.pop(message.from_user.id, None)
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="💎 Подписка $0.50/нед", url=XROCKET_SUBSCRIBE_URL)],
