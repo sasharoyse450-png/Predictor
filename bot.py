@@ -38,7 +38,7 @@ logging.basicConfig(
 )
 log = logging.getLogger("quizbot")
 
-TOKEN = os.getenv("BOT_TOKEN", "8781607065:AAFn0AbFLUHkcEaQtSgvn2Ix52HksW3_j-0")
+TOKEN = os.getenv("BOT_TOKEN", "")
 SUPABASE_URL = os.getenv("SUPABASE_URL", "")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
 
@@ -81,6 +81,8 @@ ADMIN_IDS = {8130244626, 6173495222}
 TZ = ZoneInfo(os.getenv("TZ", "Europe/Moscow"))
 WORK_HOURS = list(range(8, 24))
 WITHDRAW_CONFIRM_TTL = 120
+
+WEBHOOK_MAX_AGE_SEC = 300  # анти-replay: 5 минут
 
 CORRECT_PHRASES = [
     "🎉 <b>Правильно!</b>", "🔥 <b>В точку!</b>", "💎 <b>Красавчик!</b>",
@@ -178,8 +180,12 @@ def render_question_image(text: str) -> bytes:
     font = get_font(80)
     bbox = draw.textbbox((0, 0), text, font=font)
     tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
-    while tw > W - 60 and font.size > 20:
-        font = get_font(font.size - 5)
+    # Безопасный цикл: у load_default() может не быть .size
+    while tw > W - 60:
+        cur_size = getattr(font, "size", 0)
+        if cur_size <= 20:
+            break
+        font = get_font(cur_size - 5)
         bbox = draw.textbbox((0, 0), text, font=font)
         tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
     draw.text(((W - tw) / 2 - bbox[0], (H - th) / 2 - bbox[1]), text, fill=(20, 20, 80), font=font)
@@ -226,6 +232,21 @@ async def safe_send(coro_func, *args, **kwargs):
     return None
 
 
+async def safe_edit(coro_func, *args, **kwargs):
+    """Безопасное редактирование. Глушит 'message is not modified'."""
+    try:
+        return await coro_func(*args, **kwargs)
+    except TelegramBadRequest as e:
+        s = str(e)
+        if "message is not modified" in s or "message to edit not found" in s:
+            return None
+        log.warning("safe_edit: %s", e)
+        return None
+    except Exception as e:
+        log.warning("safe_edit: %s", e)
+        return None
+
+
 def _rpc(name, params):
     try:
         return supabase.rpc(name, params).execute()
@@ -252,14 +273,23 @@ def get_player_sync(chat_id, user_id, username=None, first_name=None):
                     pass
             return row
     except Exception as e:
-        log.warning("get_player: %s", e)
+        log.warning("get_player select: %s", e)
+
     try:
-        supabase.table("quiz_players").insert({
+        supabase.table("quiz_players").upsert({
             "chat_id": chat_id, "user_id": user_id,
             "username": username, "first_name": first_name,
-        }).execute()
-    except Exception:
-        pass
+        }, on_conflict="chat_id,user_id", ignore_duplicates=True).execute()
+    except Exception as e:
+        log.warning("get_player upsert: %s", e)
+        # Fallback: просто insert, чтобы не терять игрока
+        try:
+            supabase.table("quiz_players").insert({
+                "chat_id": chat_id, "user_id": user_id,
+                "username": username, "first_name": first_name,
+            }).execute()
+        except Exception as e2:
+            log.warning("get_player insert fallback: %s", e2)
     return {"chat_id": chat_id, "user_id": user_id, "username": username,
             "first_name": first_name, "balance": 0, "total_won": 0,
             "correct_answers": 0, "is_withdrawing": False}
@@ -267,7 +297,7 @@ def get_player_sync(chat_id, user_id, username=None, first_name=None):
 
 def add_score_sync(chat_id, user_id):
     r = _rpc("add_balance_atomic", {"p_chat_id": chat_id, "p_user_id": user_id, "p_amount": 0, "p_count_correct": True})
-    return bool(r)
+    return bool(r and r.data)
 
 
 def add_balance_sync(chat_id, user_id, amount, count_correct=False):
@@ -554,13 +584,23 @@ def get_chat_settings_sync(chat_id):
         res = supabase.table("quiz_settings").select("*").eq("chat_id", chat_id).execute()
         if res.data:
             return res.data[0]
-    except Exception:
-        pass
+    except Exception as e:
+        log.warning("get_chat_settings select: %s", e)
+
     default = {"chat_id": chat_id, "difficulty": "medium"}
     try:
-        supabase.table("quiz_settings").insert(default).execute()
-    except Exception:
-        pass
+        ins = supabase.table("quiz_settings").insert(default).execute()
+        if ins.data:
+            return ins.data[0]
+    except Exception as e:
+        log.warning("get_chat_settings insert: %s", e)
+        # Retry-select: возможно, кто-то вставил строку параллельно
+        try:
+            res = supabase.table("quiz_settings").select("*").eq("chat_id", chat_id).execute()
+            if res.data:
+                return res.data[0]
+        except Exception:
+            pass
     return default
 
 
@@ -570,7 +610,7 @@ def update_chat_setting_sync(chat_id, field, value):
         supabase.table("quiz_settings").update({field: value}).eq("chat_id", chat_id).execute()
         return True
     except Exception as e:
-        log.warning("update_chat_setting: %s", e)
+        log.warning("update_chat_setting (%s=%s): %s", field, value, e)
         return False
 
 
@@ -601,13 +641,23 @@ def get_t_settings_sync(chat_id):
         if res.data:
             return res.data[0]
     except Exception as e:
-        log.warning("get_t_settings: %s", e)
+        log.warning("get_t_settings select: %s", e)
+
     default = {"chat_id": chat_id, "question_seconds": 30, "questions": 10,
                "prize": 0.30, "difficulty": "medium", "winners_count": 1}
     try:
-        supabase.table("quiz_tournament_settings").insert(default).execute()
-    except Exception:
-        pass
+        ins = supabase.table("quiz_tournament_settings").insert(default).execute()
+        if ins.data:
+            return ins.data[0]
+    except Exception as e:
+        log.warning("get_t_settings insert: %s", e)
+        # Retry-select
+        try:
+            res = supabase.table("quiz_tournament_settings").select("*").eq("chat_id", chat_id).execute()
+            if res.data:
+                return res.data[0]
+        except Exception:
+            pass
     return default
 
 
@@ -617,7 +667,7 @@ def update_t_setting_sync(chat_id, field, value):
         supabase.table("quiz_tournament_settings").update({field: value}).eq("chat_id", chat_id).execute()
         return True
     except Exception as e:
-        log.warning("update_t_setting: %s", e)
+        log.warning("update_t_setting (%s=%s): %s", field, value, e)
         return False
 
 
@@ -854,6 +904,18 @@ async def xrocket_create_invoice(client_invoice_id: str, amount: float, descript
 def verify_webhook_signature(raw_body, signature, timestamp, secret):
     if not signature or not timestamp or not secret:
         return False
+    # Анти-replay: проверяем свежесть timestamp (5 минут)
+    try:
+        ts = int(timestamp)
+    except (ValueError, TypeError):
+        return False
+    # Если timestamp в миллисекундах — приводим к секундам
+    if ts > 10_000_000_000:
+        ts //= 1000
+    if abs(int(time.time()) - ts) > WEBHOOK_MAX_AGE_SEC:
+        log.warning("Webhook: timestamp устарел (%s)", timestamp)
+        return False
+    # Подпись считается по исходной строке timestamp
     signed = f"{timestamp}.{raw_body.decode('utf-8')}"
     expected = hmac.new(secret.encode(), signed.encode(), hashlib.sha256).hexdigest()
     return hmac.compare_digest(expected, signature)
@@ -1277,8 +1339,13 @@ async def turik_value_input(message: Message):
         await safe_send(message.reply, "❌ Неверное значение. Попробуй снова или /AiTurik для отмены.")
         return
 
-    await update_t_setting(edit["chat_id"], field, val)
+    ok = await update_t_setting(edit["chat_id"], field, val)
     TOURNAMENT_EDIT.pop(message.from_user.id, None)
+
+    if not ok:
+        await safe_send(message.reply,
+            "❌ Не удалось сохранить настройку в БД. Проверь логи (get_t_settings/update_t_setting).")
+        return
 
     s = await get_t_settings(edit["chat_id"])
     try:
@@ -1302,10 +1369,7 @@ async def on_turik_cb(cb: CallbackQuery):
 
     if action == "refresh" or action == "menu":
         s = await get_t_settings(cid)
-        try:
-            await cb.message.edit_text(turik_text(s), reply_markup=turik_kb(s))
-        except Exception:
-            pass
+        await safe_edit(cb.message.edit_text, turik_text(s), reply_markup=turik_kb(s))
         await cb.answer()
         return
 
@@ -1322,15 +1386,11 @@ async def on_turik_cb(cb: CallbackQuery):
             [InlineKeyboardButton(text=m(5), callback_data="turik:wc_set:5")],
             [InlineKeyboardButton(text="⬅️ Назад", callback_data="turik:menu")],
         ])
-        try:
-            await cb.message.edit_text(
-                f"🏆 <b>Сколько победителей?</b>\n\n"
-                f"Приз делится <b>пропорционально очкам</b> — чем больше ответил, тем больше получит.\n\n"
-                f"Текущее: <b>{cur}</b>",
-                reply_markup=kb,
-            )
-        except Exception:
-            pass
+        await safe_edit(cb.message.edit_text,
+            f"🏆 <b>Сколько победителей?</b>\n\n"
+            f"Приз делится <b>пропорционально очкам</b> — чем больше ответил, тем больше получит.\n\n"
+            f"Текущее: <b>{cur}</b>",
+            reply_markup=kb)
         await cb.answer()
         return
 
@@ -1343,13 +1403,13 @@ async def on_turik_cb(cb: CallbackQuery):
         if n not in (1, 2, 3, 5):
             await cb.answer("Ошибка", show_alert=True)
             return
-        await update_t_setting(cid, "winners_count", n)
+        ok = await update_t_setting(cid, "winners_count", n)
+        if not ok:
+            await cb.answer("❌ Не сохранилось. Смотри логи.", show_alert=True)
+            return
         await cb.answer(f"Победителей: {n}")
         s = await get_t_settings(cid)
-        try:
-            await cb.message.edit_text(turik_text(s), reply_markup=turik_kb(s))
-        except Exception:
-            pass
+        await safe_edit(cb.message.edit_text, turik_text(s), reply_markup=turik_kb(s))
         return
 
     if action == "difficulty":
@@ -1365,13 +1425,9 @@ async def on_turik_cb(cb: CallbackQuery):
             [InlineKeyboardButton(text=m("extreme"), callback_data="turik:diff_set:extreme")],
             [InlineKeyboardButton(text="⬅️ Назад", callback_data="turik:menu")],
         ])
-        try:
-            await cb.message.edit_text(
-                f"🎯 <b>Сложность турнира</b>\n\n🟢 Легко\n🟡 Средне\n🟠 Сложно\n🔴 Экстрим",
-                reply_markup=kb,
-            )
-        except Exception:
-            pass
+        await safe_edit(cb.message.edit_text,
+            f"🎯 <b>Сложность турнира</b>\n\n🟢 Легко\n🟡 Средне\n🟠 Сложно\n🔴 Экстрим",
+            reply_markup=kb)
         await cb.answer()
         return
 
@@ -1380,13 +1436,13 @@ async def on_turik_cb(cb: CallbackQuery):
         if d not in ("easy", "medium", "hard", "extreme"):
             await cb.answer("Ошибка", show_alert=True)
             return
-        await update_t_setting(cid, "difficulty", d)
+        ok = await update_t_setting(cid, "difficulty", d)
+        if not ok:
+            await cb.answer("❌ Не сохранилось. Смотри логи.", show_alert=True)
+            return
         await cb.answer(f"Сложность: {DIFFICULTY_LABELS[d]}")
         s = await get_t_settings(cid)
-        try:
-            await cb.message.edit_text(turik_text(s), reply_markup=turik_kb(s))
-        except Exception:
-            pass
+        await safe_edit(cb.message.edit_text, turik_text(s), reply_markup=turik_kb(s))
         return
 
     if action == "set":
@@ -1420,6 +1476,9 @@ async def on_turik_cb(cb: CallbackQuery):
 
 @dp.message(CommandStart())
 async def cmd_start(message: Message):
+    if message.from_user:
+        # Сбрасываем незавершённый ввод турнирных настроек
+        TOURNAMENT_EDIT.pop(message.from_user.id, None)
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="💎 Подписка $0.50/нед", url=XROCKET_SUBSCRIBE_URL)],
         [InlineKeyboardButton(text="🔗 Партнёрка xRocket", url=XROCKET_REFERRAL_URL)],
@@ -1796,10 +1855,7 @@ async def on_admin_cb(cb: CallbackQuery):
         else:
             QUIZ_ENABLED.add(cid)
             await cb.answer("Включено")
-        try:
-            await cb.message.edit_text(admin_text(cid), reply_markup=admin_kb(cid))
-        except Exception:
-            pass
+        await safe_edit(cb.message.edit_text, admin_text(cid), reply_markup=admin_kb(cid))
         return
 
     if action == "ask":
@@ -1820,13 +1876,10 @@ async def on_admin_cb(cb: CallbackQuery):
             [InlineKeyboardButton(text=m("extreme"), callback_data="adm:diff_set:extreme")],
             [InlineKeyboardButton(text="⬅️ Назад", callback_data="adm:menu")],
         ])
-        try:
-            await cb.message.edit_text(
-                f"🎯 <b>Сложность викторины</b>\n\nТекущая: <b>{DIFFICULTY_LABELS.get(cur, cur)}</b>\n\n"
-                f"🟢 Легко\n🟡 Средне\n🟠 Сложно\n🔴 Экстрим\n\n<i>+1 очко за любой правильный ответ</i>",
-                reply_markup=kb)
-        except Exception:
-            pass
+        await safe_edit(cb.message.edit_text,
+            f"🎯 <b>Сложность викторины</b>\n\nТекущая: <b>{DIFFICULTY_LABELS.get(cur, cur)}</b>\n\n"
+            f"🟢 Легко\n🟡 Средне\n🟠 Сложно\n🔴 Экстрим\n\n<i>+1 очко за любой правильный ответ</i>",
+            reply_markup=kb)
         await cb.answer()
         return
 
@@ -1835,7 +1888,10 @@ async def on_admin_cb(cb: CallbackQuery):
         if d not in ("easy", "medium", "hard", "extreme"):
             await cb.answer("Ошибка", show_alert=True)
             return
-        await update_chat_setting(cid, "difficulty", d)
+        ok = await update_chat_setting(cid, "difficulty", d)
+        if not ok:
+            await cb.answer("❌ Не сохранилось. Смотри логи.", show_alert=True)
+            return
         await cb.answer(f"Установлено: {DIFFICULTY_LABELS[d]}")
         s = await get_chat_settings(cid)
         cur = s.get("difficulty", "medium")
@@ -1848,17 +1904,11 @@ async def on_admin_cb(cb: CallbackQuery):
             [InlineKeyboardButton(text=m("extreme"), callback_data="adm:diff_set:extreme")],
             [InlineKeyboardButton(text="⬅️ Назад", callback_data="adm:menu")],
         ])
-        try:
-            await cb.message.edit_reply_markup(reply_markup=kb)
-        except Exception:
-            pass
+        await safe_edit(cb.message.edit_reply_markup, reply_markup=kb)
         return
 
     if action == "menu":
-        try:
-            await cb.message.edit_text(admin_text(cid), reply_markup=admin_kb(cid))
-        except Exception:
-            pass
+        await safe_edit(cb.message.edit_text, admin_text(cid), reply_markup=admin_kb(cid))
         await cb.answer()
         return
 
