@@ -84,6 +84,11 @@ WITHDRAW_CONFIRM_TTL = 120
 
 WEBHOOK_MAX_AGE_SEC = 300
 
+# Оптимизация: как часто пересчитывать топ-1 (в ответах)
+TOP1_CHECK_EVERY = 5
+# Оптимизация: TTL кэша настроек чата (сек)
+CHAT_SETTINGS_TTL = 60
+
 CORRECT_PHRASES = [
     "🎉 <b>Правильно!</b>", "🔥 <b>В точку!</b>", "💎 <b>Красавчик!</b>",
     "⚡ <b>Молниеносно!</b>", "🧠 <b>Умница!</b>", "🏆 <b>Есть!</b>",
@@ -113,8 +118,12 @@ BANNED_CACHE = {}
 SUBSCRIBERS_CACHE = {}
 DUEL_BUSY = set()
 TOP_CACHE = {}
+TOP1_COUNTER = {}
 HTTP_SESSION = None
 _FONT_PATH = None
+
+# Кэш настроек чата: {cid: (data, ts)}
+_CHAT_SETTINGS_CACHE = {}
 
 TOURNAMENT_STATE = {}
 TOURNAMENT_ACTIVE = {}
@@ -538,6 +547,21 @@ def get_top1_sync(chat_id):
     return int(rows[0]["user_id"]) if rows else None
 
 
+def get_player_place_sync(chat_id, user_id):
+    """Оптимизированный подсчёт места: 2 лёгких запроса вместо выгрузки всех."""
+    try:
+        me = supabase.table("quiz_players").select("correct_answers").eq(
+            "chat_id", chat_id).eq("user_id", user_id).execute()
+        if not me.data:
+            return None
+        my_ca = int(me.data[0]["correct_answers"])
+        above = supabase.table("quiz_players").select("user_id").eq(
+            "chat_id", chat_id).gt("correct_answers", my_ca).execute()
+        return len(above.data or []) + 1
+    except Exception:
+        return None
+
+
 def get_stats_sync():
     try:
         players = supabase.table("quiz_players").select("balance,total_won,correct_answers").execute().data or []
@@ -647,11 +671,6 @@ def tournament_finish_sync(tid, winner_id):
 
 
 def get_t_settings_sync(chat_id):
-    """
-    Возвращает настройки турнира.
-    winners_count хранится ВНУТРИ difficulty как "medium#w3".
-    Здесь он распаковывается в отдельное поле winners_count.
-    """
     try:
         res = supabase.table("quiz_tournament_settings").select("*").eq("chat_id", chat_id).execute()
         if res.data:
@@ -688,10 +707,6 @@ def get_t_settings_sync(chat_id):
 
 
 def update_t_setting_sync(chat_id, field, value):
-    """
-    winners_count и difficulty пакуются В difficulty как "medium#w3".
-    Остальные поля (prize, questions, question_seconds) пишутся напрямую.
-    """
     try:
         current = get_t_settings_sync(chat_id)
 
@@ -711,7 +726,6 @@ def update_t_setting_sync(chat_id, field, value):
             ).eq("chat_id", chat_id).execute()
             return True
 
-        # Остальные поля — обычные колонки, PostgREST их знает
         supabase.table("quiz_tournament_settings").update(
             {field: value}
         ).eq("chat_id", chat_id).execute()
@@ -822,16 +836,29 @@ async def get_top1(cid):
     return await asyncio.to_thread(get_top1_sync, cid)
 
 
+async def get_player_place(cid, uid):
+    return await asyncio.to_thread(get_player_place_sync, cid, uid)
+
+
 async def get_coins_stats(cid=None):
     return await asyncio.to_thread(get_coins_stats_sync, cid)
 
 
 async def get_chat_settings(cid):
-    return await asyncio.to_thread(get_chat_settings_sync, cid)
+    """С кэшем на CHAT_SETTINGS_TTL секунд — настройки меняются редко."""
+    now = time.time()
+    cached = _CHAT_SETTINGS_CACHE.get(cid)
+    if cached and now - cached[1] < CHAT_SETTINGS_TTL:
+        return cached[0]
+    data = await asyncio.to_thread(get_chat_settings_sync, cid)
+    _CHAT_SETTINGS_CACHE[cid] = (data, now)
+    return data
 
 
 async def update_chat_setting(cid, field, value):
-    return await asyncio.to_thread(update_chat_setting_sync, cid, field, value)
+    ok = await asyncio.to_thread(update_chat_setting_sync, cid, field, value)
+    _CHAT_SETTINGS_CACHE.pop(cid, None)
+    return ok
 
 
 async def tournament_create(cid, prize):
@@ -2131,17 +2158,7 @@ async def cmd_aiprofile(message: Message):
     bar = make_progress_bar(ca)
     sub = is_subscriber_cached(message.chat.id, message.from_user.id)
 
-    def _place():
-        try:
-            res = supabase.table("quiz_players").select("user_id").eq(
-                "chat_id", message.chat.id).order("correct_answers", desc=True).execute()
-            for i, row in enumerate(res.data or [], 1):
-                if int(row["user_id"]) == message.from_user.id:
-                    return i
-        except Exception:
-            pass
-        return None
-    place = await asyncio.to_thread(_place)
+    place = await get_player_place(message.chat.id, message.from_user.id)
     place_str = f"#{place}" if place else "—"
     today = await withdrawn_today(message.chat.id, message.from_user.id)
 
@@ -2535,6 +2552,7 @@ async def handle_answer(message: Message):
     cid, uid = message.chat.id, message.from_user.id
     text = (message.text or "").strip().lower()
 
+    # Турнир
     if cid in TOURNAMENT_ACTIVE:
         st = TOURNAMENT_STATE.get(cid)
         if st and not st.get("answered_by"):
@@ -2545,6 +2563,8 @@ async def handle_answer(message: Message):
     q = ACTIVE_QUESTIONS.get(cid)
     if not q:
         return
+
+    # Не совпало
     if text not in q["answers"]:
         if is_admin(uid):
             try:
@@ -2552,8 +2572,12 @@ async def handle_answer(message: Message):
             except Exception:
                 pass
         return
+
+    # Бан — до того, как отвечаем (не палим ответ)
     if is_banned_cached(cid, uid):
         return
+
+    # Атомарно вынимаем вопрос из активных
     popped = ACTIVE_QUESTIONS.pop(cid, None)
     if popped is None:
         return
@@ -2562,25 +2586,42 @@ async def handle_answer(message: Message):
     if tsk:
         tsk.cancel()
 
-    p = await get_player(cid, uid, message.from_user.username, message.from_user.first_name)
+    # === ОПТИМИЗАЦИЯ: get_player и clear_active параллельно ===
+    p, _ = await asyncio.gather(
+        get_player(cid, uid, message.from_user.username, message.from_user.first_name),
+        clear_active(cid),
+        return_exceptions=True,
+    )
+    if isinstance(p, Exception) or p is None:
+        # fallback: пробуем ещё раз, но последовательно
+        p = await get_player(cid, uid, message.from_user.username, message.from_user.first_name)
+
     old_lvl = level_from_correct(int(p["correct_answers"]))
     old_top1 = TOP_CACHE.get(cid)
 
-    await asyncio.gather(clear_active(cid), add_score(cid, uid), return_exceptions=True)
+    # Начисляем очко
+    await add_score(cid, uid)
 
     new_correct = int(p["correct_answers"]) + 1
     new_lvl = level_from_correct(new_correct)
 
-    new_top1 = await get_top1(cid)
-    if new_top1 and new_top1 != old_top1:
-        TOP_CACHE[cid] = new_top1
-        if old_top1 is not None:
-            try:
-                tp = await get_player(cid, new_top1)
-                nm = tp.get("first_name") or tp.get("username") or str(new_top1)
-                await safe_send(bot.send_message, cid, f"👑 <b>{nm}</b> вышел на первое место!")
-            except Exception:
-                pass
+    # === ОПТИМИЗАЦИЯ: топ-1 проверяем не каждый раз, а раз в N ответов ===
+    TOP1_COUNTER[cid] = TOP1_COUNTER.get(cid, 0) + 1
+    if TOP1_COUNTER[cid] % TOP1_CHECK_EVERY == 0:
+        new_top1 = await get_top1(cid)
+        if new_top1 and new_top1 != old_top1:
+            TOP_CACHE[cid] = new_top1
+            if old_top1 is not None:
+                try:
+                    tp = await get_player(cid, new_top1)
+                    nm = tp.get("first_name") or tp.get("username") or str(new_top1)
+                    await safe_send(bot.send_message, cid, f"👑 <b>{nm}</b> вышел на первое место!")
+                except Exception:
+                    pass
+    else:
+        # локально обновим кэш, если текущий игрок обогнал (без запроса)
+        if old_top1 != uid and uid not in (None,):
+            pass  # проверим в следующий раз
 
     phrase = random.choice(CORRECT_PHRASES)
     if q["is_multi"]:
@@ -2595,11 +2636,7 @@ async def handle_answer(message: Message):
         n_name = LEVELS[new_lvl - 1][2]
         msg += f"\n\n{n_emoji} <b>НОВЫЙ УРОВЕНЬ {new_lvl}!</b>\n🎖 {n_name}"
 
-    try:
-        await bot.send_chat_action(cid, "typing")
-    except Exception:
-        pass
-
+    # === ОПТИМИЗАЦИЯ: убран send_chat_action ===
     sent = await safe_send(message.reply, msg)
     if sent:
         try:
