@@ -94,88 +94,128 @@ async def fetch_avatar(user_id):
 def _circle_mask(size):
     m=Image.new("L",(size,size),0); d=ImageDraw.Draw(m); d.ellipse([0,0,size-1,size-1],fill=255); return m
 def render_profile_card(name, username, lvl, correct, place, balance, wd, is_sub, avatar_bytes=None):
-    W,H=1000,620; img=Image.new("RGB",(W,H),(10,10,28)); draw=ImageDraw.Draw(img)
-    # фон-градиент
+    W, H = 720, 1080
+    img = Image.new("RGB", (W, H), (10, 10, 28))
+    draw = ImageDraw.Draw(img)
+    # градиент
     for y in range(H):
-        t=y/H
-        r=int(18+int(50*t)); g=int(14+int(24*t)); b=int(46+int(110*t))
-        draw.line([(0,y),(W,y)],fill=(r,g,b))
-    # лёгкие декоративные круги
-    for cx,cy,rad,col in [(W-80,80,180,(255,200,60,18)),(80,H-60,220,(120,80,255,15))]:
-        overlay=Image.new("RGBA",(W,H),(0,0,0,0)); od=ImageDraw.Draw(overlay)
-        od.ellipse([cx-rad,cy-rad,cx+rad,cy+rad],fill=col)
-        img=Image.alpha_composite(img.convert("RGBA"),overlay).convert("RGB")
-    draw=ImageDraw.Draw(img)
+        t = y / H
+        r = int(16 + 50*t); g = int(12 + 26*t); b = int(42 + 120*t)
+        draw.line([(0, y), (W, y)], fill=(r, g, b))
+    # декоративные круги
+    for cx, cy, rad, col in [(W-40, 100, 220, (255,200,60,22)), (40, H-120, 280, (120,80,255,16))]:
+        overlay = Image.new("RGBA", (W, H), (0,0,0,0)); od = ImageDraw.Draw(overlay)
+        od.ellipse([cx-rad, cy-rad, cx+rad, cy+rad], fill=col)
+        img = Image.alpha_composite(img.convert("RGBA"), overlay).convert("RGB")
+    draw = ImageDraw.Draw(img)
     # золотая рамка
-    draw.rounded_rectangle([14,14,W-15,H-15],radius=24,outline=(255,210,70),width=3)
-    # аватар
-    av_size=150; av_x=60; av_y=60
-    draw.ellipse([av_x-4,av_y-4,av_x+av_size+4,av_y+av_size+4],fill=(255,210,70))
-    draw.ellipse([av_x,av_y,av_x+av_size,av_y+av_size],fill=(30,32,64))
+    draw.rounded_rectangle([16, 16, W-17, H-17], radius=32, outline=(255,210,70), width=3)
+
+    # аватар — по центру сверху
+    av_size = 230
+    av_x = (W - av_size) // 2
+    av_y = 80
+    draw.ellipse([av_x-7, av_y-7, av_x+av_size+7, av_y+av_size+7], fill=(255,210,70))
+    draw.ellipse([av_x, av_y, av_x+av_size, av_y+av_size], fill=(30,32,64))
     if avatar_bytes:
         try:
-            av=Image.open(io.BytesIO(avatar_bytes)).convert("RGB").resize((av_size,av_size),Image.LANCZOS)
-            img.paste(av,(av_x,av_y),_circle_mask(av_size))
+            av = Image.open(io.BytesIO(avatar_bytes)).convert("RGB").resize((av_size, av_size), Image.LANCZOS)
+            img.paste(av, (av_x, av_y), _circle_mask(av_size))
+            draw = ImageDraw.Draw(img)
         except Exception:
-            avatar_bytes=None
+            avatar_bytes = None
     if not avatar_bytes:
-        f_av=get_font(76,bold=True); letter=(name or "?")[0].upper()
-        bb=draw.textbbox((0,0),letter,font=f_av); tw,th=bb[2]-bb[0],bb[3]-bb[1]
-        draw.text((av_x+av_size/2-tw/2-bb[0], av_y+av_size/2-th/2-bb[1]), letter, fill=(255,210,70), font=f_av)
-    # имя и юзернейм
-    f_name=get_font(48,bold=True); f_user=get_font(22)
-    draw.text((240,72),(name or "Player")[:18],fill=(255,255,255),font=f_name)
-    un_str=f"@{username[:22]}" if username else f"ID {correct and '' or ''}"
-    if not username: un_str=""
-    if un_str: draw.text((242,130),un_str,fill=(150,160,200),font=f_user)
-    # уровень справа
-    f_lvl=get_font(40,bold=True); f_lvl_sub=get_font(22)
-    lvl_str=f"LEVEL {lvl}"
-    bb=draw.textbbox((0,0),lvl_str,font=f_lvl); tw=bb[2]-bb[0]
-    draw.text((W-tw-70,66),lvl_str,fill=(255,210,70),font=f_lvl)
-    lname=LEVELS[lvl-1][2]
-    bb=draw.textbbox((0,0),lname,font=f_lvl_sub); tw=bb[2]-bb[0]
-    draw.text((W-tw-70,118),lname,fill=(210,180,110),font=f_lvl_sub)
-    # бейдж подписки
+        f_av = get_font(110, bold=True)
+        letter = (name or "?")[0].upper()
+        bb = draw.textbbox((0,0), letter, font=f_av)
+        tw, th = bb[2]-bb[0], bb[3]-bb[1]
+        draw.text((av_x + av_size/2 - tw/2 - bb[0], av_y + av_size/2 - th/2 - bb[1]),
+                  letter, fill=(255,210,70), font=f_av)
+
+    def center(text, font, y, fill):
+        bb = draw.textbbox((0,0), text, font=font)
+        tw = bb[2]-bb[0]
+        draw.text(((W-tw)/2 - bb[0], y - bb[1]), text, fill=fill, font=font)
+
+    # имя
+    f_name = get_font(48, bold=True)
+    center((name or "Player")[:16], f_name, 350, (255,255,255))
+    # @username
+    if username:
+        f_user = get_font(24)
+        center(f"@{username[:24]}", f_user, 415, (150,160,200))
+    # уровень
+    f_lvl = get_font(32, bold=True)
+    center(f"LEVEL {lvl}  ·  {LEVELS[lvl-1][2]}", f_lvl, 460, (255,210,70))
+
+    # бейдж подписки — по центру
     if is_sub:
-        f_bdg=get_font(18,bold=True); btxt="✦ SUBSCRIBER x2"
-        bb=draw.textbbox((0,0),btxt,font=f_bdg); bw_=bb[2]-bb[0]+34; bh_=34
-        bx=W-bw_-70; by=160
-        draw.rounded_rectangle([bx,by,bx+bw_,by+bh_],radius=17,fill=(190,55,175))
-        draw.text((bx+17,by+8),btxt,fill=(255,255,255),font=f_bdg)
+        btxt = "✦  SUBSCRIBER  ×2"
+        bcol = (190, 55, 175)
+        f_bdg = get_font(22, bold=True)
+        btxt_col = (255,255,255)
     else:
-        f_bdg=get_font(18); btxt="◇ FREE USER"
-        bb=draw.textbbox((0,0),btxt,font=f_bdg); bw_=bb[2]-bb[0]+34; bh_=34
-        bx=W-bw_-70; by=160
-        draw.rounded_rectangle([bx,by,bx+bw_,by+bh_],radius=17,fill=(50,50,80))
-        draw.text((bx+17,by+8),btxt,fill=(180,180,210),font=f_bdg)
+        btxt = "◇  FREE USER"
+        bcol = (50, 50, 80)
+        f_bdg = get_font(22)
+        btxt_col = (180, 180, 210)
+    bb = draw.textbbox((0,0), btxt, font=f_bdg)
+    bw_ = bb[2]-bb[0] + 48; bh_ = 44
+    bx = (W - bw_) // 2; by = 520
+    draw.rounded_rectangle([bx, by, bx+bw_, by+bh_], radius=bh_//2, fill=bcol)
+    bbc = draw.textbbox((0,0), btxt, font=f_bdg)
+    tw, th = bbc[2]-bbc[0], bbc[3]-bbc[1]
+    draw.text((bx+(bw_-tw)/2-bbc[0], by+(bh_-th)/2-bbc[1]), btxt, fill=btxt_col, font=f_bdg)
+
     # разделитель
-    draw.line([(60,245),(W-60,245)],fill=(255,210,70),width=1)
-    # 2x2 статистика
-    f_lbl=get_font(16); f_val=get_font(44,bold=True)
-    cols_x=[70, W//2+10]; rows_y=[285, 405]
-    stats=[("POINTS", str(correct), (100,220,255)),
-           ("RANK", f"#{place}" if place else "—", (255,210,70)),
-           ("BALANCE", f"${balance:.4f}", (95,255,145)),
-           ("WITHDRAWN TODAY", f"${wd:.4f}", (255,160,90))]
-    for i,(lbl,val,col) in enumerate(stats):
-        cx=cols_x[i%2]; cy=rows_y[i//2]
-        draw.text((cx,cy),lbl,fill=(130,140,180),font=f_lbl)
-        draw.text((cx,cy+26),val,fill=col,font=f_val)
+    draw.line([(80, 605), (W-80, 605)], fill=(180,150,60), width=1)
+
+    # статистика — 2×2 по центру
+    f_lbl = get_font(18)
+    f_val = get_font(42, bold=True)
+    cols_cx = [W*0.28, W*0.72]
+    rows_y = [645, 770]
+    stats = [
+        ("POINTS", str(correct), (100,220,255)),
+        ("RANK", f"#{place}" if place else "—", (255,210,70)),
+        ("BALANCE", f"${balance:.4f}", (95,255,145)),
+        ("WITHDRAWN TODAY", f"${wd:.4f}", (255,160,90)),
+    ]
+    for i, (lbl, val, col) in enumerate(stats):
+        cx = cols_cx[i % 2]; cy = rows_y[i // 2]
+        bb = draw.textbbox((0,0), lbl, font=f_lbl)
+        tw = bb[2]-bb[0]
+        draw.text((cx - tw/2 - bb[0], cy), lbl, fill=(140,150,190), font=f_lbl)
+        bb = draw.textbbox((0,0), val, font=f_val)
+        tw = bb[2]-bb[0]
+        draw.text((cx - tw/2 - bb[0], cy + 28 - bb[1]), val, fill=col, font=f_val)
+
     # прогресс-бар
-    bx,by,bw,bh=70,520,W-140,34
-    il=correct-(lvl-1)*ANSWERS_PER_LEVEL
-    if lvl>=MAX_LEVEL: filled,bt=bw,"MAX LEVEL"
-    else: filled,bt=int(bw*il/ANSWERS_PER_LEVEL),f"{il} / {ANSWERS_PER_LEVEL} to next level"
-    draw.rounded_rectangle([bx,by,bx+bw,by+bh],radius=bh//2,fill=(28,28,54),outline=(70,70,110),width=2)
-    if filled>2: draw.rounded_rectangle([bx,by,bx+filled,by+bh],radius=bh//2,fill=(255,210,70))
-    f_bar=get_font(20,bold=True); bb=draw.textbbox((0,0),bt,font=f_bar); tw,th=bb[2]-bb[0],bb[3]-bb[1]
-    bar_text_x=bx+bw/2-tw/2
-    bar_center=bx+bw/2
-    if filled>bar_center: tcol=(25,25,45)
-    else: tcol=(230,230,240)
-    draw.text((bar_text_x, by+bh/2-th/2-bb[1]), bt, fill=tcol, font=f_bar)
-    buf=io.BytesIO(); img.save(buf,format="PNG",optimize=True); return buf.getvalue()
+    bx, by, bw, bh = 60, 920, W-120, 48
+    il = correct - (lvl-1)*ANSWERS_PER_LEVEL
+    if lvl >= MAX_LEVEL:
+        filled, bt = bw, "MAX LEVEL"
+    else:
+        filled = int(bw * il / ANSWERS_PER_LEVEL)
+        bt = f"{il} / {ANSWERS_PER_LEVEL}"
+    draw.rounded_rectangle([bx, by, bx+bw, by+bh], radius=bh//2, fill=(28,28,54), outline=(70,70,110), width=2)
+    if filled > 2:
+        draw.rounded_rectangle([bx, by, bx+filled, by+bh], radius=bh//2, fill=(255,210,70))
+    f_bar = get_font(22, bold=True)
+    bb = draw.textbbox((0,0), bt, font=f_bar)
+    tw, th = bb[2]-bb[0], bb[3]-bb[1]
+    bar_center = bx + bw/2
+    tcol = (25,25,45) if filled > (bar_center - bx) else (230,230,240)
+    draw.text((bar_center - tw/2 - bb[0], by + bh/2 - th/2 - bb[1]), bt, fill=tcol, font=f_bar)
+
+    # подпись снизу
+    f_ft = get_font(18)
+    ft = "xRocket Quiz Bot"
+    bb = draw.textbbox((0,0), ft, font=f_ft)
+    tw = bb[2]-bb[0]
+    draw.text(((W-tw)/2 - bb[0], H-65), ft, fill=(120,120,160), font=f_ft)
+
+    buf = io.BytesIO(); img.save(buf, format="PNG", optimize=True); return buf.getvalue()
 async def get_http():
     global HTTP_SESSION
     if HTTP_SESSION is None or HTTP_SESSION.closed:
