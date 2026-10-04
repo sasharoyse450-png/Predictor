@@ -28,8 +28,6 @@ ANSWERS_PER_LEVEL=10; MAX_LEVEL=10; RAKE_PCT=0.05
 SUBSCRIBER_MULTIPLIER=2.0
 SUBSCRIPTION_PRICE=0.50
 SUBSCRIPTION_DAYS=7
-SUBSCRIPTION_WALLET=os.getenv("SUBSCRIPTION_WALLET","УКАЖИ_КОШЕЛЁК_В_RAILWAY")
-SUBSCRIPTION_NETWORK=os.getenv("SUBSCRIPTION_NETWORK","USDT TRC20")
 
 MIN_WITHDRAW=0.05; DAILY_WITHDRAW_LIMIT=5.00; DEPOSIT_MIN=0.05; DEPOSIT_MAX=50.0
 DUEL_MIN=0.05; DUEL_MAX=1.00; DUEL_TTL=120; TIMER_PROBABILITY=0.20; TIMER_SECONDS=10
@@ -627,16 +625,40 @@ async def handle_webhook(request):
                 if ciid: await process_paid_invoice(ciid)
         return web.Response(status=200,text="ok")
     except Exception as e: log.error("Webhook: %s",e); return web.Response(status=200,text="ok")
+
 async def process_paid_invoice(ciid):
     inv=await mark_invoice_paid(ciid)
     if not inv: return
     uid=int(inv["user_id"]); cid=int(inv["chat_id"]) if inv.get("chat_id") else uid
     amt=float(inv["amount"]); mid=inv.get("message_id"); kind=inv.get("kind") or "deposit"
+
+    if kind=="subscription":
+        exp=await activate_subscription(uid, SUBSCRIPTION_DAYS)
+        try:
+            global SUBSCRIBERS_CACHE
+            SUBSCRIBERS_CACHE=await asyncio.to_thread(load_subscribers_sync)
+        except Exception: pass
+        if mid:
+            try:
+                await bot.edit_message_text(chat_id=cid,message_id=int(mid),
+                    text=(f"✅ <b>Подписка активирована!</b>\n\n"
+                          f"📅 До: <b>{exp.strftime('%d.%m.%Y %H:%M')} UTC</b>\n"
+                          f"🔥 Множитель очков: <b>×{SUBSCRIBER_MULTIPLIER:.0f}</b>"))
+            except Exception: pass
+        try:
+            await bot.send_message(uid,
+                f"🎉 <b>Подписка оформлена!</b>\n\n"
+                f"📅 До: <b>{exp.strftime('%d.%m.%Y %H:%M')} UTC</b>\n"
+                f"🔥 Теперь за каждый ответ: <b>×{SUBSCRIBER_MULTIPLIER:.0f} очка</b>")
+        except Exception: pass
+        return
+
     if kind=="sponsor":
         SPONSOR_SESSION[uid]={"chat_id":None,"collected":0,"target":SPONSOR_QUESTIONS}
         try: await bot.send_message(uid,f"✅ <b>Оплата ${amt:.2f} получена!</b>\n\nТеперь напиши <b>ID чата</b>.\n<i>(напр: -1002712583382)</i>")
         except Exception: pass
         return
+
     nb=await add_balance(cid,uid,amt)
     if nb is None:
         p=await get_player(cid,uid); nb=float(p.get("balance",0))
@@ -645,6 +667,7 @@ async def process_paid_invoice(ciid):
         except Exception: pass
     try: await bot.send_message(uid,f"✅ <b>Баланс пополнен!</b>\n\n💰 Сумма: <b>${amt:.4f}</b>\n💼 Баланс: <b>${nb:.4f}</b>")
     except Exception: pass
+
 async def start_webhook_server():
     app=web.Application(); app.router.add_post("/webhook",handle_webhook); app.router.get("/",lambda r: web.Response(text="ok"))
     runner=web.AppRunner(app); await runner.setup(); site=web.TCPSite(runner,"0.0.0.0",PORT); await site.start(); log.info("Webhook on %s",PORT)
@@ -885,40 +908,27 @@ async def cmd_aisub(message:Message):
     exp=await get_subscription(uid); now=datetime.now(timezone.utc)
     if exp and exp>now:
         delta=exp-now; d=delta.days; h=int(delta.total_seconds()//3600%24)
-        head=(f"💎 <b>Подписка активна</b>\n\n📅 Осталось: <b>{d} дн. {h} ч.</b>\n⏰ До: <b>{exp.strftime('%d.%m.%Y %H:%M')} UTC</b>\n\n"
-              f"🔥 Множитель очков ×{SUBSCRIBER_MULTIPLIER:.0f}\n\nПродлить: переведи ещё <b>${SUBSCRIPTION_PRICE:.2f}</b> и нажми кнопку ниже.")
-    else:
-        head=(f"💎 <b>Подписка ×{SUBSCRIBER_MULTIPLIER:.0f} очков</b>\n\n💵 Цена: <b>${SUBSCRIPTION_PRICE:.2f}</b> за <b>{SUBSCRIPTION_DAYS} дней</b>\n🌐 Сеть: <b>{SUBSCRIPTION_NETWORK}</b>\n\n"
-              f"👛 Кошелёк для перевода:\n<code>{SUBSCRIPTION_WALLET}</code>\n\n"
-              f"<b>Как оформить:</b>\n1. Отправь <b>${SUBSCRIPTION_PRICE:.2f}</b> USDT на адрес выше\n2. Нажми «✅ Я оплатил»\n3. Админ проверит и активирует\n\n<i>Обычно занимает до 30 минут.</i>")
-    kb=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="✅ Я оплатил","callback_data":"sub:paid")]])
-    await safe_send(message.reply,head,reply_markup=kb)
-
-@dp.callback_query(F.data=="sub:paid")
-async def on_sub_paid(cb:CallbackQuery):
-    if not cb.from_user or not isinstance(cb.message,Message): await cb.answer(); return
-    uid=cb.from_user.id; uname=cb.from_user.username; fname=cb.from_user.first_name; cid=cb.message.chat.id
-    await cb.answer("Заявка отправлена! Жди подтверждения.", show_alert=True)
-    try: await bot.send_message(cid,f"📨 <b>Заявка на подписку отправлена</b>\n\n💰 К оплате: <b>${SUBSCRIPTION_PRICE:.2f}</b> USDT\n⏳ Админ проверит в течение 30 мин.\n\n<i>Если перевода не было — подписка не активируется.</i>")
-    except Exception: pass
-    notif=(f"🔔 <b>Заявка на подписку</b>\n\n👤 {fname}" + (f" (@{uname})" if uname else "") + f"\n🆔 <code>{uid}</code>\n💵 Сумма: <b>${SUBSCRIPTION_PRICE:.2f}</b>\n💬 Чат: <code>{cid}</code>\n\nПроверь перевод и выдай:\n<code>/AiSubGive {uid}</code>")
-    kb=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=f"✅ Выдать {fname[:12]}", callback_data=f"subgive:{uid}")]])
-    for aid in ADMIN_IDS:
-        try: await bot.send_message(aid, notif, reply_markup=kb)
-        except Exception: pass
-
-@dp.callback_query(F.data.startswith("subgive:"))
-async def on_subgive_cb(cb:CallbackQuery):
-    if not cb.from_user or not is_admin(cb.from_user.id): await cb.answer("⛔", show_alert=True); return
-    try: uid=int(cb.data.split(":")[1])
-    except (ValueError,IndexError): await cb.answer("Ошибка", show_alert=True); return
-    exp=await activate_subscription(uid, SUBSCRIPTION_DAYS)
-    if not exp: await cb.answer("❌ Ошибка", show_alert=True); return
-    await cb.answer(f"✅ Выдано до {exp.strftime('%d.%m %H:%M')} UTC")
-    try: await cb.message.edit_reply_markup(reply_markup=None)
-    except Exception: pass
-    try: await bot.send_message(uid,f"🎉 <b>Подписка активирована!</b>\n\n📅 До: <b>{exp.strftime('%d.%m.%Y %H:%M')} UTC</b>\n🔥 Множитель очков: <b>×{SUBSCRIBER_MULTIPLIER:.0f}</b>")
-    except Exception: pass
+        await safe_send(message.reply,
+            f"💎 <b>Подписка активна</b>\n\n"
+            f"📅 Осталось: <b>{d} дн. {h} ч.</b>\n"
+            f"⏰ До: <b>{exp.strftime('%d.%m.%Y %H:%M')} UTC</b>\n\n"
+            f"🔥 Множитель очков: <b>×{SUBSCRIBER_MULTIPLIER:.0f}</b>")
+        return
+    ciid=f"sub_{uid}_{uuid.uuid4().hex[:12]}"
+    ok,res=await xrocket_create_invoice(ciid, SUBSCRIPTION_PRICE, f"Subscription {SUBSCRIPTION_DAYS}d (user {uid})")
+    if not ok:
+        await safe_send(message.reply,f"❌ <code>{res}</code>"); return
+    kb=InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text=f"💳 Оплатить ${SUBSCRIPTION_PRICE:.2f}", url=res)
+    ]])
+    sent=await safe_send(message.reply,
+        f"💎 <b>Подписка ×{SUBSCRIBER_MULTIPLIER:.0f} очков</b>\n\n"
+        f"💵 Цена: <b>${SUBSCRIPTION_PRICE:.2f}</b> за <b>{SUBSCRIPTION_DAYS} дней</b>\n"
+        f"📈 Множитель: <b>×{SUBSCRIBER_MULTIPLIER:.0f}</b> к очкам\n\n"
+        f"Нажми кнопку ниже → оплати в @xrocket → подписка активируется автоматически.",
+        reply_markup=kb)
+    mid=sent.message_id if sent else None
+    await create_invoice(ciid, uid, message.chat.id, SUBSCRIPTION_PRICE, mid, kind="subscription")
 
 # =============== ХЕНДЛЕРЫ ===============
 
@@ -1542,10 +1552,9 @@ async def handle_answer(message:Message):
         except Exception: pass
 
 async def main():
-    print("="*50); print("Quiz Bot · турниры · дуэли · копилка · подписка переводом")
+    print("="*50); print("Quiz Bot · подписка через xRocket-инвойс")
     print(f"Easy: {len(EASY_QUESTIONS)} · Medium: {len(MEDIUM_QUESTIONS)} · Hard: {len(HARD_QUESTIONS)} · Extreme: {len(EXTREME_QUESTIONS)}")
     print(f"Админы: {sorted(ADMIN_IDS)}")
-    print(f"Кошелёк подписки: {SUBSCRIPTION_WALLET}")
     await get_http(); await asyncio.to_thread(unlock_all_withdrawals_sync)
     global BANNED_CACHE,SUBSCRIBERS_CACHE
     BANNED_CACHE=await asyncio.to_thread(load_bans_sync); SUBSCRIBERS_CACHE=await asyncio.to_thread(load_subscribers_sync)
