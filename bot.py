@@ -1,16 +1,6 @@
-import asyncio
-import hashlib
-import hmac
-import io
-import json
-import logging
-import os
-import random
-import time
-import uuid
+import asyncio, hashlib, hmac, io, json, logging, os, random, time, uuid
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
-
 import aiohttp
 from aiohttp import web
 from aiogram import Bot, Dispatcher, F
@@ -19,3065 +9,1221 @@ from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramRetryAfter, TelegramBadRequest
 from aiogram.filters import Command, CommandStart
 from aiogram.dispatcher.event.bases import SkipHandler
-from aiogram.types import (
-    Message, CallbackQuery, BufferedInputFile,
-    InlineKeyboardMarkup, InlineKeyboardButton,
-)
+from aiogram.types import Message, CallbackQuery, BufferedInputFile, InlineKeyboardMarkup, InlineKeyboardButton
 from PIL import Image, ImageDraw, ImageFont
 from supabase import create_client, Client
-
-from questions import (
-    EASY_QUESTIONS, MEDIUM_QUESTIONS, HARD_QUESTIONS, EXTREME_QUESTIONS,
-    DIFFICULTY_LABELS, random_question,
-)
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
-    datefmt="%H:%M:%S",
-)
+from questions import EASY_QUESTIONS, MEDIUM_QUESTIONS, HARD_QUESTIONS, EXTREME_QUESTIONS, DIFFICULTY_LABELS, random_question
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s", datefmt="%H:%M:%S")
 log = logging.getLogger("quizbot")
-
-TOKEN = os.getenv("BOT_TOKEN", "")
-SUPABASE_URL = os.getenv("SUPABASE_URL", "")
-SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
-
-XROCKET_API_KEY = os.getenv("XROCKET_API_KEY", "")
-XROCKET_WEBHOOK_SECRET = os.getenv("XROCKET_WEBHOOK_SECRET", "")
-XROCKET_BASE = "https://pay.api.xrocket.exchange"
-XROCKET_SUBSCRIBE_URL = os.getenv("XROCKET_SUBSCRIBE_URL", "https://t.me/xRocket")
-XROCKET_REFERRAL_URL = os.getenv("XROCKET_REFERRAL_URL", "https://t.me/xRocket")
-
-PORT = int(os.getenv("PORT", 8080))
-
-ANSWERS_PER_LEVEL = 10
-MAX_LEVEL = 10
-RAKE_PCT = 0.05
-
-SUBSCRIBER_MULTIPLIER = 2.0
-SUBSCRIPTION_PRICE = 0.50
-
-MIN_WITHDRAW = 0.05
-DAILY_WITHDRAW_LIMIT = 5.00
-
-DEPOSIT_MIN = 0.05
-DEPOSIT_MAX = 50.0
-
-DUEL_MIN = 0.05
-DUEL_MAX = 1.00
-DUEL_TTL = 120
-
-TIMER_PROBABILITY = 0.20
-TIMER_SECONDS = 10
-
-POT_PERCENT = 0.05
-POT_HOUR = 21
-
-SPONSOR_PRICE = 5.00
-SPONSOR_QUESTIONS = 20
-
-ADMIN_IDS = {8130244626, 6173495222}
-
-TZ = ZoneInfo(os.getenv("TZ", "Europe/Moscow"))
-WORK_HOURS = list(range(8, 24))
-WITHDRAW_CONFIRM_TTL = 120
-
-WEBHOOK_MAX_AGE_SEC = 300
-
-TOP1_CHECK_EVERY = 5
-CHAT_SETTINGS_TTL = 60
-
-CORRECT_PHRASES = [
-    "🎉 <b>Правильно!</b>", "🔥 <b>В точку!</b>", "💎 <b>Красавчик!</b>",
-    "⚡ <b>Молниеносно!</b>", "🧠 <b>Умница!</b>", "🏆 <b>Есть!</b>",
-    "✨ <b>Верно!</b>", "🚀 <b>Полетели!</b>", "🎯 <b>Точно в цель!</b>",
-    "🌟 <b>Блестяще!</b>",
-]
-
-LEVELS = [
-    (1, "🐣", "Новичок"), (2, "🥚", "Ученик"), (3, "🐥", "Знаток"),
-    (4, "🦅", "Эксперт"), (5, "🧠", "Мастер"), (6, "🎓", "Гуру"),
-    (7, "💎", "Легенда"), (8, "👑", "Гений"), (9, "🔥", "Титан"),
-    (10, "⚡", "Бог викторины"),
-]
-
-# ===== ДНЕВНЫЕ КВЕСТЫ =====
-
-DAILY_QUESTS = {
-    "answer_5":     {"title": "Ответить на 5 вопросов",     "target": 5, "reward": 0.02, "emoji": "🎯"},
-    "daily_login":  {"title": "Забрать /AiDaily",            "target": 1, "reward": 0.01, "emoji": "📅"},
-    "deposit_050":  {"title": "Сделать депозит ≥ $0.50",     "target": 1, "reward": 0.03, "emoji": "💳"},
-    "message_1":    {"title": "Написать сообщение в чат",    "target": 1, "reward": 0.01, "emoji": "💬"},
-    "duel_play_1":  {"title": "Сыграть 1 дуэль",             "target": 1, "reward": 0.02, "emoji": "🎲"},
-    "duel_win_1":   {"title": "Выиграть 1 дуэль",            "target": 1, "reward": 0.03, "emoji": "🏆"},
-    "tourn_top3":   {"title": "Попасть в топ-3 турнира",     "target": 1, "reward": 0.10, "emoji": "🥉"},
-    "withdraw":     {"title": "Сделать вывод на xRocket",    "target": 1, "reward": 0.02, "emoji": "💸"},
-    "deposit_2":    {"title": "Пополнить ≥ $2 за сутки",     "target": 1, "reward": 0.05, "emoji": "💰"},
-    "duel_big":     {"title": "Дуэль со ставкой > $0.50",    "target": 1, "reward": 0.03, "emoji": "🎰"},
-    "first_answer": {"title": "Первый ответ дня в чате",     "target": 1, "reward": 0.02, "emoji": "🥇"},
-    "last_answer":  {"title": "Последний ответ дня",         "target": 1, "reward": 0.02, "emoji": "🌙"},
-}
-
-DAILY_STREAK_BASE = 0.01
-DAILY_STREAK_MAX  = 0.05
-
+TOKEN=os.getenv("BOT_TOKEN",""); SUPABASE_URL=os.getenv("SUPABASE_URL",""); SUPABASE_KEY=os.getenv("SUPABASE_KEY","")
+XROCKET_API_KEY=os.getenv("XROCKET_API_KEY",""); XROCKET_WEBHOOK_SECRET=os.getenv("XROCKET_WEBHOOK_SECRET","")
+XROCKET_BASE="https://pay.api.xrocket.exchange"
+XROCKET_SUBSCRIBE_URL=os.getenv("XROCKET_SUBSCRIBE_URL","https://t.me/xRocket")
+XROCKET_REFERRAL_URL=os.getenv("XROCKET_REFERRAL_URL","https://t.me/xRocket")
+PORT=int(os.getenv("PORT",8080))
+ANSWERS_PER_LEVEL=10; MAX_LEVEL=10; RAKE_PCT=0.05; SUBSCRIBER_MULTIPLIER=2.0; SUBSCRIPTION_PRICE=0.50
+MIN_WITHDRAW=0.05; DAILY_WITHDRAW_LIMIT=5.00; DEPOSIT_MIN=0.05; DEPOSIT_MAX=50.0
+DUEL_MIN=0.05; DUEL_MAX=1.00; DUEL_TTL=120; TIMER_PROBABILITY=0.20; TIMER_SECONDS=10
+POT_PERCENT=0.05; POT_HOUR=21; SPONSOR_PRICE=5.00; SPONSOR_QUESTIONS=20
+ADMIN_IDS={8130244626,6173495222}
+TZ=ZoneInfo(os.getenv("TZ","Europe/Moscow")); WORK_HOURS=list(range(8,24)); WITHDRAW_CONFIRM_TTL=120
+WEBHOOK_MAX_AGE_SEC=300; TOP1_CHECK_EVERY=5; CHAT_SETTINGS_TTL=60
+CORRECT_PHRASES=["🎉 <b>Правильно!</b>","🔥 <b>В точку!</b>","💎 <b>Красавчик!</b>","⚡ <b>Молниеносно!</b>","🧠 <b>Умница!</b>","🏆 <b>Есть!</b>","✨ <b>Верно!</b>","🚀 <b>Полетели!</b>","🎯 <b>Точно в цель!</b>","🌟 <b>Блестяще!</b>"]
+LEVELS=[(1,"🐣","Новичок"),(2,"🥚","Ученик"),(3,"🐥","Знаток"),(4,"🦅","Эксперт"),(5,"🧠","Мастер"),(6,"🎓","Гуру"),(7,"💎","Легенда"),(8,"👑","Гений"),(9,"🔥","Титан"),(10,"⚡","Бог викторины")]
 if not TOKEN or not SUPABASE_URL or not SUPABASE_KEY:
-    print("!!! Не заданы BOT_TOKEN / SUPABASE_URL / SUPABASE_KEY")
-    raise SystemExit(1)
-
-bot = Bot(TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
-dp = Dispatcher()
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
-
-ACTIVE_QUESTIONS = {}
-QUIZ_ENABLED = set()
-PENDING_WITHDRAWS = {}
-BANNED_CACHE = {}
-SUBSCRIBERS_CACHE = {}
-DUEL_BUSY = set()
-TOP_CACHE = {}
-TOP1_COUNTER = {}
-HTTP_SESSION = None
-_FONT_PATH = None
-
-_CHAT_SETTINGS_CACHE = {}
-
-TOURNAMENT_STATE = {}
-TOURNAMENT_ACTIVE = {}
-TOURNAMENT_EDIT = {}
-
-SPONSOR_SESSION = {}
-
-
-def is_admin(uid):
-    return uid in ADMIN_IDS
-
-
-def level_from_correct(c):
-    return min(c // ANSWERS_PER_LEVEL + 1, MAX_LEVEL)
-
-
+    print("!!! Не заданы BOT_TOKEN / SUPABASE_URL / SUPABASE_KEY"); raise SystemExit(1)
+bot=Bot(TOKEN,default=DefaultBotProperties(parse_mode=ParseMode.HTML)); dp=Dispatcher(); supabase:Client=create_client(SUPABASE_URL,SUPABASE_KEY)
+ACTIVE_QUESTIONS={}; QUIZ_ENABLED=set(); PENDING_WITHDRAWS={}; BANNED_CACHE={}; SUBSCRIBERS_CACHE={}
+DUEL_BUSY=set(); TOP_CACHE={}; TOP1_COUNTER={}; HTTP_SESSION=None; _FONT_PATH=None; _CHAT_SETTINGS_CACHE={}
+TOURNAMENT_STATE={}; TOURNAMENT_ACTIVE={}; TOURNAMENT_EDIT={}; SPONSOR_SESSION={}
+def is_admin(uid): return uid in ADMIN_IDS
+def level_from_correct(c): return min(c//ANSWERS_PER_LEVEL+1,MAX_LEVEL)
 def level_info(c):
-    lvl = level_from_correct(c)
-    emoji, name = LEVELS[lvl - 1][1], LEVELS[lvl - 1][2]
-    title_str = f"{emoji} {name} (ур. {lvl})"
-    if lvl >= MAX_LEVEL:
-        progress = "🏆 Максимальный уровень!"
-    else:
-        in_level = c - (lvl - 1) * ANSWERS_PER_LEVEL
-        progress = f"до след. уровня: {ANSWERS_PER_LEVEL - in_level} отв."
-    return lvl, emoji, name, 0, title_str, progress
-
-
+    lvl=level_from_correct(c); emoji,name=LEVELS[lvl-1][1],LEVELS[lvl-1][2]
+    ts=f"{emoji} {name} (ур. {lvl})"; p="🏆 Максимальный уровень!" if lvl>=MAX_LEVEL else f"до след. уровня: {ANSWERS_PER_LEVEL-(c-(lvl-1)*ANSWERS_PER_LEVEL)} отв."
+    return lvl,emoji,name,0,ts,p
 def make_progress_bar(c):
-    lvl = level_from_correct(c)
-    if lvl >= MAX_LEVEL:
-        return "▓" * 10 + " 10/10"
-    in_level = c - (lvl - 1) * ANSWERS_PER_LEVEL
-    return f"{'▓' * in_level}{'▒' * (ANSWERS_PER_LEVEL - in_level)} {in_level}/{ANSWERS_PER_LEVEL}"
-
-
+    lvl=level_from_correct(c)
+    if lvl>=MAX_LEVEL: return "▓"*10+" 10/10"
+    il=c-(lvl-1)*ANSWERS_PER_LEVEL
+    return f"{'▓'*il}{'▒'*(ANSWERS_PER_LEVEL-il)} {il}/{ANSWERS_PER_LEVEL}"
 def get_font(size=64):
     global _FONT_PATH
-    candidates = [
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-        "/usr/share/fonts/TTF/DejaVuSans-Bold.ttf",
-    ]
+    cands=["/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf","/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf","/usr/share/fonts/TTF/DejaVuSans-Bold.ttf"]
     if _FONT_PATH is None:
-        for path in candidates:
-            if os.path.exists(path):
-                _FONT_PATH = path
-                break
-        if _FONT_PATH is None:
-            _FONT_PATH = ""
+        for p in cands:
+            if os.path.exists(p): _FONT_PATH=p; break
+        if _FONT_PATH is None: _FONT_PATH=""
     try:
-        if _FONT_PATH:
-            return ImageFont.truetype(_FONT_PATH, size)
-    except Exception:
-        pass
+        if _FONT_PATH: return ImageFont.truetype(_FONT_PATH,size)
+    except Exception: pass
     return ImageFont.load_default()
-
-
-def render_question_image(text: str) -> bytes:
-    W, H = 800, 300
-    img = Image.new("RGB", (W, H), "white")
-    draw = ImageDraw.Draw(img)
-    font = get_font(80)
-    bbox = draw.textbbox((0, 0), text, font=font)
-    tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
-    while tw > W - 60:
-        cur_size = getattr(font, "size", 0)
-        if cur_size <= 20:
-            break
-        font = get_font(cur_size - 5)
-        bbox = draw.textbbox((0, 0), text, font=font)
-        tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
-    draw.text(((W - tw) / 2 - bbox[0], (H - th) / 2 - bbox[1]), text, fill=(20, 20, 80), font=font)
-    buf = io.BytesIO()
-    img.save(buf, format="PNG")
-    return buf.getvalue()
-
-
+def render_question_image(text):
+    W,H=800,300; img=Image.new("RGB",(W,H),"white"); draw=ImageDraw.Draw(img); font=get_font(80)
+    bbox=draw.textbbox((0,0),text,font=font); tw,th=bbox[2]-bbox[0],bbox[3]-bbox[1]
+    while tw>W-60:
+        cs=getattr(font,"size",0)
+        if cs<=20: break
+        font=get_font(cs-5); bbox=draw.textbbox((0,0),text,font=font); tw,th=bbox[2]-bbox[0],bbox[3]-bbox[1]
+    draw.text(((W-tw)/2-bbox[0],(H-th)/2-bbox[1]),text,fill=(20,20,80),font=font)
+    buf=io.BytesIO(); img.save(buf,format="PNG"); return buf.getvalue()
+def render_profile_card(name,le,ln,lvl,correct,place,balance,wd,is_sub):
+    W,H=900,500; img=Image.new("RGB",(W,H),(18,20,40)); draw=ImageDraw.Draw(img)
+    for y in range(H):
+        r=int(18+(60-18)*y/H); g=int(20+(30-20)*y/H); b=int(40+(110-40)*y/H); draw.line([(0,y),(W,y)],fill=(r,g,b))
+    draw.rectangle([10,10,W-11,H-11],outline=(255,215,0),width=3)
+    fb=get_font(56); fm=get_font(32); fs=get_font(24); fx=get_font(20)
+    draw.text((40,35),(name or "Игрок")[:24],fill=(255,255,255),font=fb)
+    draw.text((40,105),f"{le} {ln} · ур. {lvl}",fill=(255,215,0),font=fm)
+    draw.line([(40,155),(W-40,155)],fill=(255,215,0),width=2)
+    draw.text((40,180),"🏆 Очков:",fill=(200,200,220),font=fs); draw.text((250,180),str(correct),fill=(255,255,255),font=fm)
+    draw.text((40,230),"📍 Место:",fill=(200,200,220),font=fs); draw.text((250,230),f"#{place}" if place else "—",fill=(255,255,255),font=fm)
+    draw.text((40,280),"💰 Баланс:",fill=(200,200,220),font=fs); draw.text((250,280),f"${balance:.4f}",fill=(80,255,120),font=fm)
+    draw.text((40,330),"💸 Выведено:",fill=(200,200,220),font=fs); draw.text((250,330),f"${wd:.4f}",fill=(255,200,100),font=fm)
+    draw.text((40,380),"💎 Подписка: активна" if is_sub else "💎 Подписка: нет",fill=(255,120,220) if is_sub else (150,150,170),font=fs)
+    bx,by,bw,bh=40,440,W-80,24
+    il=correct-(lvl-1)*ANSWERS_PER_LEVEL
+    if lvl>=MAX_LEVEL: filled,bt=bw,"МАКС"
+    else: filled,bt=int(bw*il/ANSWERS_PER_LEVEL),f"{il}/{ANSWERS_PER_LEVEL}"
+    draw.rectangle([bx,by,bx+bw,by+bh],outline=(100,100,140),width=2)
+    if filled>0: draw.rectangle([bx+2,by+2,bx+filled-2,by+bh-2],fill=(255,215,0))
+    bbox=draw.textbbox((0,0),bt,font=fx); tw=bbox[2]-bbox[0]; th=bbox[3]-bbox[1]
+    draw.text((bx+(bw-tw)/2,by+(bh-th)/2-bbox[1]),bt,fill=(20,20,40),font=fx)
+    buf=io.BytesIO(); img.save(buf,format="PNG"); return buf.getvalue()
 async def get_http():
     global HTTP_SESSION
     if HTTP_SESSION is None or HTTP_SESSION.closed:
-        HTTP_SESSION = aiohttp.ClientSession(
-            timeout=aiohttp.ClientTimeout(total=15, connect=5),
-            connector=aiohttp.TCPConnector(limit=100, ttl_dns_cache=300),
-        )
+        HTTP_SESSION=aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15,connect=5),connector=aiohttp.TCPConnector(limit=100,ttl_dns_cache=300))
     return HTTP_SESSION
-
-
 async def close_http():
     global HTTP_SESSION
-    if HTTP_SESSION and not HTTP_SESSION.closed:
-        await HTTP_SESSION.close()
-
-
-async def safe_send(coro_func, *args, **kwargs):
+    if HTTP_SESSION and not HTTP_SESSION.closed: await HTTP_SESSION.close()
+async def safe_send(cf,*a,**kw):
     for _ in range(3):
-        try:
-            return await coro_func(*args, **kwargs)
-        except TelegramRetryAfter as e:
-            log.warning("FloodWait %s сек", e.retry_after)
-            await asyncio.sleep(e.retry_after + 1)
+        try: return await cf(*a,**kw)
+        except TelegramRetryAfter as e: log.warning("FloodWait %s",e.retry_after); await asyncio.sleep(e.retry_after+1)
         except TelegramBadRequest as e:
-            if "can't parse entities" in str(e) and "parse_mode" in kwargs:
-                kwargs.pop("parse_mode", None)
-                try:
-                    return await coro_func(*args, **kwargs)
-                except Exception:
-                    return None
-            log.warning("safe_send bad request: %s", e)
-            return None
-        except Exception as e:
-            log.warning("safe_send error: %s", e)
-            return None
+            if "can't parse entities" in str(e) and "parse_mode" in kw:
+                kw.pop("parse_mode",None)
+                try: return await cf(*a,**kw)
+                except Exception: return None
+            log.warning("safe_send: %s",e); return None
+        except Exception as e: log.warning("safe_send: %s",e); return None
     return None
-
-
-async def safe_edit(coro_func, *args, **kwargs):
-    try:
-        return await coro_func(*args, **kwargs)
+async def safe_edit(cf,*a,**kw):
+    try: return await cf(*a,**kw)
     except TelegramBadRequest as e:
-        s = str(e)
-        if "message is not modified" in s or "message to edit not found" in s:
-            return None
-        log.warning("safe_edit: %s", e)
-        return None
-    except Exception as e:
-        log.warning("safe_edit: %s", e)
-        return None
-
-
-def _rpc(name, params):
-    try:
-        return supabase.rpc(name, params).execute()
-    except Exception as e:
-        log.warning("rpc %s: %s", name, e)
-        return None
-
-
-# ===== ХАК: winners_count хранится в difficulty как "medium#w3" =====
-
-def _pack_difficulty(diff: str, winners: int) -> str:
-    diff = (diff or "medium").split("#")[0]
-    if int(winners) == 1:
-        return diff
-    return f"{diff}#w{int(winners)}"
-
-
-def _unpack_difficulty(raw: str):
-    raw = raw or "medium"
+        s=str(e)
+        if "message is not modified" in s or "message to edit not found" in s: return None
+        log.warning("safe_edit: %s",e); return None
+    except Exception as e: log.warning("safe_edit: %s",e); return None
+def _rpc(name,params):
+    try: return supabase.rpc(name,params).execute()
+    except Exception as e: log.warning("rpc %s: %s",name,e); return None
+def _pack_difficulty(diff,winners):
+    diff=(diff or "medium").split("#")[0]; return diff if int(winners)==1 else f"{diff}#w{int(winners)}"
+def _unpack_difficulty(raw):
+    raw=raw or "medium"
     if "#w" in raw:
-        d, w = raw.split("#w", 1)
-        try:
-            return (d or "medium"), int(w)
-        except ValueError:
-            return (d or "medium"), 1
-    return raw, 1
-
-
-# ===== БАЗА =====
-
-def get_player_sync(chat_id, user_id, username=None, first_name=None):
+        d,w=raw.split("#w",1)
+        try: return (d or "medium"),int(w)
+        except ValueError: return (d or "medium"),1
+    return raw,1
+def get_player_sync(cid,uid,un=None,fn=None):
     try:
-        res = supabase.table("quiz_players").select("*").eq("chat_id", chat_id).eq("user_id", user_id).execute()
+        res=supabase.table("quiz_players").select("*").eq("chat_id",cid).eq("user_id",uid).execute()
         if res.data:
-            row = res.data[0]
-            upd = {}
-            if not row.get("first_name") and first_name:
-                upd["first_name"] = first_name
-            if not row.get("username") and username:
-                upd["username"] = username
+            row=res.data[0]; upd={}
+            if not row.get("first_name") and fn: upd["first_name"]=fn
+            if not row.get("username") and un: upd["username"]=un
             if upd:
                 try:
-                    supabase.table("quiz_players").update(upd).eq("chat_id", chat_id).eq("user_id", user_id).execute()
-                    row.update(upd)
-                except Exception:
-                    pass
+                    supabase.table("quiz_players").update(upd).eq("chat_id",cid).eq("user_id",uid).execute(); row.update(upd)
+                except Exception: pass
             return row
-    except Exception as e:
-        log.warning("get_player select: %s", e)
-
+    except Exception as e: log.warning("get_player: %s",e)
+    try: supabase.table("quiz_players").insert({"chat_id":cid,"user_id":uid,"username":un,"first_name":fn}).execute()
+    except Exception as e: log.warning("get_player ins: %s",e)
+    return {"chat_id":cid,"user_id":uid,"username":un,"first_name":fn,"balance":0,"total_won":0,"correct_answers":0,"is_withdrawing":False}
+def add_score_sync(cid,uid):
+    r=_rpc("add_balance_atomic",{"p_chat_id":cid,"p_user_id":uid,"p_amount":0,"p_count_correct":True}); return bool(r and r.data)
+def add_balance_sync(cid,uid,amt,cc=False):
+    r=_rpc("add_balance_atomic",{"p_chat_id":cid,"p_user_id":uid,"p_amount":amt,"p_count_correct":cc}); return float(r.data) if r and r.data is not None else None
+def deduct_balance_sync(cid,uid,amt):
+    r=_rpc("deduct_balance_atomic",{"p_chat_id":cid,"p_user_id":uid,"p_amount":amt}); return bool(r and r.data is True)
+def try_lock_withdraw_sync(cid,uid):
+    r=_rpc("try_lock_withdraw",{"p_chat_id":cid,"p_user_id":uid}); return bool(r and r.data is True)
+def unlock_withdraw_sync(cid,uid): _rpc("unlock_withdraw",{"p_chat_id":cid,"p_user_id":uid})
+def withdrawn_today_sync(cid,uid):
+    r=_rpc("withdrawn_today",{"p_chat_id":cid,"p_user_id":uid}); return float(r.data) if r and r.data is not None else 0.0
+def log_house_income_sync(cid,amt,src):
+    try: supabase.table("quiz_house").insert({"chat_id":cid,"amount":amt,"source":src}).execute()
+    except Exception as e: log.warning("house: %s",e)
+def get_house_total_sync(cid=None):
     try:
-        supabase.table("quiz_players").insert({
-            "chat_id": chat_id, "user_id": user_id,
-            "username": username, "first_name": first_name,
-        }).execute()
-    except Exception as e:
-        log.warning("get_player insert: %s", e)
-    return {"chat_id": chat_id, "user_id": user_id, "username": username,
-            "first_name": first_name, "balance": 0, "total_won": 0,
-            "correct_answers": 0, "is_withdrawing": False}
-
-
-def add_score_sync(chat_id, user_id):
-    r = _rpc("add_balance_atomic", {"p_chat_id": chat_id, "p_user_id": user_id, "p_amount": 0, "p_count_correct": True})
-    return bool(r and r.data)
-
-
-def add_balance_sync(chat_id, user_id, amount, count_correct=False):
-    r = _rpc("add_balance_atomic", {"p_chat_id": chat_id, "p_user_id": user_id, "p_amount": amount, "p_count_correct": count_correct})
-    return float(r.data) if r and r.data is not None else None
-
-
-def deduct_balance_sync(chat_id, user_id, amount):
-    r = _rpc("deduct_balance_atomic", {"p_chat_id": chat_id, "p_user_id": user_id, "p_amount": amount})
-    return bool(r and r.data is True)
-
-
-def try_lock_withdraw_sync(chat_id, user_id):
-    r = _rpc("try_lock_withdraw", {"p_chat_id": chat_id, "p_user_id": user_id})
-    return bool(r and r.data is True)
-
-
-def unlock_withdraw_sync(chat_id, user_id):
-    _rpc("unlock_withdraw", {"p_chat_id": chat_id, "p_user_id": user_id})
-
-
-def withdrawn_today_sync(chat_id, user_id):
-    r = _rpc("withdrawn_today", {"p_chat_id": chat_id, "p_user_id": user_id})
-    return float(r.data) if r and r.data is not None else 0.0
-
-
-def log_house_income_sync(chat_id, amount, source):
-    try:
-        supabase.table("quiz_house").insert({"chat_id": chat_id, "amount": amount, "source": source}).execute()
-    except Exception as e:
-        log.warning("house_income: %s", e)
-
-
-def get_house_total_sync(chat_id=None):
-    try:
-        q = supabase.table("quiz_house").select("amount")
-        if chat_id is not None:
-            q = q.eq("chat_id", chat_id)
-        res = q.execute()
-        return sum(float(r["amount"]) for r in (res.data or []))
-    except Exception:
-        return 0.0
-
-
+        q=supabase.table("quiz_house").select("amount")
+        if cid is not None: q=q.eq("chat_id",cid)
+        return sum(float(r["amount"]) for r in (q.execute().data or []))
+    except Exception: return 0.0
 def get_house_by_source_sync():
     try:
-        res = supabase.table("quiz_house").select("amount,source").execute()
-        by = {}
-        for r in res.data or []:
-            by[r["source"]] = by.get(r["source"], 0.0) + float(r["amount"])
+        res=supabase.table("quiz_house").select("amount,source").execute(); by={}
+        for r in res.data or []: by[r["source"]]=by.get(r["source"],0.0)+float(r["amount"])
         return by
-    except Exception:
-        return {}
-
-
-def add_to_pot_sync(chat_id, amount):
+    except Exception: return {}
+def add_to_pot_sync(cid,amt):
     try:
-        res = supabase.table("quiz_pot").select("amount").eq("chat_id", chat_id).execute()
-        current = float(res.data[0]["amount"]) if res.data else 0.0
-        new_amount = round(current + amount, 4)
-        if res.data:
-            supabase.table("quiz_pot").update({"amount": new_amount}).eq("chat_id", chat_id).execute()
-        else:
-            supabase.table("quiz_pot").insert({"chat_id": chat_id, "amount": new_amount}).execute()
-        return new_amount
-    except Exception as e:
-        log.warning("add_to_pot: %s", e)
-        return None
-
-
-def payout_pot_sync(chat_id):
+        res=supabase.table("quiz_pot").select("amount").eq("chat_id",cid).execute(); cur=float(res.data[0]["amount"]) if res.data else 0.0; na=round(cur+amt,4)
+        if res.data: supabase.table("quiz_pot").update({"amount":na}).eq("chat_id",cid).execute()
+        else: supabase.table("quiz_pot").insert({"chat_id":cid,"amount":na}).execute()
+        return na
+    except Exception as e: log.warning("add_pot: %s",e); return None
+def payout_pot_sync(cid):
     try:
-        res = supabase.table("quiz_pot").select("amount").eq("chat_id", chat_id).execute()
-        if not res.data:
-            return 0.0
-        amount = float(res.data[0]["amount"])
-        supabase.table("quiz_pot").update({"amount": 0}).eq("chat_id", chat_id).execute()
-        return amount
-    except Exception as e:
-        log.warning("payout_pot: %s", e)
-        return 0.0
-
-
-def get_pot_sync(chat_id):
+        res=supabase.table("quiz_pot").select("amount").eq("chat_id",cid).execute()
+        if not res.data: return 0.0
+        amt=float(res.data[0]["amount"]); supabase.table("quiz_pot").update({"amount":0}).eq("chat_id",cid).execute(); return amt
+    except Exception: return 0.0
+def get_pot_sync(cid):
     try:
-        res = supabase.table("quiz_pot").select("amount").eq("chat_id", chat_id).execute()
-        return float(res.data[0]["amount"]) if res.data else 0.0
-    except Exception:
-        return 0.0
-
-
-def pot_take_sync(chat_id, amount):
+        res=supabase.table("quiz_pot").select("amount").eq("chat_id",cid).execute(); return float(res.data[0]["amount"]) if res.data else 0.0
+    except Exception: return 0.0
+def pot_take_sync(cid,amt):
     try:
-        res = supabase.table("quiz_pot").select("amount").eq("chat_id", chat_id).execute()
-        current = float(res.data[0]["amount"]) if res.data else 0.0
-        if current < amount:
-            return False, current
-        new_amount = round(current - amount, 4)
-        supabase.table("quiz_pot").update({"amount": new_amount}).eq("chat_id", chat_id).execute()
-        return True, new_amount
-    except Exception as e:
-        log.warning("pot_take: %s", e)
-        return False, 0.0
-
-
-def create_invoice_sync(client_invoice_id, user_id, chat_id, amount, message_id=None, kind="deposit"):
+        res=supabase.table("quiz_pot").select("amount").eq("chat_id",cid).execute(); cur=float(res.data[0]["amount"]) if res.data else 0.0
+        if cur<amt: return False,cur
+        na=round(cur-amt,4); supabase.table("quiz_pot").update({"amount":na}).eq("chat_id",cid).execute(); return True,na
+    except Exception: return False,0.0
+def create_invoice_sync(ciid,uid,cid,amt,mid=None,kind="deposit"):
     try:
-        res = supabase.table("quiz_invoices").insert({
-            "client_invoice_id": client_invoice_id, "user_id": user_id, "chat_id": chat_id,
-            "amount": amount, "message_id": message_id, "kind": kind,
-        }).execute()
-        return res.data[0]["id"] if res.data else None
-    except Exception as e:
-        log.warning("create_invoice: %s", e)
-        return None
-
-
-def mark_invoice_paid_sync(client_invoice_id):
+        res=supabase.table("quiz_invoices").insert({"client_invoice_id":ciid,"user_id":uid,"chat_id":cid,"amount":amt,"message_id":mid,"kind":kind}).execute(); return res.data[0]["id"] if res.data else None
+    except Exception as e: log.warning("inv: %s",e); return None
+def mark_invoice_paid_sync(ciid):
     try:
-        res = supabase.table("quiz_invoices").select("*").eq("client_invoice_id", client_invoice_id).execute()
-        if not res.data:
-            return None
-        inv = res.data[0]
-        if inv["status"] == "paid":
-            return None
-        supabase.table("quiz_invoices").update({
-            "status": "paid", "paid_at": datetime.now(timezone.utc).isoformat(),
-        }).eq("client_invoice_id", client_invoice_id).execute()
-        return inv
-    except Exception as e:
-        log.warning("mark_invoice_paid: %s", e)
-        return None
-
-
+        res=supabase.table("quiz_invoices").select("*").eq("client_invoice_id",ciid).execute()
+        if not res.data: return None
+        inv=res.data[0]
+        if inv["status"]=="paid": return None
+        supabase.table("quiz_invoices").update({"status":"paid","paid_at":datetime.now(timezone.utc).isoformat()}).eq("client_invoice_id",ciid).execute(); return inv
+    except Exception: return None
 def load_bans_sync():
     try:
-        res = supabase.table("quiz_bans").select("chat_id,user_id,banned_until").execute()
-        cache = {}
-        now = datetime.now(timezone.utc)
+        res=supabase.table("quiz_bans").select("chat_id,user_id,banned_until").execute(); cache={}; now=datetime.now(timezone.utc)
         for row in res.data or []:
-            bu = row.get("banned_until")
+            bu=row.get("banned_until")
             if bu:
                 try:
-                    until = datetime.fromisoformat(bu.replace("Z", "+00:00"))
-                    if until <= now:
-                        continue
-                except Exception:
-                    pass
-            cache.setdefault(int(row["chat_id"]), set()).add(int(row["user_id"]))
+                    u=datetime.fromisoformat(bu.replace("Z","+00:00"))
+                    if u<=now: continue
+                except Exception: pass
+            cache.setdefault(int(row["chat_id"]),set()).add(int(row["user_id"]))
         return cache
-    except Exception:
-        return {}
-
-
+    except Exception: return {}
 def load_subscribers_sync():
     try:
-        now_iso = datetime.now(timezone.utc).isoformat()
-        res = supabase.table("quiz_subscribers").select("chat_id,user_id").gt("expires_at", now_iso).execute()
-        cache = {}
-        for row in res.data or []:
-            cache.setdefault(int(row["chat_id"]), set()).add(int(row["user_id"]))
+        now_iso=datetime.now(timezone.utc).isoformat()
+        res=supabase.table("quiz_subscribers").select("chat_id,user_id").gt("expires_at",now_iso).execute(); cache={}
+        for row in res.data or []: cache.setdefault(int(row["chat_id"]),set()).add(int(row["user_id"]))
         return cache
-    except Exception:
-        return {}
-
-
-def ban_user_sync(chat_id, user_id, reason, admin_id, banned_until=None):
-    try:
-        supabase.table("quiz_bans").upsert({
-            "chat_id": chat_id, "user_id": user_id, "reason": reason,
-            "banned_by": admin_id, "banned_until": banned_until,
-        }).execute()
-    except Exception as e:
-        log.warning("ban: %s", e)
-
-
-def unban_user_sync(chat_id, user_id):
-    try:
-        supabase.table("quiz_bans").delete().eq("chat_id", chat_id).eq("user_id", user_id).execute()
-    except Exception:
-        pass
-
-
-def save_active_sync(chat_id, question, answers, is_multi):
-    try:
-        supabase.table("quiz_active").upsert({
-            "chat_id": chat_id, "question": question, "answer": "||".join(answers), "is_multi": is_multi,
-        }).execute()
-    except Exception:
-        pass
-
-
-def clear_active_sync(chat_id):
-    try:
-        supabase.table("quiz_active").delete().eq("chat_id", chat_id).execute()
-    except Exception:
-        pass
-
-
+    except Exception: return {}
+def ban_user_sync(cid,uid,reason,aid,bu=None):
+    try: supabase.table("quiz_bans").upsert({"chat_id":cid,"user_id":uid,"reason":reason,"banned_by":aid,"banned_until":bu}).execute()
+    except Exception as e: log.warning("ban: %s",e)
+def unban_user_sync(cid,uid):
+    try: supabase.table("quiz_bans").delete().eq("chat_id",cid).eq("user_id",uid).execute()
+    except Exception: pass
+def save_active_sync(cid,q,ans,im):
+    try: supabase.table("quiz_active").upsert({"chat_id":cid,"question":q,"answer":"||".join(ans),"is_multi":im}).execute()
+    except Exception: pass
+def clear_active_sync(cid):
+    try: supabase.table("quiz_active").delete().eq("chat_id",cid).execute()
+    except Exception: pass
 def load_active_sync():
-    try:
-        return supabase.table("quiz_active").select("*").execute().data or []
-    except Exception:
-        return []
-
-
+    try: return supabase.table("quiz_active").select("*").execute().data or []
+    except Exception: return []
 def unlock_all_withdrawals_sync():
+    try: supabase.table("quiz_players").update({"is_withdrawing":False}).eq("is_withdrawing",True).execute()
+    except Exception: pass
+def get_top_sync(cid,limit=10):
+    try: return supabase.table("quiz_players").select("user_id,username,first_name,balance,correct_answers").eq("chat_id",cid).order("correct_answers",desc=True).limit(limit).execute().data or []
+    except Exception: return []
+def get_top1_sync(cid):
+    r=get_top_sync(cid,1); return int(r[0]["user_id"]) if r else None
+def get_player_place_sync(cid,uid):
     try:
-        supabase.table("quiz_players").update({"is_withdrawing": False}).eq("is_withdrawing", True).execute()
-    except Exception:
-        pass
-
-
-def get_top_sync(chat_id, limit=10):
-    try:
-        res = supabase.table("quiz_players").select(
-            "user_id,username,first_name,balance,correct_answers"
-        ).eq("chat_id", chat_id).order("correct_answers", desc=True).limit(limit).execute()
-        return res.data or []
-    except Exception:
-        return []
-
-
-def get_top1_sync(chat_id):
-    rows = get_top_sync(chat_id, 1)
-    return int(rows[0]["user_id"]) if rows else None
-
-
-def get_player_place_sync(chat_id, user_id):
-    try:
-        me = supabase.table("quiz_players").select("correct_answers").eq(
-            "chat_id", chat_id).eq("user_id", user_id).execute()
-        if not me.data:
-            return None
-        my_ca = int(me.data[0]["correct_answers"])
-        above = supabase.table("quiz_players").select("user_id").eq(
-            "chat_id", chat_id).gt("correct_answers", my_ca).execute()
-        return len(above.data or []) + 1
-    except Exception:
-        return None
-
-
+        me=supabase.table("quiz_players").select("correct_answers").eq("chat_id",cid).eq("user_id",uid).execute()
+        if not me.data: return None
+        mca=int(me.data[0]["correct_answers"])
+        return len(supabase.table("quiz_players").select("user_id").eq("chat_id",cid).gt("correct_answers",mca).execute().data or [])+1
+    except Exception: return None
 def get_stats_sync():
     try:
-        players = supabase.table("quiz_players").select("balance,total_won,correct_answers").execute().data or []
-        payouts = supabase.table("quiz_payouts").select("amount,status").execute().data or []
-        bans = supabase.table("quiz_bans").select("user_id").execute().data or []
-        subs = supabase.table("quiz_subscribers").select("user_id").execute().data or []
-        return players, payouts, bans, subs
-    except Exception:
-        return [], [], [], []
-
-
+        p=supabase.table("quiz_players").select("balance,total_won,correct_answers").execute().data or []
+        po=supabase.table("quiz_payouts").select("amount,status").execute().data or []
+        b=supabase.table("quiz_bans").select("user_id").execute().data or []
+        s=supabase.table("quiz_subscribers").select("user_id").execute().data or []
+        return p,po,b,s
+    except Exception: return [],[],[],[]
 def get_payouts_sync(limit=20):
+    try: return supabase.table("quiz_payouts").select("*").order("created_at",desc=True).limit(limit).execute().data or []
+    except Exception: return []
+def log_payout_sync(cid,uid,amt,pid,st):
+    try: supabase.table("quiz_payouts").insert({"chat_id":cid,"user_id":uid,"amount":amt,"xrocket_payout_id":pid,"status":st}).execute()
+    except Exception as e: log.warning("log_payout: %s",e)
+def get_coins_stats_sync(cid=None):
     try:
-        return supabase.table("quiz_payouts").select("*").order("created_at", desc=True).limit(limit).execute().data or []
-    except Exception:
-        return []
-
-
-def log_payout_sync(chat_id, user_id, amount, payout_id, status):
+        pq=supabase.table("quiz_players").select("balance,correct_answers,user_id")
+        if cid is not None: pq=pq.eq("chat_id",cid)
+        p=pq.execute().data or []; tb=sum(float(x["balance"]) for x in p); tp=sum(int(x["correct_answers"]) for x in p)
+        pq2=supabase.table("quiz_payouts").select("amount,status")
+        if cid is not None: pq2=pq2.eq("chat_id",cid)
+        po=pq2.execute().data or []; tp2=sum(float(x["amount"]) for x in po if x["status"]=="finished")
+        hq=supabase.table("quiz_house").select("amount")
+        if cid is not None: hq=hq.eq("chat_id",cid)
+        h=hq.execute().data or []; th=sum(float(x["amount"]) for x in h)
+        return {"balance":tb,"points":tp,"players":len(p),"paid":tp2,"house":th}
+    except Exception as e: log.warning("coins: %s",e); return None
+def get_chat_settings_sync(cid):
     try:
-        supabase.table("quiz_payouts").insert({
-            "chat_id": chat_id, "user_id": user_id, "amount": amount,
-            "xrocket_payout_id": payout_id, "status": status,
-        }).execute()
+        res=supabase.table("quiz_settings").select("*").eq("chat_id",cid).execute()
+        if res.data: return res.data[0]
+    except Exception as e: log.warning("settings: %s",e)
+    d={"chat_id":cid,"difficulty":"medium"}
+    try:
+        ins=supabase.table("quiz_settings").insert(d).execute()
+        if ins.data: return ins.data[0]
     except Exception as e:
-        log.warning("log_payout: %s", e)
-
-
-def get_coins_stats_sync(chat_id=None):
-    try:
-        pq = supabase.table("quiz_players").select("balance,correct_answers,user_id")
-        if chat_id is not None:
-            pq = pq.eq("chat_id", chat_id)
-        players = pq.execute().data or []
-        total_balance = sum(float(p["balance"]) for p in players)
-        total_points = sum(int(p["correct_answers"]) for p in players)
-        pq2 = supabase.table("quiz_payouts").select("amount,status")
-        if chat_id is not None:
-            pq2 = pq2.eq("chat_id", chat_id)
-        payouts = pq2.execute().data or []
-        total_paid = sum(float(p["amount"]) for p in payouts if p["status"] == "finished")
-        hq = supabase.table("quiz_house").select("amount")
-        if chat_id is not None:
-            hq = hq.eq("chat_id", chat_id)
-        house = hq.execute().data or []
-        total_house = sum(float(h["amount"]) for h in house)
-        return {"balance": total_balance, "points": total_points,
-                "players": len(players), "paid": total_paid, "house": total_house}
-    except Exception as e:
-        log.warning("get_coins_stats: %s", e)
-        return None
-
-
-def get_chat_settings_sync(chat_id):
-    try:
-        res = supabase.table("quiz_settings").select("*").eq("chat_id", chat_id).execute()
-        if res.data:
-            return res.data[0]
-    except Exception as e:
-        log.warning("get_chat_settings select: %s", e)
-
-    default = {"chat_id": chat_id, "difficulty": "medium"}
-    try:
-        ins = supabase.table("quiz_settings").insert(default).execute()
-        if ins.data:
-            return ins.data[0]
-    except Exception as e:
-        log.warning("get_chat_settings insert: %s", e)
+        log.warning("settings ins: %s",e)
         try:
-            res = supabase.table("quiz_settings").select("*").eq("chat_id", chat_id).execute()
-            if res.data:
-                return res.data[0]
-        except Exception:
-            pass
-    return default
-
-
-def update_chat_setting_sync(chat_id, field, value):
+            res=supabase.table("quiz_settings").select("*").eq("chat_id",cid).execute()
+            if res.data: return res.data[0]
+        except Exception: pass
+    return d
+def update_chat_setting_sync(cid,f,v):
     try:
-        get_chat_settings_sync(chat_id)
-        supabase.table("quiz_settings").update({field: value}).eq("chat_id", chat_id).execute()
-        return True
-    except Exception as e:
-        log.warning("update_chat_setting (%s=%s): %s", field, value, e)
-        return False
-
-
-def tournament_create_sync(chat_id, prize):
+        get_chat_settings_sync(cid); supabase.table("quiz_settings").update({f:v}).eq("chat_id",cid).execute(); return True
+    except Exception as e: log.warning("upd_set: %s",e); return False
+def tournament_create_sync(cid,prize):
     try:
-        res = supabase.table("quiz_tournaments").insert({
-            "chat_id": chat_id, "prize": prize, "status": "active",
-        }).execute()
-        return res.data[0]["id"] if res.data else None
-    except Exception as e:
-        log.warning("tournament_create: %s", e)
-        return None
-
-
-def tournament_finish_sync(tid, winner_id):
+        res=supabase.table("quiz_tournaments").insert({"chat_id":cid,"prize":prize,"status":"active"}).execute(); return res.data[0]["id"] if res.data else None
+    except Exception as e: log.warning("t_create: %s",e); return None
+def tournament_finish_sync(tid,wid):
+    try: supabase.table("quiz_tournaments").update({"status":"finished","finished_at":datetime.now(timezone.utc).isoformat(),"winner_id":wid}).eq("id",tid).execute()
+    except Exception as e: log.warning("t_fin: %s",e)
+def get_t_settings_sync(cid):
     try:
-        supabase.table("quiz_tournaments").update({
-            "status": "finished", "finished_at": datetime.now(timezone.utc).isoformat(),
-            "winner_id": winner_id,
-        }).eq("id", tid).execute()
-    except Exception as e:
-        log.warning("tourn_finish: %s", e)
-
-
-def get_t_settings_sync(chat_id):
-    try:
-        res = supabase.table("quiz_tournament_settings").select("*").eq("chat_id", chat_id).execute()
+        res=supabase.table("quiz_tournament_settings").select("*").eq("chat_id",cid).execute()
         if res.data:
-            row = res.data[0]
-            diff, wc = _unpack_difficulty(row.get("difficulty", "medium"))
-            row["difficulty"] = diff
-            row["winners_count"] = wc
-            return row
-    except Exception as e:
-        log.warning("get_t_settings select: %s", e)
-
-    default = {"chat_id": chat_id, "question_seconds": 30, "questions": 10,
-               "prize": 0.30, "difficulty": "medium", "winners_count": 1}
+            row=res.data[0]; d,wc=_unpack_difficulty(row.get("difficulty","medium")); row["difficulty"]=d; row["winners_count"]=wc; return row
+    except Exception as e: log.warning("t_set: %s",e)
+    d={"chat_id":cid,"question_seconds":30,"questions":10,"prize":0.30,"difficulty":"medium","winners_count":1}
     try:
-        ins = supabase.table("quiz_tournament_settings").insert(default).execute()
+        ins=supabase.table("quiz_tournament_settings").insert(d).execute()
         if ins.data:
-            row = ins.data[0]
-            row["difficulty"] = "medium"
-            row["winners_count"] = 1
-            return row
+            row=ins.data[0]; row["difficulty"]="medium"; row["winners_count"]=1; return row
     except Exception as e:
-        log.warning("get_t_settings insert: %s", e)
+        log.warning("t_set ins: %s",e)
         try:
-            res = supabase.table("quiz_tournament_settings").select("*").eq("chat_id", chat_id).execute()
+            res=supabase.table("quiz_tournament_settings").select("*").eq("chat_id",cid).execute()
             if res.data:
-                row = res.data[0]
-                diff, wc = _unpack_difficulty(row.get("difficulty", "medium"))
-                row["difficulty"] = diff
-                row["winners_count"] = wc
-                return row
-        except Exception:
-            pass
-    return default
-
-
-def update_t_setting_sync(chat_id, field, value):
+                row=res.data[0]; dd,wc=_unpack_difficulty(row.get("difficulty","medium")); row["difficulty"]=dd; row["winners_count"]=wc; return row
+        except Exception: pass
+    return d
+def update_t_setting_sync(cid,f,v):
     try:
-        current = get_t_settings_sync(chat_id)
-
-        if field == "winners_count":
-            diff = current.get("difficulty", "medium")
-            new_diff = _pack_difficulty(diff, int(value))
-            supabase.table("quiz_tournament_settings").update(
-                {"difficulty": new_diff}
-            ).eq("chat_id", chat_id).execute()
-            return True
-
-        if field == "difficulty":
-            wc = current.get("winners_count", 1)
-            new_diff = _pack_difficulty(value, wc)
-            supabase.table("quiz_tournament_settings").update(
-                {"difficulty": new_diff}
-            ).eq("chat_id", chat_id).execute()
-            return True
-
-        supabase.table("quiz_tournament_settings").update(
-            {field: value}
-        ).eq("chat_id", chat_id).execute()
-        return True
-    except Exception as e:
-        log.warning("update_t_setting (%s=%s): %s", field, value, e)
-        return False
-
-
-def sponsor_add_sync(user_id, chat_id, question, answer, position):
+        cur=get_t_settings_sync(cid)
+        if f=="winners_count":
+            nd=_pack_difficulty(cur.get("difficulty","medium"),int(v)); supabase.table("quiz_tournament_settings").update({"difficulty":nd}).eq("chat_id",cid).execute(); return True
+        if f=="difficulty":
+            nd=_pack_difficulty(v,cur.get("winners_count",1)); supabase.table("quiz_tournament_settings").update({"difficulty":nd}).eq("chat_id",cid).execute(); return True
+        supabase.table("quiz_tournament_settings").update({f:v}).eq("chat_id",cid).execute(); return True
+    except Exception as e: log.warning("upd_t_set: %s",e); return False
+def sponsor_add_sync(uid,cid,q,a,pos):
     try:
-        res = supabase.table("quiz_sponsor_questions").insert({
-            "sponsor_id": user_id, "chat_id": chat_id, "question": question,
-            "answer": answer, "position": position,
-        }).execute()
-        return res.data[0]["id"] if res.data else None
-    except Exception as e:
-        log.warning("sponsor_add: %s", e)
-        return None
-
-
-def sponsor_get_next_sync(chat_id):
+        res=supabase.table("quiz_sponsor_questions").insert({"sponsor_id":uid,"chat_id":cid,"question":q,"answer":a,"position":pos}).execute(); return res.data[0]["id"] if res.data else None
+    except Exception as e: log.warning("sp_add: %s",e); return None
+def sponsor_get_next_sync(cid):
     try:
-        res = supabase.table("quiz_sponsor_questions").select("*").eq(
-            "chat_id", chat_id).eq("used", False).order("position").limit(1).execute()
-        if not res.data:
-            return None
-        return res.data[0]
-    except Exception as e:
-        log.warning("sponsor_get_next: %s", e)
-        return None
-
-
+        res=supabase.table("quiz_sponsor_questions").select("*").eq("chat_id",cid).eq("used",False).order("position").limit(1).execute(); return res.data[0] if res.data else None
+    except Exception: return None
 def sponsor_mark_used_sync(qid):
-    try:
-        supabase.table("quiz_sponsor_questions").update({"used": True}).eq("id", qid).execute()
-    except Exception as e:
-        log.warning("sponsor_mark_used: %s", e)
-
-
-# ===== ДНЕВНЫЕ КВЕСТЫ: SYNC =====
-
-def _today_local():
-    return datetime.now(TZ).date()
-
-
-def daily_get_all_sync(chat_id, user_id, day):
-    try:
-        res = (supabase.table("quiz_daily")
-               .select("quest_key,progress,claimed")
-               .eq("chat_id", chat_id).eq("user_id", user_id)
-               .eq("day", day.isoformat()).execute())
-        return {r["quest_key"]: {"progress": int(r["progress"]), "claimed": bool(r["claimed"])}
-                for r in (res.data or [])}
-    except Exception as e:
-        log.warning("daily_get_all: %s", e)
-        return {}
-
-
-def daily_add_progress_sync(chat_id, user_id, day, quest_key, amount=1):
-    try:
-        cur = (supabase.table("quiz_daily")
-               .select("progress,claimed")
-               .eq("chat_id", chat_id).eq("user_id", user_id)
-               .eq("day", day.isoformat()).eq("quest_key", quest_key).execute())
-        if cur.data:
-            row = cur.data[0]
-            if row.get("claimed"):
-                return True
-            new_progress = int(row["progress"]) + amount
-            supabase.table("quiz_daily").update({
-                "progress": new_progress,
-                "updated_at": datetime.now(timezone.utc).isoformat(),
-            }).eq("chat_id", chat_id).eq("user_id", user_id) \
-              .eq("day", day.isoformat()).eq("quest_key", quest_key).execute()
-        else:
-            supabase.table("quiz_daily").insert({
-                "chat_id": chat_id, "user_id": user_id,
-                "day": day.isoformat(), "quest_key": quest_key,
-                "progress": amount, "claimed": False,
-            }).execute()
-        return True
-    except Exception as e:
-        log.warning("daily_add_progress (%s): %s", quest_key, e)
-        return False
-
-
-def daily_claim_sync(chat_id, user_id, day, quest_key, reward):
-    try:
-        cur = (supabase.table("quiz_daily")
-               .select("progress,claimed")
-               .eq("chat_id", chat_id).eq("user_id", user_id)
-               .eq("day", day.isoformat()).eq("quest_key", quest_key).execute())
-        if not cur.data:
-            return False
-        row = cur.data[0]
-        if row.get("claimed"):
-            return False
-        target = DAILY_QUESTS.get(quest_key, {}).get("target", 1)
-        if int(row["progress"]) < target:
-            return False
-
-        upd = supabase.table("quiz_daily").update({
-            "claimed": True,
-            "updated_at": datetime.now(timezone.utc).isoformat(),
-        }).eq("chat_id", chat_id).eq("user_id", user_id) \
-          .eq("day", day.isoformat()).eq("quest_key", quest_key) \
-          .eq("claimed", False).execute()
-        if not upd.data:
-            return False
-
-        add_balance_sync(chat_id, user_id, reward)
-        return True
-    except Exception as e:
-        log.warning("daily_claim (%s): %s", quest_key, e)
-        return False
-
-
-def streak_get_sync(chat_id, user_id):
-    try:
-        res = (supabase.table("quiz_streak")
-               .select("streak,last_claim")
-               .eq("chat_id", chat_id).eq("user_id", user_id).execute())
-        if res.data:
-            r = res.data[0]
-            last = r.get("last_claim")
-            if last:
-                try:
-                    last = datetime.fromisoformat(str(last).replace("Z", "+00:00")).date()
-                except Exception:
-                    try:
-                        last = datetime.strptime(str(last), "%Y-%m-%d").date()
-                    except Exception:
-                        last = None
-            return int(r["streak"] or 0), last
-        return 0, None
-    except Exception as e:
-        log.warning("streak_get: %s", e)
-        return 0, None
-
-
-def streak_update_sync(chat_id, user_id, today, streak, last_claim):
-    try:
-        payload = {
-            "chat_id": chat_id, "user_id": user_id,
-            "streak": int(streak),
-            "last_claim": today.isoformat() if last_claim else None,
-            "updated_at": datetime.now(timezone.utc).isoformat(),
-        }
-        cur = (supabase.table("quiz_streak")
-               .select("chat_id")
-               .eq("chat_id", chat_id).eq("user_id", user_id).execute())
-        if cur.data:
-            supabase.table("quiz_streak").update(payload) \
-                .eq("chat_id", chat_id).eq("user_id", user_id).execute()
-        else:
-            supabase.table("quiz_streak").insert(payload).execute()
-        return True
-    except Exception as e:
-        log.warning("streak_update: %s", e)
-        return False
-
-
-def first_answer_marker_sync(chat_id, day):
-    try:
-        try:
-            supabase.table("quiz_daily").insert({
-                "chat_id": chat_id, "user_id": 0,
-                "day": day.isoformat(), "quest_key": "_first_answer_day",
-                "progress": 1, "claimed": True,
-            }).execute()
-            return True
-        except Exception:
-            return False
-    except Exception as e:
-        log.warning("first_answer_marker: %s", e)
-        return False
-
-
-# ===== ASYNC-ОБЁРТКИ =====
-
-async def get_player(cid, uid, un=None, fn=None):
-    return await asyncio.to_thread(get_player_sync, cid, uid, un, fn)
-
-
-async def add_score(cid, uid):
-    return await asyncio.to_thread(add_score_sync, cid, uid)
-
-
-async def add_balance(cid, uid, amt, count_correct=False):
-    return await asyncio.to_thread(add_balance_sync, cid, uid, amt, count_correct)
-
-
-async def deduct_balance(cid, uid, amt):
-    return await asyncio.to_thread(deduct_balance_sync, cid, uid, amt)
-
-
-async def try_lock_withdraw(cid, uid):
-    return await asyncio.to_thread(try_lock_withdraw_sync, cid, uid)
-
-
-async def unlock_withdraw(cid, uid):
-    await asyncio.to_thread(unlock_withdraw_sync, cid, uid)
-
-
-async def withdrawn_today(cid, uid):
-    return await asyncio.to_thread(withdrawn_today_sync, cid, uid)
-
-
-async def log_house_income(cid, amt, source):
-    await asyncio.to_thread(log_house_income_sync, cid, amt, source)
-
-
-async def get_house_total(cid=None):
-    return await asyncio.to_thread(get_house_total_sync, cid)
-
-
-async def get_house_by_source():
-    return await asyncio.to_thread(get_house_by_source_sync)
-
-
-async def add_to_pot(cid, amt):
-    return await asyncio.to_thread(add_to_pot_sync, cid, amt)
-
-
-async def payout_pot(cid):
-    return await asyncio.to_thread(payout_pot_sync, cid)
-
-
-async def get_pot(cid):
-    return await asyncio.to_thread(get_pot_sync, cid)
-
-
-async def pot_take(cid, amt):
-    return await asyncio.to_thread(pot_take_sync, cid, amt)
-
-
-async def create_invoice(client_invoice_id, uid, cid, amt, message_id=None, kind="deposit"):
-    return await asyncio.to_thread(create_invoice_sync, client_invoice_id, uid, cid, amt, message_id, kind)
-
-
-async def mark_invoice_paid(client_invoice_id):
-    return await asyncio.to_thread(mark_invoice_paid_sync, client_invoice_id)
-
-
-async def get_top1(cid):
-    return await asyncio.to_thread(get_top1_sync, cid)
-
-
-async def get_player_place(cid, uid):
-    return await asyncio.to_thread(get_player_place_sync, cid, uid)
-
-
-async def get_coins_stats(cid=None):
-    return await asyncio.to_thread(get_coins_stats_sync, cid)
-
-
+    try: supabase.table("quiz_sponsor_questions").update({"used":True}).eq("id",qid).execute()
+    except Exception: pass
+async def get_player(cid,uid,un=None,fn=None): return await asyncio.to_thread(get_player_sync,cid,uid,un,fn)
+async def add_score(cid,uid): return await asyncio.to_thread(add_score_sync,cid,uid)
+async def add_balance(cid,uid,amt,cc=False): return await asyncio.to_thread(add_balance_sync,cid,uid,amt,cc)
+async def deduct_balance(cid,uid,amt): return await asyncio.to_thread(deduct_balance_sync,cid,uid,amt)
+async def try_lock_withdraw(cid,uid): return await asyncio.to_thread(try_lock_withdraw_sync,cid,uid)
+async def unlock_withdraw(cid,uid): await asyncio.to_thread(unlock_withdraw_sync,cid,uid)
+async def withdrawn_today(cid,uid): return await asyncio.to_thread(withdrawn_today_sync,cid,uid)
+async def log_house_income(cid,amt,src): await asyncio.to_thread(log_house_income_sync,cid,amt,src)
+async def get_house_total(cid=None): return await asyncio.to_thread(get_house_total_sync,cid)
+async def get_house_by_source(): return await asyncio.to_thread(get_house_by_source_sync)
+async def add_to_pot(cid,amt): return await asyncio.to_thread(add_to_pot_sync,cid,amt)
+async def payout_pot(cid): return await asyncio.to_thread(payout_pot_sync,cid)
+async def get_pot(cid): return await asyncio.to_thread(get_pot_sync,cid)
+async def pot_take(cid,amt): return await asyncio.to_thread(pot_take_sync,cid,amt)
+async def create_invoice(ciid,uid,cid,amt,mid=None,kind="deposit"): return await asyncio.to_thread(create_invoice_sync,ciid,uid,cid,amt,mid,kind)
+async def mark_invoice_paid(ciid): return await asyncio.to_thread(mark_invoice_paid_sync,ciid)
+async def get_top1(cid): return await asyncio.to_thread(get_top1_sync,cid)
+async def get_player_place(cid,uid): return await asyncio.to_thread(get_player_place_sync,cid,uid)
+async def get_coins_stats(cid=None): return await asyncio.to_thread(get_coins_stats_sync,cid)
 async def get_chat_settings(cid):
-    now = time.time()
-    cached = _CHAT_SETTINGS_CACHE.get(cid)
-    if cached and now - cached[1] < CHAT_SETTINGS_TTL:
-        return cached[0]
-    data = await asyncio.to_thread(get_chat_settings_sync, cid)
-    _CHAT_SETTINGS_CACHE[cid] = (data, now)
-    return data
-
-
-async def update_chat_setting(cid, field, value):
-    ok = await asyncio.to_thread(update_chat_setting_sync, cid, field, value)
-    _CHAT_SETTINGS_CACHE.pop(cid, None)
-    return ok
-
-
-async def tournament_create(cid, prize):
-    return await asyncio.to_thread(tournament_create_sync, cid, prize)
-
-
-async def tournament_finish(tid, winner_id):
-    await asyncio.to_thread(tournament_finish_sync, tid, winner_id)
-
-
-async def get_t_settings(cid):
-    return await asyncio.to_thread(get_t_settings_sync, cid)
-
-
-async def update_t_setting(cid, field, value):
-    return await asyncio.to_thread(update_t_setting_sync, cid, field, value)
-
-
-async def sponsor_add(uid, cid, q, a, pos):
-    return await asyncio.to_thread(sponsor_add_sync, uid, cid, q, a, pos)
-
-
-async def sponsor_get_next(cid):
-    return await asyncio.to_thread(sponsor_get_next_sync, cid)
-
-
-async def sponsor_mark_used(qid):
-    await asyncio.to_thread(sponsor_mark_used_sync, qid)
-
-
-async def daily_get_all(cid, uid, day):
-    return await asyncio.to_thread(daily_get_all_sync, cid, uid, day)
-
-
-async def daily_add_progress(cid, uid, day, key, amount=1):
-    return await asyncio.to_thread(daily_add_progress_sync, cid, uid, day, key, amount)
-
-
-async def daily_claim(cid, uid, day, key, reward):
-    return await asyncio.to_thread(daily_claim_sync, cid, uid, day, key, reward)
-
-
-async def streak_get(cid, uid):
-    return await asyncio.to_thread(streak_get_sync, cid, uid)
-
-
-async def streak_update(cid, uid, today, streak, last_claim):
-    return await asyncio.to_thread(streak_update_sync, cid, uid, today, streak, last_claim)
-
-
-async def first_answer_marker(cid, day):
-    return await asyncio.to_thread(first_answer_marker_sync, cid, day)
-
-
-def is_banned_cached(cid, uid):
-    return uid in BANNED_CACHE.get(cid, set())
-
-
-def is_subscriber_cached(cid, uid):
-    return uid in SUBSCRIBERS_CACHE.get(cid, set())
-
-
-async def ban_user(cid, uid, reason, admin_id, banned_until=None):
-    await asyncio.to_thread(ban_user_sync, cid, uid, reason, admin_id, banned_until)
-    BANNED_CACHE.setdefault(cid, set()).add(uid)
-
-
-async def unban_user(cid, uid):
-    await asyncio.to_thread(unban_user_sync, cid, uid)
-    BANNED_CACHE.get(cid, set()).discard(uid)
-
-
-async def save_active(cid, q, answers, is_multi):
-    await asyncio.to_thread(save_active_sync, cid, q, answers, is_multi)
-
-
-async def clear_active(cid):
-    await asyncio.to_thread(clear_active_sync, cid)
-
-
-async def get_top(cid, limit=10):
-    return await asyncio.to_thread(get_top_sync, cid, limit)
-
-
-async def get_stats():
-    return await asyncio.to_thread(get_stats_sync)
-
-
-async def get_payouts(limit=20):
-    return await asyncio.to_thread(get_payouts_sync, limit)
-
-
-async def log_payout(cid, uid, amt, pid, status):
-    await asyncio.to_thread(log_payout_sync, cid, uid, amt, pid, status)
-
-
-# ===== xROCKET =====
-
-async def xrocket_payout(cid, uid, amount):
-    if not XROCKET_API_KEY:
-        return False, "XROCKET_API_KEY не задан"
-    payload = {
-        "clientPayoutId": f"quiz_{cid}_{uid}_{int(datetime.now().timestamp()*1000)}",
-        "target": str(uid), "targetType": "telegram_user_id",
-        "asset": "USDT", "amount": f"{amount:.4f}", "description": "Quiz reward",
-    }
+    now=time.time(); c=_CHAT_SETTINGS_CACHE.get(cid)
+    if c and now-c[1]<CHAT_SETTINGS_TTL: return c[0]
+    d=await asyncio.to_thread(get_chat_settings_sync,cid); _CHAT_SETTINGS_CACHE[cid]=(d,now); return d
+async def update_chat_setting(cid,f,v):
+    ok=await asyncio.to_thread(update_chat_setting_sync,cid,f,v); _CHAT_SETTINGS_CACHE.pop(cid,None); return ok
+async def tournament_create(cid,prize): return await asyncio.to_thread(tournament_create_sync,cid,prize)
+async def tournament_finish(tid,wid): await asyncio.to_thread(tournament_finish_sync,tid,wid)
+async def get_t_settings(cid): return await asyncio.to_thread(get_t_settings_sync,cid)
+async def update_t_setting(cid,f,v): return await asyncio.to_thread(update_t_setting_sync,cid,f,v)
+async def sponsor_add(uid,cid,q,a,pos): return await asyncio.to_thread(sponsor_add_sync,uid,cid,q,a,pos)
+async def sponsor_get_next(cid): return await asyncio.to_thread(sponsor_get_next_sync,cid)
+async def sponsor_mark_used(qid): await asyncio.to_thread(sponsor_mark_used_sync,qid)
+def is_banned_cached(cid,uid): return uid in BANNED_CACHE.get(cid,set())
+def is_subscriber_cached(cid,uid): return uid in SUBSCRIBERS_CACHE.get(cid,set())
+async def ban_user(cid,uid,reason,aid,bu=None):
+    await asyncio.to_thread(ban_user_sync,cid,uid,reason,aid,bu); BANNED_CACHE.setdefault(cid,set()).add(uid)
+async def unban_user(cid,uid):
+    await asyncio.to_thread(unban_user_sync,cid,uid); BANNED_CACHE.get(cid,set()).discard(uid)
+async def save_active(cid,q,a,im): await asyncio.to_thread(save_active_sync,cid,q,a,im)
+async def clear_active(cid): await asyncio.to_thread(clear_active_sync,cid)
+async def get_top(cid,limit=10): return await asyncio.to_thread(get_top_sync,cid,limit)
+async def get_stats(): return await asyncio.to_thread(get_stats_sync)
+async def get_payouts(limit=20): return await asyncio.to_thread(get_payouts_sync,limit)
+async def log_payout(cid,uid,amt,pid,st): await asyncio.to_thread(log_payout_sync,cid,uid,amt,pid,st)
+async def xrocket_payout(cid,uid,amount):
+    if not XROCKET_API_KEY: return False,"XROCKET_API_KEY не задан"
+    payload={"clientPayoutId":f"quiz_{cid}_{uid}_{int(datetime.now().timestamp()*1000)}","target":str(uid),"targetType":"telegram_user_id","asset":"USDT","amount":f"{amount:.4f}","description":"Quiz reward"}
     try:
-        s = await get_http()
-        async with s.post(
-            f"{XROCKET_BASE}/api/v1/payouts",
-            headers={"Authorization": f"Bearer {XROCKET_API_KEY}", "Content-Type": "application/json"},
-            json=payload,
-        ) as r:
-            data = await r.json()
-            log.info("xRocket [%s] %s", r.status, data)
-            if r.status in (200, 201):
-                return True, data.get("payoutId") or data.get("id") or "ok"
-            return False, data.get("detail") or data.get("title") or str(data)
-    except Exception as e:
-        return False, str(e)
-
-
-async def xrocket_create_invoice(client_invoice_id: str, amount: float, description: str):
-    if not XROCKET_API_KEY:
-        return False, "XROCKET_API_KEY не задан"
-    payload = {
-        "priceAmount": f"{amount:.4f}", "priceCurrency": "USDT", "numPayments": 1,
-        "clientInvoiceId": client_invoice_id, "description": description[:1000], "expiresIn": 3600000,
-    }
+        s=await get_http()
+        async with s.post(f"{XROCKET_BASE}/api/v1/payouts",headers={"Authorization":f"Bearer {XROCKET_API_KEY}","Content-Type":"application/json"},json=payload) as r:
+            data=await r.json(); log.info("xRocket [%s] %s",r.status,data)
+            if r.status in (200,201): return True,data.get("payoutId") or data.get("id") or "ok"
+            return False,data.get("detail") or data.get("title") or str(data)
+    except Exception as e: return False,str(e)
+async def xrocket_create_invoice(ciid,amount,desc):
+    if not XROCKET_API_KEY: return False,"XROCKET_API_KEY не задан"
+    payload={"priceAmount":f"{amount:.4f}","priceCurrency":"USDT","numPayments":1,"clientInvoiceId":ciid,"description":desc[:1000],"expiresIn":3600000}
     try:
-        s = await get_http()
-        async with s.post(
-            f"{XROCKET_BASE}/api/v1/invoices",
-            headers={"Authorization": f"Bearer {XROCKET_API_KEY}", "Content-Type": "application/json"},
-            json=payload,
-        ) as r:
-            data = await r.json()
-            log.info("xRocket invoice [%s] %s", r.status, data)
-            if r.status in (200, 201):
-                inv_id = data.get("id")
-                url = data.get("links", {}).get("telegramBotLink") or f"https://t.me/xRocket?start={inv_id}"
-                return True, url
-            return False, data.get("detail") or data.get("title") or str(data)
-    except Exception as e:
-        return False, str(e)
-
-
-def verify_webhook_signature(raw_body, signature, timestamp, secret):
-    if not signature or not timestamp or not secret:
-        return False
+        s=await get_http()
+        async with s.post(f"{XROCKET_BASE}/api/v1/invoices",headers={"Authorization":f"Bearer {XROCKET_API_KEY}","Content-Type":"application/json"},json=payload) as r:
+            data=await r.json(); log.info("xRocket inv [%s] %s",r.status,data)
+            if r.status in (200,201):
+                iid=data.get("id"); return True,data.get("links",{}).get("telegramBotLink") or f"https://t.me/xRocket?start={iid}"
+            return False,data.get("detail") or data.get("title") or str(data)
+    except Exception as e: return False,str(e)
+def verify_webhook_signature(raw,sig,ts,secret):
+    if not sig or not ts or not secret: return False
+    try: tsi=int(ts)
+    except (ValueError,TypeError): return False
+    if tsi>10_000_000_000: tsi//=1000
+    if abs(int(time.time())-tsi)>WEBHOOK_MAX_AGE_SEC: log.warning("ts old"); return False
+    signed=f"{ts}.{raw.decode('utf-8')}"; exp=hmac.new(secret.encode(),signed.encode(),hashlib.sha256).hexdigest(); return hmac.compare_digest(exp,sig)
+async def handle_webhook(request):
     try:
-        ts = int(timestamp)
-    except (ValueError, TypeError):
-        return False
-    if ts > 10_000_000_000:
-        ts //= 1000
-    if abs(int(time.time()) - ts) > WEBHOOK_MAX_AGE_SEC:
-        log.warning("Webhook: timestamp устарел (%s)", timestamp)
-        return False
-    signed = f"{timestamp}.{raw_body.decode('utf-8')}"
-    expected = hmac.new(secret.encode(), signed.encode(), hashlib.sha256).hexdigest()
-    return hmac.compare_digest(expected, signature)
-
-
-async def handle_webhook(request: web.Request) -> web.Response:
-    try:
-        raw_body = await request.read()
-        signature = request.headers.get("Signature", "")
-        sig_version = request.headers.get("Signature-Version", "")
-        sig_timestamp = request.headers.get("Signature-Timestamp", "")
-
-        if sig_version != "v1":
-            return web.Response(status=401, text="bad version")
-        if not verify_webhook_signature(raw_body, signature, sig_timestamp, XROCKET_WEBHOOK_SECRET):
-            return web.Response(status=401, text="bad signature")
-
-        try:
-            event = json.loads(raw_body)
-        except Exception:
-            return web.Response(status=400, text="bad json")
-
-        ev_type = event.get("type")
-        data = event.get("data", {})
-        log.info("Webhook: type=%s", ev_type)
-
-        if ev_type == "invoice":
-            if data.get("event") == "invoice_status_changed":
-                inv = data.get("invoice", {})
-                if inv.get("status") == "paid":
-                    cid = inv.get("clientInvoiceId")
-                    if cid:
-                        await process_paid_invoice(cid)
-
-        return web.Response(status=200, text="ok")
-    except Exception as e:
-        log.error("Webhook error: %s", e)
-        return web.Response(status=200, text="ok")
-
-
-async def process_paid_invoice(client_invoice_id: str):
-    inv = await mark_invoice_paid(client_invoice_id)
-    if not inv:
+        raw=await request.read(); sig=request.headers.get("Signature",""); ver=request.headers.get("Signature-Version",""); ts=request.headers.get("Signature-Timestamp","")
+        if ver!="v1": return web.Response(status=401,text="bad version")
+        if not verify_webhook_signature(raw,sig,ts,XROCKET_WEBHOOK_SECRET): return web.Response(status=401,text="bad sig")
+        try: event=json.loads(raw)
+        except Exception: return web.Response(status=400,text="bad json")
+        et=event.get("type"); data=event.get("data",{}); log.info("Webhook: %s",et)
+        if et=="invoice" and data.get("event")=="invoice_status_changed":
+            inv=data.get("invoice",{})
+            if inv.get("status")=="paid":
+                ciid=inv.get("clientInvoiceId")
+                if ciid: await process_paid_invoice(ciid)
+        return web.Response(status=200,text="ok")
+    except Exception as e: log.error("Webhook: %s",e); return web.Response(status=200,text="ok")
+async def process_paid_invoice(ciid):
+    inv=await mark_invoice_paid(ciid)
+    if not inv: return
+    uid=int(inv["user_id"]); cid=int(inv["chat_id"]) if inv.get("chat_id") else uid
+    amt=float(inv["amount"]); mid=inv.get("message_id"); kind=inv.get("kind") or "deposit"
+    if kind=="sponsor":
+        SPONSOR_SESSION[uid]={"chat_id":None,"collected":0,"target":SPONSOR_QUESTIONS}
+        try: await bot.send_message(uid,f"✅ <b>Оплата ${amt:.2f} получена!</b>\n\nТеперь напиши <b>ID чата</b>.\n<i>(напр: -1002712583382)</i>")
+        except Exception: pass
         return
-
-    user_id = int(inv["user_id"])
-    chat_id = int(inv["chat_id"]) if inv.get("chat_id") else user_id
-    amount = float(inv["amount"])
-    msg_id = inv.get("message_id")
-    kind = inv.get("kind") or "deposit"
-
-    if kind == "sponsor":
-        SPONSOR_SESSION[user_id] = {"chat_id": None, "collected": 0, "target": SPONSOR_QUESTIONS}
-        try:
-            await bot.send_message(user_id,
-                f"✅ <b>Оплата ${amount:.2f} получена!</b>\n\n"
-                f"Теперь напиши <b>ID чата</b>, куда постить вопросы.\n"
-                f"<i>(например: -1002712583382)</i>")
-        except Exception:
-            pass
-        return
-
-    new_balance = await add_balance(chat_id, user_id, amount)
-    if new_balance is None:
-        p = await get_player(chat_id, user_id)
-        new_balance = float(p.get("balance", 0))
-
-    # === КВЕСТЫ: депозиты ===
-    day = _today_local()
-    if amount >= 0.50:
-        await daily_add_progress(chat_id, user_id, day, "deposit_050", 1)
-    if amount >= 2.00:
-        await daily_add_progress(chat_id, user_id, day, "deposit_2", 1)
-
-    if msg_id:
-        try:
-            await bot.edit_message_text(
-                chat_id=chat_id, message_id=int(msg_id),
-                text=(f"✅ <b>Пополнение успешно!</b>\n\n"
-                      f"💳 Зачислено: <b>${amount:.4f}</b> USDT\n"
-                      f"💰 Баланс: <b>${new_balance:.4f}</b>\n\n"
-                      f"<i>Спасибо!</i>"))
-        except Exception:
-            pass
-
-    try:
-        await bot.send_message(user_id,
-            f"✅ <b>Баланс пополнен!</b>\n\n"
-            f"💰 Сумма: <b>${amount:.4f}</b>\n💼 Баланс: <b>${new_balance:.4f}</b>")
-    except Exception:
-        pass
-
-
+    nb=await add_balance(cid,uid,amt)
+    if nb is None:
+        p=await get_player(cid,uid); nb=float(p.get("balance",0))
+    if mid:
+        try: await bot.edit_message_text(chat_id=cid,message_id=int(mid),text=f"✅ <b>Пополнение успешно!</b>\n\n💳 Зачислено: <b>${amt:.4f}</b> USDT\n💰 Баланс: <b>${nb:.4f}</b>\n\n<i>Спасибо!</i>")
+        except Exception: pass
+    try: await bot.send_message(uid,f"✅ <b>Баланс пополнен!</b>\n\n💰 Сумма: <b>${amt:.4f}</b>\n💼 Баланс: <b>${nb:.4f}</b>")
+    except Exception: pass
 async def start_webhook_server():
-    app = web.Application()
-    app.router.add_post("/webhook", handle_webhook)
-    app.router.get("/", lambda r: web.Response(text="ok"))
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", PORT)
-    await site.start()
-    log.info("Webhook-сервер на порту %s", PORT)
-
-
-# ===== ВИКТОРИНА =====
-
-async def ask_question(chat_id):
-    if chat_id in TOURNAMENT_ACTIVE:
-        return False
-
-    chat_settings = await get_chat_settings(chat_id)
-    difficulty = chat_settings.get("difficulty", "medium")
-    diff_label = DIFFICULTY_LABELS.get(difficulty, "🟡 Средне")
-
-    sponsor_q = await sponsor_get_next(chat_id)
-    if sponsor_q:
-        q = sponsor_q["question"]
-        answers = [sponsor_q["answer"].lower()]
-        is_multi = False
-        is_image = False
-        await sponsor_mark_used(sponsor_q["id"])
-        sponsor_note = "\n🎁 <i>Спонсорский вопрос</i>"
+    app=web.Application(); app.router.add_post("/webhook",handle_webhook); app.router.get("/",lambda r: web.Response(text="ok"))
+    runner=web.AppRunner(app); await runner.setup(); site=web.TCPSite(runner,"0.0.0.0",PORT); await site.start(); log.info("Webhook on %s",PORT)
+async def ask_question(cid):
+    if cid in TOURNAMENT_ACTIVE: return False
+    cs=await get_chat_settings(cid); diff=cs.get("difficulty","medium"); dl=DIFFICULTY_LABELS.get(diff,"🟡 Средне")
+    sq=await sponsor_get_next(cid)
+    if sq:
+        q=sq["question"]; answers=[sq["answer"].lower()]; is_multi=False; is_image=False
+        await sponsor_mark_used(sq["id"]); sn="\n🎁 <i>Спонсорский вопрос</i>"
     else:
-        q, answers, is_multi, is_image = random_question(difficulty=difficulty)
-        sponsor_note = ""
-
-    ACTIVE_QUESTIONS[chat_id] = {"question": q, "answers": answers, "is_multi": is_multi, "timer": False, "timer_task": None}
-    await save_active(chat_id, q, answers, is_multi)
-
-    pot = await get_pot(chat_id)
-    pot_line = f"\n🎰 Копилка: <b>${pot:.3f}</b>" if pot >= 0.01 else ""
-
-    use_timer = random.random() < TIMER_PROBABILITY
-    if use_timer:
-        ACTIVE_QUESTIONS[chat_id]["timer"] = True
-        timer_line = f"\n⏱ <b>Таймер: {TIMER_SECONDS} сек!</b>"
-    else:
-        timer_line = ""
-
-    try:
-        await bot.send_chat_action(chat_id, "typing")
-    except Exception:
-        pass
-
+        q,answers,is_multi,is_image=random_question(difficulty=diff); sn=""
+    ACTIVE_QUESTIONS[cid]={"question":q,"answers":answers,"is_multi":is_multi,"timer":False,"timer_task":None}
+    await save_active(cid,q,answers,is_multi)
+    pot=await get_pot(cid); pl=f"\n🎰 Копилка: <b>${pot:.3f}</b>" if pot>=0.01 else ""
+    ut=random.random()<TIMER_PROBABILITY
+    if ut: ACTIVE_QUESTIONS[cid]["timer"]=True; tl=f"\n⏱ <b>Таймер: {TIMER_SECONDS} сек!</b>"
+    else: tl=""
+    try: await bot.send_chat_action(cid,"typing")
+    except Exception: pass
     try:
         if is_image:
-            png = render_question_image(q)
-            buf = BufferedInputFile(png, filename="q.png")
-            caption = (f"🧠 <b>Вопрос!</b>{sponsor_note}\n\n"
-                       f"{diff_label} · 🏆 +1 очко за правильный\n"
-                       f"🔓 Вопрос открыт до правильного ответа.{pot_line}{timer_line}")
-            msg = await safe_send(bot.send_photo, chat_id, buf, caption=caption)
+            png=render_question_image(q); buf=BufferedInputFile(png,filename="q.png")
+            cap=f"🧠 <b>Вопрос!</b>{sn}\n\n{dl} · 🏆 +1 очко\n🔓 Вопрос открыт до правильного ответа.{pl}{tl}"
+            msg=await safe_send(bot.send_photo,cid,buf,caption=cap)
         else:
-            msg = await safe_send(bot.send_message, chat_id,
-                f"🧠 <b>Вопрос!</b>{sponsor_note}\n\n❓ {q}\n\n"
-                f"{diff_label} · 🏆 +1 очко за правильный\n"
-                f"🔓 Вопрос открыт до правильного ответа.{pot_line}{timer_line}")
+            msg=await safe_send(bot.send_message,cid,f"🧠 <b>Вопрос!</b>{sn}\n\n❓ {q}\n\n{dl} · 🏆 +1 очко\n🔓 Вопрос открыт до правильного ответа.{pl}{tl}")
         if msg:
-            try:
-                await bot.set_message_reaction(chat_id, msg.message_id, ["🧠"])
-            except Exception:
-                pass
-
-        if use_timer:
-            async def timer_task():
-                await asyncio.sleep(TIMER_SECONDS)
-                cur = ACTIVE_QUESTIONS.get(chat_id)
+            try: await bot.set_message_reaction(cid,msg.message_id,["🧠"])
+            except Exception: pass
+        if ut:
+            async def tt():
+                await asyncio.sleep(TIMER_SECONDS); cur=ACTIVE_QUESTIONS.get(cid)
                 if cur and cur.get("timer"):
-                    ACTIVE_QUESTIONS.pop(chat_id, None)
-                    await clear_active(chat_id)
-                    await safe_send(bot.send_message, chat_id,
-                        f"⌛ <b>Время вышло!</b>\nОтвет: <b>{answers[0]}</b>")
-            ACTIVE_QUESTIONS[chat_id]["timer_task"] = asyncio.create_task(timer_task())
+                    ACTIVE_QUESTIONS.pop(cid,None); await clear_active(cid); await safe_send(bot.send_message,cid,f"⌛ <b>Время вышло!</b>\nОтвет: <b>{answers[0]}</b>")
+            ACTIVE_QUESTIONS[cid]["timer_task"]=asyncio.create_task(tt())
         return True
-    except Exception as e:
-        log.warning("send_question: %s", e)
-        return False
-
-
+    except Exception as e: log.warning("ask: %s",e); return False
 def next_run_time(now):
     for h in WORK_HOURS:
-        target = now.replace(hour=h, minute=0, second=5, microsecond=0)
-        if target > now:
-            return target
-    return (now + timedelta(days=1)).replace(hour=WORK_HOURS[0], minute=0, second=5, microsecond=0)
-
-
+        t=now.replace(hour=h,minute=0,second=5,microsecond=0)
+        if t>now: return t
+    return (now+timedelta(days=1)).replace(hour=WORK_HOURS[0],minute=0,second=5,microsecond=0)
 async def question_scheduler():
     await asyncio.sleep(10)
     while True:
-        now = datetime.now(TZ)
-        target = next_run_time(now)
-        wait = (target - now).total_seconds()
-        log.info("Следующий вопрос в %s (через %.0f сек)", target.strftime("%H:%M:%S"), wait)
-        await asyncio.sleep(max(1, wait))
-        if QUIZ_ENABLED:
-            await asyncio.gather(*[ask_question(c) for c in list(QUIZ_ENABLED)], return_exceptions=True)
+        now=datetime.now(TZ); t=next_run_time(now); w=(t-now).total_seconds()
+        log.info("Next Q at %s (in %.0f)",t.strftime("%H:%M:%S"),w); await asyncio.sleep(max(1,w))
+        if QUIZ_ENABLED: await asyncio.gather(*[ask_question(c) for c in list(QUIZ_ENABLED)],return_exceptions=True)
         await asyncio.sleep(60)
-
-
 async def caches_refresh_loop():
-    global BANNED_CACHE, SUBSCRIBERS_CACHE
+    global BANNED_CACHE,SUBSCRIBERS_CACHE
     while True:
         try:
-            BANNED_CACHE = await asyncio.to_thread(load_bans_sync)
-            SUBSCRIBERS_CACHE = await asyncio.to_thread(load_subscribers_sync)
-        except Exception as e:
-            log.warning("caches refresh: %s", e)
+            BANNED_CACHE=await asyncio.to_thread(load_bans_sync); SUBSCRIBERS_CACHE=await asyncio.to_thread(load_subscribers_sync)
+        except Exception as e: log.warning("cache: %s",e)
         await asyncio.sleep(60)
-
-
-async def distribute_pot(cid, reason="manual"):
-    amount = await payout_pot(cid)
-    if amount < 0.01:
-        return False, "Копилка пуста (меньше $0.01)"
-    rows = await get_top(cid, 10)
-    if not rows:
-        await add_to_pot(cid, amount)
-        return False, "Нет игроков"
-    winner = random.choice(rows)
-    wuid = int(winner["user_id"])
-    wname = winner.get("first_name") or winner.get("username") or str(wuid)
-    await add_balance(cid, wuid, amount)
-
-    head = "🎰 <b>Розыгрыш копилки!</b>" if reason == "auto" else "🎉 <b>Копилка разыграна вручную!</b>"
-    await safe_send(bot.send_message, cid,
-        f"{head}\n\n💰 Выигрыш: <b>${amount:.4f}</b>\n"
-        f"🏆 Получатель: <b>{wname}</b> (ID <code>{wuid}</code>)\n"
-        f"<i>Случайный из топ-10</i>")
-    return True, f"${amount:.4f} → {wname}"
-
-
+async def distribute_pot(cid,reason="manual"):
+    amt=await payout_pot(cid)
+    if amt<0.01: return False,"Копилка пуста"
+    rows=await get_top(cid,10)
+    if not rows: await add_to_pot(cid,amt); return False,"Нет игроков"
+    w=random.choice(rows); wuid=int(w["user_id"]); wn=w.get("first_name") or w.get("username") or str(wuid)
+    await add_balance(cid,wuid,amt)
+    head="🎰 <b>Розыгрыш копилки!</b>" if reason=="auto" else "🎉 <b>Копилка разыграна вручную!</b>"
+    await safe_send(bot.send_message,cid,f"{head}\n\n💰 Выигрыш: <b>${amt:.4f}</b>\n🏆 <b>{wn}</b> (ID <code>{wuid}</code>)\n<i>Случайный из топ-10</i>")
+    return True,f"${amt:.4f} → {wn}"
 async def pot_payout_loop():
-    await asyncio.sleep(30)
-    last = None
+    await asyncio.sleep(30); last=None
     while True:
-        now = datetime.now(TZ)
-        today = now.date()
-        if now.hour == POT_HOUR and last != today:
-            last = today
+        now=datetime.now(TZ); td=now.date()
+        if now.hour==POT_HOUR and last!=td:
+            last=td
             for cid in list(QUIZ_ENABLED):
-                try:
-                    await distribute_pot(cid, reason="auto")
-                except Exception as e:
-                    log.warning("pot auto: %s", e)
+                try: await distribute_pot(cid,reason="auto")
+                except Exception as e: log.warning("pot: %s",e)
         await asyncio.sleep(60)
-
-
-def split_prize(prize: float, top_scores: list) -> list:
-    total_points = sum(p for _, p in top_scores)
-    if total_points == 0:
-        return []
-    result = []
-    acc = 0.0
-    for i, (uid, pts) in enumerate(top_scores):
-        if i == len(top_scores) - 1:
-            share = round(prize - acc, 4)
-        else:
-            share = round(prize * (pts / total_points), 4)
-            acc += share
-        result.append((uid, share))
-    return result
-
-
-async def run_tournament(tid, chat_id, settings):
-    TOURNAMENT_ACTIVE[chat_id] = tid
-    total_q = int(settings["questions"])
-    q_secs = int(settings["question_seconds"])
-    prize = float(settings["prize"])
-    difficulty = settings.get("difficulty", "medium")
-    diff_label = DIFFICULTY_LABELS.get(difficulty, "🟡 Средне")
-    winners_count = int(settings.get("winners_count", 1))
-
-    scores = {}
-
+def split_prize(prize,top_scores):
+    tp=sum(p for _,p in top_scores)
+    if tp==0: return []
+    r=[]; acc=0.0
+    for i,(uid,pts) in enumerate(top_scores):
+        if i==len(top_scores)-1: sh=round(prize-acc,4)
+        else: sh=round(prize*(pts/tp),4); acc+=sh
+        r.append((uid,sh))
+    return r
+async def run_tournament(tid,cid,settings):
+    TOURNAMENT_ACTIVE[cid]=tid
+    tq=int(settings["questions"]); qs=int(settings["question_seconds"]); pr=float(settings["prize"])
+    diff=settings.get("difficulty","medium"); dl=DIFFICULTY_LABELS.get(diff,"🟡 Средне"); wc=int(settings.get("winners_count",1))
+    scores={}
     try:
-        await safe_send(bot.send_message, chat_id,
-            f"🏁 <b>ТУРНИР НАЧАЛСЯ!</b>\n\n"
-            f"🎯 Сложность: <b>{diff_label}</b>\n"
-            f"❓ {total_q} вопросов\n⏱ {q_secs} сек на каждый\n"
-            f"💰 Приз: <b>${prize:.2f}</b>\n"
-            f"🏆 Победителей: <b>{winners_count}</b>\n\n"
-            f"Отвечать может любой. Чем больше правильных — тем больше получишь!")
+        await safe_send(bot.send_message,cid,f"🏁 <b>ТУРНИР НАЧАЛСЯ!</b>\n\n🎯 {dl}\n❓ {tq} вопросов\n⏱ {qs} сек\n💰 Приз: <b>${pr:.2f}</b>\n🏆 Победителей: <b>{wc}</b>\n\nОтвечать может любой!")
         await asyncio.sleep(2)
-
-        for q_num in range(total_q):
-            q, answers, is_multi, _ = random_question(difficulty=difficulty)
-            TOURNAMENT_STATE[chat_id] = {"tid": tid, "q_num": q_num, "answers": answers, "answered_by": None}
-            await safe_send(bot.send_message, chat_id,
-                f"❓ <b>Вопрос {q_num + 1}/{total_q}</b>\n\n{q}\n\n⏱ {q_secs} сек")
-
-            for _ in range(q_secs):
-                await asyncio.sleep(1)
-                st = TOURNAMENT_STATE.get(chat_id)
-                if st and st.get("answered_by"):
-                    break
-
-            st = TOURNAMENT_STATE.get(chat_id) or {}
-            winner_uid = st.get("answered_by")
-
-            if winner_uid:
-                scores[winner_uid] = scores.get(winner_uid, 0) + 1
+        for qn in range(tq):
+            q,answers,_,_=random_question(difficulty=diff)
+            TOURNAMENT_STATE[cid]={"tid":tid,"q_num":qn,"answers":answers,"answered_by":None}
+            await safe_send(bot.send_message,cid,f"❓ <b>Вопрос {qn+1}/{tq}</b>\n\n{q}\n\n⏱ {qs} сек")
+            for _ in range(qs):
+                await asyncio.sleep(1); st=TOURNAMENT_STATE.get(cid)
+                if st and st.get("answered_by"): break
+            st=TOURNAMENT_STATE.get(cid) or {}; wu=st.get("answered_by")
+            if wu:
+                scores[wu]=scores.get(wu,0)+1
                 try:
-                    p = await get_player(chat_id, winner_uid)
-                    nm = p.get("first_name") or p.get("username") or str(winner_uid)
-                    await safe_send(bot.send_message, chat_id, f"✅ <b>{nm}</b> ответил правильно! +1")
-                except Exception:
-                    pass
-            else:
-                await safe_send(bot.send_message, chat_id, f"⌛ Никто не ответил. Правильный: <b>{answers[0]}</b>")
+                    p=await get_player(cid,wu); nm=p.get("first_name") or p.get("username") or str(wu)
+                    await safe_send(bot.send_message,cid,f"✅ <b>{nm}</b> +1")
+                except Exception: pass
+            else: await safe_send(bot.send_message,cid,f"⌛ Никто. Ответ: <b>{answers[0]}</b>")
             await asyncio.sleep(2)
-
         if not scores:
-            await safe_send(bot.send_message, chat_id, "🏁 <b>Турнир окончен.</b>\nНикто не ответил. Приз не вручён.")
-            await tournament_finish(tid, None)
-            return
-
-        sorted_scores = sorted(scores.items(), key=lambda x: -x[1])
-        top_n = sorted_scores[:winners_count]
-        shares = split_prize(prize, top_n)
-
-        winner_ids = []
-        for uid, share in shares:
-            if share > 0:
-                await add_balance(chat_id, uid, share)
-            winner_ids.append(uid)
-
-        await tournament_finish(tid, winner_ids[0] if winner_ids else None)
-
-        lines = ["🏆 <b>ТУРНИР ЗАВЕРШЁН!</b>", ""]
-        medals = ["🥇", "🥈", "🥉", "4.", "5.", "6.", "7.", "8.", "9.", "10."]
-        for i, (uid, share) in enumerate(shares):
-            # === КВЕСТ: топ-3 турнира ===
-            if i < 3:
-                try:
-                    await daily_add_progress(chat_id, uid, _today_local(), "tourn_top3", 1)
-                except Exception:
-                    pass
+            await safe_send(bot.send_message,cid,"🏁 <b>Турнир окончен.</b>\nНикто не ответил.")
+            await tournament_finish(tid,None); return
+        ss=sorted(scores.items(),key=lambda x:-x[1]); tn=ss[:wc]; sh=split_prize(pr,tn)
+        wids=[]
+        for uid,s in sh:
+            if s>0: await add_balance(cid,uid,s)
+            wids.append(uid)
+        await tournament_finish(tid,wids[0] if wids else None)
+        lines=["🏆 <b>ТУРНИР ЗАВЕРШЁН!</b>",""]
+        medals=["🥇","🥈","🥉","4.","5.","6.","7.","8.","9.","10."]
+        for i,(uid,s) in enumerate(sh):
             try:
-                pp = await get_player(chat_id, uid)
-                pnm = pp.get("first_name") or pp.get("username") or str(uid)
-            except Exception:
-                pnm = str(uid)
-            med = medals[i] if i < len(medals) else f"{i+1}."
-            lines.append(f"{med} {pnm} — {scores[uid]} прав. · <b>${share:.4f}</b>")
-
-        rest = sorted_scores[winners_count:]
+                pp=await get_player(cid,uid); pnm=pp.get("first_name") or pp.get("username") or str(uid)
+            except Exception: pnm=str(uid)
+            med=medals[i] if i<len(medals) else f"{i+1}."
+            lines.append(f"{med} {pnm} — {scores[uid]} прав. · <b>${s:.4f}</b>")
+        rest=ss[wc:]
         if rest:
-            lines.append("")
-            lines.append("<i>Остальные:</i>")
-            for uid, cnt in rest[:5]:
+            lines.append(""); lines.append("<i>Остальные:</i>")
+            for uid,cnt in rest[:5]:
                 try:
-                    pp = await get_player(chat_id, uid)
-                    pnm = pp.get("first_name") or pp.get("username") or str(uid)
-                except Exception:
-                    pnm = str(uid)
+                    pp=await get_player(cid,uid); pnm=pp.get("first_name") or pp.get("username") or str(uid)
+                except Exception: pnm=str(uid)
                 lines.append(f"• {pnm} — {cnt}")
-
-        lines.append("")
-        lines.append(f"💰 Общий приз: <b>${prize:.2f}</b> · 🏆 Победителей: {winners_count}")
-        await safe_send(bot.send_message, chat_id, "\n".join(lines))
+        lines.append(""); lines.append(f"💰 Приз: <b>${pr:.2f}</b> · Победителей: {wc}")
+        await safe_send(bot.send_message,cid,"\n".join(lines))
     finally:
-        TOURNAMENT_ACTIVE.pop(chat_id, None)
-        TOURNAMENT_STATE.pop(chat_id, None)
-
-
+        TOURNAMENT_ACTIVE.pop(cid,None); TOURNAMENT_STATE.pop(cid,None)
 def turik_kb(s):
-    diff = s.get("difficulty", "medium")
-    wc = s.get("winners_count", 1)
+    diff=s.get("difficulty","medium"); wc=s.get("winners_count",1)
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=f"⏱ На вопрос: {s['question_seconds']}с", callback_data="turik:set:question_seconds"),
-         InlineKeyboardButton(text=f"❓ Вопросов: {s['questions']}", callback_data="turik:set:questions")],
-        [InlineKeyboardButton(text=f"💰 Приз: ${float(s['prize']):.2f}", callback_data="turik:set:prize")],
-        [InlineKeyboardButton(text=f"🏆 Победителей: {wc}", callback_data="turik:winners_count")],
-        [InlineKeyboardButton(text=f"🎯 Сложность: {DIFFICULTY_LABELS.get(diff, diff)}", callback_data="turik:difficulty")],
-        [InlineKeyboardButton(text="🚀 Запустить турнир", callback_data="turik:start")],
-        [InlineKeyboardButton(text="🔄 Обновить", callback_data="turik:refresh")],
-    ])
-
-
+        [InlineKeyboardButton(text=f"⏱ {s['question_seconds']}с",callback_data="turik:set:question_seconds"),InlineKeyboardButton(text=f"❓ {s['questions']}",callback_data="turik:set:questions")],
+        [InlineKeyboardButton(text=f"💰 Приз: ${float(s['prize']):.2f}",callback_data="turik:set:prize")],
+        [InlineKeyboardButton(text=f"🏆 Победителей: {wc}",callback_data="turik:winners_count")],
+        [InlineKeyboardButton(text=f"🎯 {DIFFICULTY_LABELS.get(diff,diff)}",callback_data="turik:difficulty")],
+        [InlineKeyboardButton(text="🚀 Запустить турнир",callback_data="turik:start")],
+        [InlineKeyboardButton(text="🔄 Обновить",callback_data="turik:refresh")]])
 def turik_text(s):
-    diff = s.get("difficulty", "medium")
-    wc = s.get("winners_count", 1)
-    return (f"🏁 <b>Настройки турнира</b>\n\n"
-            f"⏱ На вопрос: <b>{s['question_seconds']}</b> сек\n"
-            f"❓ Вопросов: <b>{s['questions']}</b>\n"
-            f"💰 Приз: <b>${float(s['prize']):.2f}</b>\n"
-            f"🏆 Победителей: <b>{wc}</b>\n"
-            f"🎯 Сложность: <b>{DIFFICULTY_LABELS.get(diff, diff)}</b>\n\n"
-            f"<i>Приз делится пропорционально количеству правильных ответов.</i>\n\n"
-            f"Жми кнопку → напиши число в чат.")
-
-
+    diff=s.get("difficulty","medium"); wc=s.get("winners_count",1)
+    return (f"🏁 <b>Настройки турнира</b>\n\n⏱ На вопрос: <b>{s['question_seconds']}</b> сек\n❓ Вопросов: <b>{s['questions']}</b>\n💰 Приз: <b>${float(s['prize']):.2f}</b>\n🏆 Победителей: <b>{wc}</b>\n🎯 Сложность: <b>{DIFFICULTY_LABELS.get(diff,diff)}</b>\n\n<i>Приз делится пропорционально очкам.</i>\n\nЖми кнопку → напиши число.")
 @dp.message(Command("AiTurik"))
-async def cmd_turik(message: Message):
-    if not message.from_user or not is_admin(message.from_user.id):
-        return
-    if message.chat.type not in ("group", "supergroup"):
-        return
-    TOURNAMENT_EDIT.pop(message.from_user.id, None)
-    s = await get_t_settings(message.chat.id)
-    await safe_send(message.reply, turik_text(s), reply_markup=turik_kb(s))
-
-
-@dp.message(F.chat.type.in_({"group", "supergroup"}), F.text, ~F.text.startswith("/"))
-async def turik_value_input(message: Message):
-    if not message.from_user or message.from_user.id not in TOURNAMENT_EDIT:
-        raise SkipHandler()
-    edit = TOURNAMENT_EDIT[message.from_user.id]
-    if edit["chat_id"] != message.chat.id:
-        raise SkipHandler()
-
-    field = edit["field"]
-    raw = message.text.strip().replace(",", ".")
-
+async def cmd_turik(message:Message):
+    if not message.from_user or not is_admin(message.from_user.id): return
+    if message.chat.type not in ("group","supergroup"): return
+    TOURNAMENT_EDIT.pop(message.from_user.id,None); s=await get_t_settings(message.chat.id)
+    await safe_send(message.reply,turik_text(s),reply_markup=turik_kb(s))
+@dp.message(F.chat.type.in_({"group","supergroup"}),F.text,~F.text.startswith("/"))
+async def turik_value_input(message:Message):
+    if not message.from_user or message.from_user.id not in TOURNAMENT_EDIT: raise SkipHandler()
+    edit=TOURNAMENT_EDIT[message.from_user.id]
+    if edit["chat_id"]!=message.chat.id: raise SkipHandler()
+    f=edit["field"]; raw=message.text.strip().replace(",",".")
     try:
-        if field == "prize":
-            val = float(raw)
-            if not (0.1 <= val <= 100):
-                raise ValueError
-            val = round(val, 4)
+        if f=="prize":
+            v=float(raw)
+            if not (0.1<=v<=100): raise ValueError
+            v=round(v,4)
         else:
-            val = int(raw)
-            ranges = {"question_seconds": (5, 300), "questions": (3, 50)}
-            lo, hi = ranges[field]
-            if not (lo <= val <= hi):
-                raise ValueError
+            v=int(raw); rng={"question_seconds":(5,300),"questions":(3,50)}[f]
+            if not (rng[0]<=v<=rng[1]): raise ValueError
     except ValueError:
-        await safe_send(message.reply, "❌ Неверное значение. Попробуй снова или /AiTurik для отмены.")
-        return
-
-    ok = await update_t_setting(edit["chat_id"], field, val)
-    TOURNAMENT_EDIT.pop(message.from_user.id, None)
-
-    if not ok:
-        await safe_send(message.reply, "❌ Не удалось сохранить настройку в БД. Проверь логи.")
-        return
-
-    s = await get_t_settings(edit["chat_id"])
-    try:
-        await message.delete()
-    except Exception:
-        pass
-    await safe_send(message.answer, turik_text(s), reply_markup=turik_kb(s))
-
-
+        await safe_send(message.reply,"❌ Неверное значение. /AiTurik для отмены."); return
+    ok=await update_t_setting(edit["chat_id"],f,v); TOURNAMENT_EDIT.pop(message.from_user.id,None)
+    if not ok: await safe_send(message.reply,"❌ Не сохранилось."); return
+    s=await get_t_settings(edit["chat_id"])
+    try: await message.delete()
+    except Exception: pass
+    await safe_send(message.answer,turik_text(s),reply_markup=turik_kb(s))
 @dp.callback_query(F.data.startswith("turik:"))
-async def on_turik_cb(cb: CallbackQuery):
-    if not cb.from_user or not is_admin(cb.from_user.id):
-        await cb.answer("⛔", show_alert=True)
-        return
-    if not isinstance(cb.message, Message):
-        await cb.answer()
-        return
-    cid = cb.message.chat.id
-    parts = cb.data.split(":")
-    action = parts[1] if len(parts) > 1 else ""
-
-    if action == "refresh" or action == "menu":
-        s = await get_t_settings(cid)
-        await safe_edit(cb.message.edit_text, turik_text(s), reply_markup=turik_kb(s))
-        await cb.answer()
-        return
-
-    if action == "winners_count":
-        s = await get_t_settings(cid)
-        cur = s.get("winners_count", 1)
-        def m(n):
-            mark = "✅ " if n == cur else ""
-            return f"{mark}Топ-{n}"
-        kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text=m(1), callback_data="turik:wc_set:1")],
-            [InlineKeyboardButton(text=m(2), callback_data="turik:wc_set:2")],
-            [InlineKeyboardButton(text=m(3), callback_data="turik:wc_set:3")],
-            [InlineKeyboardButton(text=m(5), callback_data="turik:wc_set:5")],
-            [InlineKeyboardButton(text="⬅️ Назад", callback_data="turik:menu")],
-        ])
-        await safe_edit(cb.message.edit_text,
-            f"🏆 <b>Сколько победителей?</b>\n\n"
-            f"Приз делится <b>пропорционально очкам</b> — чем больше ответил, тем больше получит.\n\n"
-            f"Текущее: <b>{cur}</b>",
-            reply_markup=kb)
-        await cb.answer()
-        return
-
-    if action == "wc_set":
-        try:
-            n = int(parts[2])
-        except (ValueError, IndexError):
-            await cb.answer("Ошибка", show_alert=True)
-            return
-        if n not in (1, 2, 3, 5):
-            await cb.answer("Ошибка", show_alert=True)
-            return
-        ok = await update_t_setting(cid, "winners_count", n)
-        if not ok:
-            await cb.answer("❌ Не сохранилось. Смотри логи.", show_alert=True)
-            return
-        await cb.answer(f"Победителей: {n}")
-        s = await get_t_settings(cid)
-        await safe_edit(cb.message.edit_text, turik_text(s), reply_markup=turik_kb(s))
-        return
-
-    if action == "difficulty":
-        s = await get_t_settings(cid)
-        cur = s.get("difficulty", "medium")
-        def m(d):
-            mark = "✅ " if d == cur else ""
-            return f"{mark}{DIFFICULTY_LABELS[d]}"
-        kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text=m("easy"), callback_data="turik:diff_set:easy")],
-            [InlineKeyboardButton(text=m("medium"), callback_data="turik:diff_set:medium")],
-            [InlineKeyboardButton(text=m("hard"), callback_data="turik:diff_set:hard")],
-            [InlineKeyboardButton(text=m("extreme"), callback_data="turik:diff_set:extreme")],
-            [InlineKeyboardButton(text="⬅️ Назад", callback_data="turik:menu")],
-        ])
-        await safe_edit(cb.message.edit_text,
-            f"🎯 <b>Сложность турнира</b>\n\n🟢 Легко\n🟡 Средне\n🟠 Сложно\n🔴 Экстрим",
-            reply_markup=kb)
-        await cb.answer()
-        return
-
-    if action == "diff_set":
-        d = parts[2] if len(parts) > 2 else ""
-        if d not in ("easy", "medium", "hard", "extreme"):
-            await cb.answer("Ошибка", show_alert=True)
-            return
-        ok = await update_t_setting(cid, "difficulty", d)
-        if not ok:
-            await cb.answer("❌ Не сохранилось. Смотри логи.", show_alert=True)
-            return
-        await cb.answer(f"Сложность: {DIFFICULTY_LABELS[d]}")
-        s = await get_t_settings(cid)
-        await safe_edit(cb.message.edit_text, turik_text(s), reply_markup=turik_kb(s))
-        return
-
-    if action == "set":
-        field = parts[2]
-        if field not in ("question_seconds", "questions", "prize"):
-            await cb.answer("Ошибка", show_alert=True)
-            return
-        TOURNAMENT_EDIT[cb.from_user.id] = {"chat_id": cid, "field": field}
-        prompts = {
-            "question_seconds": "⏱ Сколько секунд на один вопрос? (5-300)",
-            "questions": "❓ Сколько всего вопросов? (3-50)",
-            "prize": "💰 Какой приз в USDT? (0.1-100)",
-        }
-        await cb.answer("Жду число...")
-        await safe_send(cb.message.answer, prompts[field] + "\n\n<i>Отмена: /AiTurik</i>")
-        return
-
-    if action == "start":
-        if cid in TOURNAMENT_ACTIVE:
-            await cb.answer("⏳ Турнир уже идёт.", show_alert=True)
-            return
-        s = await get_t_settings(cid)
-        tid = await tournament_create(cid, float(s["prize"]))
-        if not tid:
-            await cb.answer("Ошибка создания", show_alert=True)
-            return
-        await cb.answer("Запускаю!")
-        asyncio.create_task(run_tournament(tid, cid, s))
-        return
-
-
-# ===== ДНЕВНЫЕ КВЕСТЫ: UI =====
-
-def daily_kb(cid, uid, day, progress, streak_claimed_today):
-    rows = []
-
-    if not streak_claimed_today:
-        rows.append([InlineKeyboardButton(
-            text="🎁 Забрать ежедневный бонус",
-            callback_data="daily:streak")])
-
-    for key, q in DAILY_QUESTS.items():
-        st = progress.get(key)
-        if not st:
-            continue
-        if st["claimed"]:
-            continue
-        if st["progress"] >= q["target"]:
-            rows.append([InlineKeyboardButton(
-                text=f"✅ Забрать: {q['emoji']} {q['title']} (+${q['reward']:.2f})",
-                callback_data=f"daily:claim:{key}")])
-
-    rows.append([InlineKeyboardButton(text="🔄 Обновить", callback_data="daily:refresh")])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
-
-
-def daily_text(cid, uid, day, progress, streak, streak_claimed_today):
-    if streak_claimed_today:
-        streak_line = f"🔥 Стрик: <b>{streak}</b> дн. · ✅ бонус получен сегодня"
-    else:
-        next_streak = streak + 1
-        reward = min(DAILY_STREAK_BASE * max(next_streak, 1), DAILY_STREAK_MAX)
-        streak_line = f"🔥 Стрик: <b>{streak}</b> дн. · 🎁 бонус сегодня: <b>${reward:.2f}</b>"
-
-    lines = [
-        "📅 <b>ЕЖЕДНЕВНЫЙ БОНУС И КВЕСТЫ</b>",
-        "",
-        streak_line,
-        "",
-        f"📋 <b>Квесты на {day.strftime('%d.%m.%Y')}</b>",
-        "",
-    ]
-
-    total_available = 0.0
-    total_claimed = 0.0
-
-    for key, q in DAILY_QUESTS.items():
-        st = progress.get(key)
-        if st:
-            p = min(st["progress"], q["target"])
-            claimed = st["claimed"]
-        else:
-            p = 0
-            claimed = False
-
-        if claimed:
-            mark = "💵"
-            tail = "<i>получено</i>"
-            total_claimed += q["reward"]
-        elif p >= q["target"]:
-            mark = "✅"
-            tail = f"<b>+${q['reward']:.2f}</b>"
-            total_available += q["reward"]
-        else:
-            mark = "⬜"
-            tail = f"+${q['reward']:.2f}"
-
-        lines.append(f"{mark} {q['emoji']} {q['title']} — {p}/{q['target']} · {tail}")
-
-    lines.append("")
-    lines.append(f"💵 Доступно к получению: <b>${total_available:.2f}</b>")
-    lines.append(f"💼 Уже забрано: <b>${total_claimed:.2f}</b>")
-    return "\n".join(lines)
-
-
-async def _render_daily(cid, uid, edit_msg=None):
-    day = _today_local()
-    progress = await daily_get_all(cid, uid, day)
-    streak, last_claim = await streak_get(cid, uid)
-    streak_claimed_today = (last_claim == day)
-    text = daily_text(cid, uid, day, progress, streak, streak_claimed_today)
-    kb = daily_kb(cid, uid, day, progress, streak_claimed_today)
-    if edit_msg:
-        await safe_edit(edit_msg.edit_text, text, reply_markup=kb)
-    else:
-        return await safe_send(bot.send_message, cid, text, reply_markup=kb)
-
-
-@dp.message(Command("AiDaily"))
-async def cmd_daily(message: Message):
-    if message.chat.type not in ("group", "supergroup") or not message.from_user:
-        return
-    cid, uid = message.chat.id, message.from_user.id
-    if is_banned_cached(cid, uid):
-        await safe_send(message.reply, "🚫 Ты в бане.")
-        return
-    await _render_daily(cid, uid)
-
-
-@dp.callback_query(F.data.startswith("daily:"))
-async def on_daily_cb(cb: CallbackQuery):
-    if not cb.from_user or not isinstance(cb.message, Message):
-        await cb.answer()
-        return
-    cid, uid = cb.message.chat.id, cb.from_user.id
-    parts = cb.data.split(":")
-    action = parts[1] if len(parts) > 1 else ""
-    day = _today_local()
-
-    if action == "refresh":
-        await cb.answer("Обновляю...")
-        await _render_daily(cid, uid, edit_msg=cb.message)
-        return
-
-    if action == "streak":
-        streak, last_claim = await streak_get(cid, uid)
-        if last_claim == day:
-            await cb.answer("Ты уже получал сегодня", show_alert=True)
-            return
-
-        yesterday = day - timedelta(days=1)
-        if last_claim == yesterday:
-            new_streak = streak + 1
-        else:
-            new_streak = 1
-
-        reward = min(DAILY_STREAK_BASE * new_streak, DAILY_STREAK_MAX)
-        reward = round(reward, 4)
-
-        await streak_update(cid, uid, day, new_streak, day)
-        await add_balance(cid, uid, reward)
-        await daily_add_progress(cid, uid, day, "daily_login", 1)
-
-        await cb.answer(f"🔥 +${reward:.2f} · стрик {new_streak} дн.", show_alert=True)
-        await _render_daily(cid, uid, edit_msg=cb.message)
-        return
-
-    if action == "claim":
-        key = parts[2] if len(parts) > 2 else ""
-        q = DAILY_QUESTS.get(key)
-        if not q:
-            await cb.answer("Ошибка", show_alert=True)
-            return
-        ok = await daily_claim(cid, uid, day, key, q["reward"])
-        if ok:
-            await cb.answer(f"✅ +${q['reward']:.2f}", show_alert=True)
-            await _render_daily(cid, uid, edit_msg=cb.message)
-        else:
-            await cb.answer("Уже получено или не выполнено", show_alert=True)
-        return
-
-    await cb.answer()
-
-
-# ===== ПРОЧИЕ ХЕНДЛЕРЫ =====
-
+async def on_turik_cb(cb:CallbackQuery):
+    if not cb.from_user or not is_admin(cb.from_user.id): await cb.answer("⛔",show_alert=True); return
+    if not isinstance(cb.message,Message): await cb.answer(); return
+    cid=cb.message.chat.id; parts=cb.data.split(":"); action=parts[1] if len(parts)>1 else ""
+    if action in ("refresh","menu"):
+        s=await get_t_settings(cid); await safe_edit(cb.message.edit_text,turik_text(s),reply_markup=turik_kb(s)); await cb.answer(); return
+    if action=="winners_count":
+        s=await get_t_settings(cid); cur=s.get("winners_count",1)
+        def m(n): return f"{'✅ ' if n==cur else ''}Топ-{n}"
+        kb=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=m(1),callback_data="turik:wc_set:1")],[InlineKeyboardButton(text=m(2),callback_data="turik:wc_set:2")],[InlineKeyboardButton(text=m(3),callback_data="turik:wc_set:3")],[InlineKeyboardButton(text=m(5),callback_data="turik:wc_set:5")],[InlineKeyboardButton(text="⬅️ Назад",callback_data="turik:menu")]])
+        await safe_edit(cb.message.edit_text,f"🏆 <b>Сколько победителей?</b>\n\nПриз делится <b>пропорционально очкам</b>.\n\nТекущее: <b>{cur}</b>",reply_markup=kb); await cb.answer(); return
+    if action=="wc_set":
+        try: n=int(parts[2])
+        except (ValueError,IndexError): await cb.answer("Ошибка",show_alert=True); return
+        if n not in (1,2,3,5): await cb.answer("Ошибка",show_alert=True); return
+        ok=await update_t_setting(cid,"winners_count",n)
+        if not ok: await cb.answer("❌ Не сохранилось",show_alert=True); return
+        await cb.answer(f"Победителей: {n}"); s=await get_t_settings(cid); await safe_edit(cb.message.edit_text,turik_text(s),reply_markup=turik_kb(s)); return
+    if action=="difficulty":
+        s=await get_t_settings(cid); cur=s.get("difficulty","medium")
+        def m(d): return f"{'✅ ' if d==cur else ''}{DIFFICULTY_LABELS[d]}"
+        kb=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=m("easy"),callback_data="turik:diff_set:easy")],[InlineKeyboardButton(text=m("medium"),callback_data="turik:diff_set:medium")],[InlineKeyboardButton(text=m("hard"),callback_data="turik:diff_set:hard")],[InlineKeyboardButton(text=m("extreme"),callback_data="turik:diff_set:extreme")],[InlineKeyboardButton(text="⬅️ Назад",callback_data="turik:menu")]])
+        await safe_edit(cb.message.edit_text,"🎯 <b>Сложность турнира</b>\n\n🟢 Легко\n🟡 Средне\n🟠 Сложно\n🔴 Экстрим",reply_markup=kb); await cb.answer(); return
+    if action=="diff_set":
+        d=parts[2] if len(parts)>2 else ""
+        if d not in ("easy","medium","hard","extreme"): await cb.answer("Ошибка",show_alert=True); return
+        ok=await update_t_setting(cid,"difficulty",d)
+        if not ok: await cb.answer("❌ Не сохранилось",show_alert=True); return
+        await cb.answer(f"Сложность: {DIFFICULTY_LABELS[d]}"); s=await get_t_settings(cid); await safe_edit(cb.message.edit_text,turik_text(s),reply_markup=turik_kb(s)); return
+    if action=="set":
+        f=parts[2]
+        if f not in ("question_seconds","questions","prize"): await cb.answer("Ошибка",show_alert=True); return
+        TOURNAMENT_EDIT[cb.from_user.id]={"chat_id":cid,"field":f}
+        p={"question_seconds":"⏱ Секунд на вопрос? (5-300)","questions":"❓ Всего вопросов? (3-50)","prize":"💰 Приз в USDT? (0.1-100)"}[f]
+        await cb.answer("Жду число..."); await safe_send(cb.message.answer,p+"\n\n<i>Отмена: /AiTurik</i>"); return
+    if action=="start":
+        if cid in TOURNAMENT_ACTIVE: await cb.answer("⏳ Уже идёт",show_alert=True); return
+        s=await get_t_settings(cid); tid=await tournament_create(cid,float(s["prize"]))
+        if not tid: await cb.answer("Ошибка",show_alert=True); return
+        await cb.answer("Запускаю!"); asyncio.create_task(run_tournament(tid,cid,s)); return
 @dp.message(CommandStart())
-async def cmd_start(message: Message):
-    if message.from_user:
-        TOURNAMENT_EDIT.pop(message.from_user.id, None)
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="💎 Подписка $0.50/нед", url=XROCKET_SUBSCRIBE_URL)],
-        [InlineKeyboardButton(text="🔗 Партнёрка xRocket", url=XROCKET_REFERRAL_URL)],
-    ])
-    await safe_send(message.reply,
-        f"👋 <b>Викторина с дуэлями!</b>\n\n"
-        f"🎯 Квиз: +1 очко за правильный ответ\n"
-        f"📈 10 уровней за очки\n"
-        f"📅 /AiDaily — бонус и квесты\n"
-        f"🎲 Дуэли: <code>/AiDuel 0.20</code>\n"
-        f"💳 Пополнить: <code>/AiDeposit 1.0</code>\n"
-        f"💸 Вывод от ${MIN_WITHDRAW:.2f}\n\n"
-        f"📖 /AiHelp · 📜 /AiRules",
-        reply_markup=kb)
-
-
+async def cmd_start(message:Message):
+    if message.from_user: TOURNAMENT_EDIT.pop(message.from_user.id,None)
+    kb=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="💎 Подписка $0.50/нед",url=XROCKET_SUBSCRIBE_URL)],[InlineKeyboardButton(text="🔗 Партнёрка xRocket",url=XROCKET_REFERRAL_URL)]])
+    await safe_send(message.reply,f"👋 <b>Викторина с дуэлями!</b>\n\n🎯 Квиз: +1 очко\n📈 10 уровней\n🎲 Дуэли: <code>/AiDuel 0.20</code>\n💳 <code>/AiDeposit 1.0</code>\n💸 Вывод от ${MIN_WITHDRAW:.2f}\n\n📖 /AiHelp · 📜 /AiRules",reply_markup=kb)
 @dp.message(Command("AiHelp"))
-async def cmd_aihelp(message: Message):
-    if message.chat.type not in ("group", "supergroup"):
-        return
-    text = (
-        "📖 <b>СПРАВКА</b>\n\n"
-        "<b>🎮 Игра</b>\n"
-        "/AiBalance · /AiProfile · /AiTop · /AiLevels · /AiCoins\n"
-        "/AiDaily — бонус и квесты\n"
-        "/AiDuel 0.20 — дуэль на кубах\n\n"
-        "<b>💰 Деньги</b>\n"
-        f"/AiDeposit 0.05 — пополнить (от ${DEPOSIT_MIN:.2f})\n"
-        f"/AiWithdraw — вывод от ${MIN_WITHDRAW:.2f}\n"
-        f"/AiSubscribe — подписка ×{SUBSCRIBER_MULTIPLIER}\n"
-        f"/AiSponsor — купить спонсорские вопросы (в ЛС)\n\n"
-        "<b>📜 Общее</b>\n/AiRules · /AiHelp\n"
-    )
+async def cmd_aihelp(message:Message):
+    if message.chat.type not in ("group","supergroup"): return
+    text=("📖 <b>СПРАВКА</b>\n\n<b>🎮 Игра</b>\n/AiBalance · /AiProfile · /AiTop · /AiLevels · /AiCoins\n/AiCard — карточка профиля\n/AiDuel 0.20 — дуэль\n\n<b>💰 Деньги</b>\n"
+          f"/AiDeposit 0.05 — пополнить (от ${DEPOSIT_MIN:.2f})\n/AiWithdraw — вывод от ${MIN_WITHDRAW:.2f}\n"
+          f"/AiSubscribe — подписка ×{SUBSCRIBER_MULTIPLIER}\n/AiSponsor — спонсорские вопросы (в ЛС)\n\n<b>📜 Общее</b>\n/AiRules · /AiHelp\n")
     if message.from_user and is_admin(message.from_user.id):
-        text += (
-            "\n<b>🛠 Админ</b>\n"
-            "/AiAdmin — панель\n"
-            "/AiTurik — турниры (топ-N победителей)\n"
-            "/AiPot · /AiPotAdd · /AiPotTake · /AiPotGive\n"
-            "/AiBan &lt;id&gt; [время] [причина]\n/AiUnban &lt;id&gt;\n"
-        )
-    await safe_send(message.reply, text)
-
-
+        text+=("\n<b>🛠 Админ</b>\n/AiAdmin — панель\n/AiTurik — турниры\n/AiGive &lt;id&gt; &lt;сумма&gt; — выдать\n"
+               "/AiPot · /AiPotAdd · /AiPotTake · /AiPotGive\n/AiBan &lt;id&gt; [время] [причина]\n/AiUnban &lt;id&gt;\n")
+    await safe_send(message.reply,text)
 @dp.message(Command("AiRules"))
-async def cmd_airules(message: Message):
-    if message.chat.type not in ("group", "supergroup"):
-        return
-    await safe_send(message.reply,
-        "📜 <b>ПРАВИЛА</b>\n\n"
-        "1. Оскорбления — бан.\n"
-        "2. Обход бана (твинк) — перманентный бан.\n"
-        "3. Скрипты, боты — бан + сброс.\n"
-        "4. Спам — бан.\n"
-        "5. Фиктивные дуэли — бан обоим.\n"
-        "6. Обман системы вывода — бан + обнуление.\n\n"
-        f"💸 Вывод: от ${MIN_WITHDRAW:.2f} · лимит ${DAILY_WITHDRAW_LIMIT:.2f}/сутки\n"
-        f"🎲 Рейк с дуэлей: {RAKE_PCT*100:.0f}%\n\n"
-        "<i>Незнание правил не освобождает от ответственности.</i>")
-
-
+async def cmd_airules(message:Message):
+    if message.chat.type not in ("group","supergroup"): return
+    await safe_send(message.reply,"📜 <b>ПРАВИЛА</b>\n\n1. Оскорбления — бан.\n2. Обход бана — перманентный.\n3. Скрипты — бан.\n4. Спам — бан.\n5. Фиктивные дуэли — бан обоим.\n6. Обман вывода — бан + обнуление.\n\n"+f"💸 Вывод: ${MIN_WITHDRAW:.2f} · ${DAILY_WITHDRAW_LIMIT:.2f}/сутки\n🎲 Рейк: {RAKE_PCT*100:.0f}%\n\n<i>Незнание не освобождает.</i>")
 @dp.message(Command("AiCoins"))
-async def cmd_aicoins(message: Message):
-    if message.chat.type not in ("group", "supergroup"):
-        return
-    stats = await get_coins_stats(message.chat.id)
-    if not stats:
-        await safe_send(message.reply, "Ошибка при подсчёте.")
-        return
-    await safe_send(message.reply,
-        f"💼 <b>Экономика чата</b>\n\n"
-        f"👥 Игроков: <b>{stats['players']}</b>\n"
-        f"💰 На балансах: <b>${stats['balance']:.4f}</b>\n"
-        f"🎯 Очков всего: <b>{stats['points']}</b>\n\n"
-        f"💸 Выплачено: <b>${stats['paid']:.4f}</b>\n"
-        f"🏦 В кассе: <b>${stats['house']:.4f}</b>")
-
-
+async def cmd_aicoins(message:Message):
+    if message.chat.type not in ("group","supergroup"): return
+    st=await get_coins_stats(message.chat.id)
+    if not st: await safe_send(message.reply,"Ошибка"); return
+    await safe_send(message.reply,f"💼 <b>Экономика чата</b>\n\n👥 Игроков: <b>{st['players']}</b>\n💰 Балансы: <b>${st['balance']:.4f}</b>\n🎯 Очков: <b>{st['points']}</b>\n\n💸 Выплачено: <b>${st['paid']:.4f}</b>\n🏦 Касса: <b>${st['house']:.4f}</b>")
 @dp.message(Command("AiSponsor"))
-async def cmd_sponsor(message: Message):
-    if message.chat.type != "private":
-        await safe_send(message.reply, "Эта команда работает только в личке бота.")
-        return
-
-    uid = message.from_user.id
-
+async def cmd_sponsor(message:Message):
+    if message.chat.type!="private": await safe_send(message.reply,"Только в ЛС"); return
+    uid=message.from_user.id
     if uid in SPONSOR_SESSION:
-        session = SPONSOR_SESSION[uid]
-        if not session.get("chat_id"):
-            await safe_send(message.reply,
-                "📌 Укажи <b>ID чата</b>, куда постить вопросы.\nНапример: <code>-1002712583382</code>")
-        else:
-            left = session["target"] - session["collected"]
-            await safe_send(message.reply,
-                f"📝 Режим спонсора\nОсталось собрать: <b>{left}</b> вопросов\n\n"
-                f"Формат: <code>вопрос | ответ</code>")
+        s=SPONSOR_SESSION[uid]
+        if not s.get("chat_id"): await safe_send(message.reply,"📌 Укажи <b>ID чата</b>.\nнапр: <code>-1002712583382</code>")
+        else: await safe_send(message.reply,f"📝 Режим спонсора\nОсталось: <b>{s['target']-s['collected']}</b>\n\nФормат: <code>вопрос | ответ</code>")
         return
-
-    parts = (message.text or "").split()
-    if len(parts) != 2 or parts[1] != "5":
-        await safe_send(message.reply,
-            f"🎁 <b>Спонсорские вопросы</b>\n\n"
-            f"Цена: <b>${SPONSOR_PRICE:.2f}</b> = <b>{SPONSOR_QUESTIONS} вопросов</b>\n\n"
-            f"Для оплаты: <code>/AiSponsor 5</code>")
-        return
-
-    client_inv_id = f"sponsor_{uid}_{uuid.uuid4().hex[:12]}"
-    ok, result = await xrocket_create_invoice(client_inv_id, SPONSOR_PRICE,
-        f"Sponsor pack for quiz bot (user {uid})")
-    if not ok:
-        await safe_send(message.reply, f"❌ <code>{result}</code>")
-        return
-
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=f"💳 Оплатить ${SPONSOR_PRICE:.2f}", url=result)],
-    ])
-    await create_invoice(client_inv_id, uid, 0, SPONSOR_PRICE, None, kind="sponsor")
-    await safe_send(message.reply,
-        f"🎁 <b>Пакет спонсора</b>\n\n"
-        f"💰 Сумма: <b>${SPONSOR_PRICE:.2f}</b>\n"
-        f"📝 Вопросов: <b>{SPONSOR_QUESTIONS}</b>\n\n"
-        f"После оплаты бот попросит ID чата.",
-        reply_markup=kb)
-
-
-@dp.message(F.chat.type == "private", F.text, ~F.text.startswith("/"))
-async def handle_sponsor_input(message: Message):
-    if not message.from_user or not message.text:
-        raise SkipHandler()
-    uid = message.from_user.id
-    session = SPONSOR_SESSION.get(uid)
-    if not session:
-        raise SkipHandler()
-
-    if not session.get("chat_id"):
-        try:
-            chat_id = int(message.text.strip())
-        except ValueError:
-            await safe_send(message.reply, "❌ Неверный ID. Пример: <code>-1002712583382</code>")
-            return
-        session["chat_id"] = chat_id
-        await safe_send(message.reply,
-            f"✅ Чат: <code>{chat_id}</code>\n\n"
-            f"Отправляй вопросы: <code>вопрос | ответ</code>\nОсталось: <b>{session['target']}</b>")
-        return
-
-    text = message.text.strip()
-    if "|" not in text:
-        await safe_send(message.reply, "❌ Формат: <code>вопрос | ответ</code>")
-        return
-
-    q, a = text.split("|", 1)
-    q, a = q.strip(), a.strip().lower()
-    if not q or not a:
-        await safe_send(message.reply, "❌ Пустой вопрос или ответ.")
-        return
-
-    position = session["collected"] + 1
-    await sponsor_add(uid, session["chat_id"], q, a, position)
-    session["collected"] += 1
-    left = session["target"] - session["collected"]
-
-    if left <= 0:
-        await safe_send(message.reply,
-            f"🎉 <b>Все {session['target']} вопросов приняты!</b>\nОни появятся в чате по порядку.")
-        SPONSOR_SESSION.pop(uid, None)
-    else:
-        await safe_send(message.reply, f"✅ Принято. Осталось: <b>{left}</b>")
-
-
+    parts=(message.text or "").split()
+    if len(parts)!=2 or parts[1]!="5":
+        await safe_send(message.reply,f"🎁 <b>Спонсорские вопросы</b>\n\nЦена: <b>${SPONSOR_PRICE:.2f}</b> = <b>{SPONSOR_QUESTIONS} вопросов</b>\n\nОплата: <code>/AiSponsor 5</code>"); return
+    ciid=f"sponsor_{uid}_{uuid.uuid4().hex[:12]}"; ok,res=await xrocket_create_invoice(ciid,SPONSOR_PRICE,f"Sponsor {uid}")
+    if not ok: await safe_send(message.reply,f"❌ <code>{res}</code>"); return
+    kb=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=f"💳 Оплатить ${SPONSOR_PRICE:.2f}",url=res)]])
+    await create_invoice(ciid,uid,0,SPONSOR_PRICE,None,kind="sponsor")
+    await safe_send(message.reply,f"🎁 <b>Пакет спонсора</b>\n\n💰 <b>${SPONSOR_PRICE:.2f}</b>\n📝 <b>{SPONSOR_QUESTIONS}</b>\n\nПосле оплаты бот попросит ID чата.",reply_markup=kb)
+@dp.message(F.chat.type=="private",F.text,~F.text.startswith("/"))
+async def handle_sponsor_input(message:Message):
+    if not message.from_user or not message.text: raise SkipHandler()
+    uid=message.from_user.id; s=SPONSOR_SESSION.get(uid)
+    if not s: raise SkipHandler()
+    if not s.get("chat_id"):
+        try: cid=int(message.text.strip())
+        except ValueError: await safe_send(message.reply,"❌ Неверный ID"); return
+        s["chat_id"]=cid; await safe_send(message.reply,f"✅ Чат: <code>{cid}</code>\n\nОтправляй: <code>вопрос | ответ</code>\nОсталось: <b>{s['target']}</b>"); return
+    t=message.text.strip()
+    if "|" not in t: await safe_send(message.reply,"❌ Формат: <code>вопрос | ответ</code>"); return
+    q,a=t.split("|",1); q,a=q.strip(),a.strip().lower()
+    if not q or not a: await safe_send(message.reply,"❌ Пусто"); return
+    pos=s["collected"]+1; await sponsor_add(uid,s["chat_id"],q,a,pos); s["collected"]+=1; left=s["target"]-s["collected"]
+    if left<=0:
+        await safe_send(message.reply,f"🎉 Все {s['target']} приняты!"); SPONSOR_SESSION.pop(uid,None)
+    else: await safe_send(message.reply,f"✅ Принято. Осталось: <b>{left}</b>")
 def admin_kb(cid):
-    enabled = cid in QUIZ_ENABLED
+    en=cid in QUIZ_ENABLED
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="⏸ Выключить" if enabled else "▶️ Включить", callback_data="adm:toggle")],
-        [InlineKeyboardButton(text="❓ Вопрос", callback_data="adm:ask"),
-         InlineKeyboardButton(text="📊 Стата", callback_data="adm:stats")],
-        [InlineKeyboardButton(text="💼 Касса", callback_data="adm:house"),
-         InlineKeyboardButton(text="💸 Выплаты", callback_data="adm:payouts")],
-        [InlineKeyboardButton(text="📋 Топ", callback_data="adm:top"),
-         InlineKeyboardButton(text="🚫 Баны", callback_data="adm:bans")],
-        [InlineKeyboardButton(text="🎯 Сложность", callback_data="adm:difficulty"),
-         InlineKeyboardButton(text="🎰 Копилка", callback_data="adm:pot")],
-        [InlineKeyboardButton(text="🧪 xRocket", callback_data="adm:xrdbg")],
-    ])
-
-
+        [InlineKeyboardButton(text="⏸ Выкл" if en else "▶️ Вкл",callback_data="adm:toggle")],
+        [InlineKeyboardButton(text="❓ Вопрос",callback_data="adm:ask"),InlineKeyboardButton(text="📊 Стата",callback_data="adm:stats")],
+        [InlineKeyboardButton(text="💼 Касса",callback_data="adm:house"),InlineKeyboardButton(text="💸 Выплаты",callback_data="adm:payouts")],
+        [InlineKeyboardButton(text="📋 Топ",callback_data="adm:top"),InlineKeyboardButton(text="🚫 Баны",callback_data="adm:bans")],
+        [InlineKeyboardButton(text="🎯 Сложность",callback_data="adm:difficulty"),InlineKeyboardButton(text="🎰 Копилка",callback_data="adm:pot")],
+        [InlineKeyboardButton(text="🧪 xRocket",callback_data="adm:xrdbg")]])
 def admin_text(cid):
-    status = "🟢 включена" if cid in QUIZ_ENABLED else "🔴 выключена"
-    current = ACTIVE_QUESTIONS.get(cid)
-    cur_txt = f"\n🔓 Открыт: {current['question']}" if current else ""
-    return (f"🛠 <b>Админ-панель</b>\nВикторина: {status}\n"
-            f"Рейк с дуэлей: <b>{RAKE_PCT*100:.0f}%</b>\n"
-            f"Депозит: от ${DEPOSIT_MIN:.2f}\n"
-            f"Вывод: от ${MIN_WITHDRAW:.2f}{cur_txt}")
-
-
+    st="🟢 вкл" if cid in QUIZ_ENABLED else "🔴 выкл"; cur=ACTIVE_QUESTIONS.get(cid)
+    ct=f"\n🔓 Открыт: {cur['question']}" if cur else ""
+    return f"🛠 <b>Админ</b>\nВикторина: {st}\nРейк: <b>{RAKE_PCT*100:.0f}%</b>\nДепозит: ${DEPOSIT_MIN:.2f}\nВывод: ${MIN_WITHDRAW:.2f}{ct}"
 @dp.message(Command("AiAdmin"))
-async def cmd_aiadmin(message: Message):
-    if not message.from_user or not is_admin(message.from_user.id):
-        return
-    if message.chat.type not in ("group", "supergroup"):
-        return
-    await safe_send(message.reply, admin_text(message.chat.id), reply_markup=admin_kb(message.chat.id))
-
-
+async def cmd_aiadmin(message:Message):
+    if not message.from_user or not is_admin(message.from_user.id): return
+    if message.chat.type not in ("group","supergroup"): return
+    await safe_send(message.reply,admin_text(message.chat.id),reply_markup=admin_kb(message.chat.id))
 @dp.message(Command("AiHouse"))
-async def cmd_house(message: Message):
-    if not message.from_user or not is_admin(message.from_user.id):
-        return
-    if message.chat.type not in ("group", "supergroup"):
-        return
-    total = await get_house_total(message.chat.id)
-    total_all = await get_house_total(None)
-    by = await get_house_by_source()
-    lines = [f"💼 <b>Касса</b>\n", f"💰 В этом чате: <b>${total:.4f}</b>", f"📈 Всего: <b>${total_all:.4f}</b>\n"]
+async def cmd_house(message:Message):
+    if not message.from_user or not is_admin(message.from_user.id): return
+    if message.chat.type not in ("group","supergroup"): return
+    t=await get_house_total(message.chat.id); ta=await get_house_total(None); by=await get_house_by_source()
+    lines=[f"💼 <b>Касса</b>\n",f"💰 Чат: <b>${t:.4f}</b>",f"📈 Всего: <b>${ta:.4f}</b>\n"]
     if by:
-        lines.append("<b>По источникам:</b>")
-        for src, amt in sorted(by.items(), key=lambda x: -x[1]):
-            lines.append(f"• {src}: ${amt:.4f}")
-    await safe_send(message.reply, "\n".join(lines))
-
-
+        lines.append("<b>Источники:</b>")
+        for s,a in sorted(by.items(),key=lambda x:-x[1]): lines.append(f"• {s}: ${a:.4f}")
+    await safe_send(message.reply,"\n".join(lines))
 @dp.message(Command("AiPot"))
-async def cmd_aipot(message: Message):
-    if not message.from_user or not is_admin(message.from_user.id):
-        return
-    if message.chat.type not in ("group", "supergroup"):
-        return
-    pot = await get_pot(message.chat.id)
-    await safe_send(message.reply,
-        f"🎰 <b>Копилка чата</b>\n\nСейчас в фонде: <b>${pot:.4f}</b>\n\n"
-        f"/AiPotAdd &lt;сумма&gt; — пополнить\n/AiPotTake &lt;сумма&gt; — снять себе\n"
-        f"/AiPotGive — раздать сейчас\n\nАвто-раздача в <b>{POT_HOUR}:00 МСК</b>")
-
-
+async def cmd_aipot(message:Message):
+    if not message.from_user or not is_admin(message.from_user.id): return
+    if message.chat.type not in ("group","supergroup"): return
+    p=await get_pot(message.chat.id)
+    await safe_send(message.reply,f"🎰 <b>Копилка</b>\n\nСейчас: <b>${p:.4f}</b>\n\n/AiPotAdd &lt;сумма&gt;\n/AiPotTake &lt;сумма&gt;\n/AiPotGive\n\nАвто: <b>{POT_HOUR}:00 МСК</b>")
 @dp.message(Command("AiPotAdd"))
-async def cmd_aipotadd(message: Message):
-    if not message.from_user or not is_admin(message.from_user.id):
-        return
-    parts = (message.text or "").split()
-    if len(parts) != 2:
-        await safe_send(message.reply, "Формат: <code>/AiPotAdd 0.50</code>")
-        return
-    try:
-        amount = round(float(parts[1]), 4)
-    except ValueError:
-        await safe_send(message.reply, "Сумма — число.")
-        return
-    if amount <= 0:
-        await safe_send(message.reply, "Сумма должна быть > 0.")
-        return
-    new_pot = await add_to_pot(message.chat.id, amount)
-    if new_pot is None:
-        await safe_send(message.reply, "Ошибка.")
-        return
-    await safe_send(message.reply, f"✅ Добавлено <b>${amount:.4f}</b>\n🎰 В фонде: <b>${new_pot:.4f}</b>")
-
-
+async def cmd_aipotadd(message:Message):
+    if not message.from_user or not is_admin(message.from_user.id): return
+    parts=(message.text or "").split()
+    if len(parts)!=2: await safe_send(message.reply,"Формат: <code>/AiPotAdd 0.50</code>"); return
+    try: a=round(float(parts[1]),4)
+    except ValueError: await safe_send(message.reply,"Число."); return
+    if a<=0: await safe_send(message.reply,"&gt; 0"); return
+    np=await add_to_pot(message.chat.id,a)
+    if np is None: await safe_send(message.reply,"Ошибка"); return
+    await safe_send(message.reply,f"✅ +${a:.4f}\n🎰 ${np:.4f}")
 @dp.message(Command("AiPotTake"))
-async def cmd_aipottake(message: Message):
-    if not message.from_user or not is_admin(message.from_user.id):
-        return
-    parts = (message.text or "").split()
-    if len(parts) != 2:
-        await safe_send(message.reply, "Формат: <code>/AiPotTake 0.50</code>")
-        return
-    try:
-        amount = round(float(parts[1]), 4)
-    except ValueError:
-        await safe_send(message.reply, "Сумма — число.")
-        return
-    if amount <= 0:
-        await safe_send(message.reply, "Сумма должна быть > 0.")
-        return
-    ok, new_pot = await pot_take(message.chat.id, amount)
-    if not ok:
-        await safe_send(message.reply, f"❌ В копилке только ${new_pot:.4f}")
-        return
-    await add_balance(message.chat.id, message.from_user.id, amount)
-    await safe_send(message.reply,
-        f"✅ Снято <b>${amount:.4f}</b>\n💰 Зачислено тебе\n🎰 В фонде: <b>${new_pot:.4f}</b>")
-
-
+async def cmd_aipottake(message:Message):
+    if not message.from_user or not is_admin(message.from_user.id): return
+    parts=(message.text or "").split()
+    if len(parts)!=2: await safe_send(message.reply,"Формат: <code>/AiPotTake 0.50</code>"); return
+    try: a=round(float(parts[1]),4)
+    except ValueError: await safe_send(message.reply,"Число."); return
+    if a<=0: await safe_send(message.reply,"&gt; 0"); return
+    ok,np=await pot_take(message.chat.id,a)
+    if not ok: await safe_send(message.reply,f"❌ Только ${np:.4f}"); return
+    await add_balance(message.chat.id,message.from_user.id,a)
+    await safe_send(message.reply,f"✅ Снято ${a:.4f}\n🎰 ${np:.4f}")
 @dp.message(Command("AiPotGive"))
-async def cmd_aipotgive(message: Message):
-    if not message.from_user or not is_admin(message.from_user.id):
-        return
-    if message.chat.type not in ("group", "supergroup"):
-        return
-    ok, info = await distribute_pot(message.chat.id, reason="manual")
-    if not ok:
-        await safe_send(message.reply, f"❌ {info}")
-
-
+async def cmd_aipotgive(message:Message):
+    if not message.from_user or not is_admin(message.from_user.id): return
+    if message.chat.type not in ("group","supergroup"): return
+    ok,info=await distribute_pot(message.chat.id,reason="manual")
+    if not ok: await safe_send(message.reply,f"❌ {info}")
+@dp.message(Command("AiGive"))
+async def cmd_aigive(message:Message):
+    if not message.from_user or not is_admin(message.from_user.id): return
+    parts=(message.text or "").split()
+    if len(parts)<3: await safe_send(message.reply,"Формат: <code>/AiGive &lt;user_id&gt; &lt;сумма&gt; [причина]</code>"); return
+    try: target=int(parts[1]); amt=round(float(parts[2]),4)
+    except ValueError: await safe_send(message.reply,"user_id и сумма — числа."); return
+    if amt<=0 or amt>100: await safe_send(message.reply,"Сумма: 0.0001-100"); return
+    reason=" ".join(parts[3:]) if len(parts)>3 else "admin_give"
+    nb=await add_balance(message.chat.id,target,amt)
+    if nb is None: await safe_send(message.reply,"❌ Ошибка начисления (нет игрока?)"); return
+    await log_house_income(message.chat.id,-amt,f"admin_give:{reason[:50]}")
+    try: await bot.send_message(target,f"🎁 <b>Начисление от админа</b>\n\n💰 +${amt:.4f} USDT\n💼 Баланс: <b>${nb:.4f}</b>\n📝 {reason}")
+    except Exception: pass
+    await safe_send(message.reply,f"✅ <code>{target}</code> +${amt:.4f}\n💰 Баланс: ${nb:.4f}\n📝 {reason}")
 def parse_duration(s):
-    s = s.lower().strip()
-    if s in ("perm", "forever", "навсегда", "permanent"):
-        return None
-    units = {"m": 60, "h": 3600, "d": 86400, "w": 604800}
-    if s and s[-1] in units:
-        try:
-            return timedelta(seconds=int(s[:-1]) * units[s[-1]])
-        except ValueError:
-            return "error"
+    s=s.lower().strip()
+    if s in ("perm","forever","навсегда","permanent"): return None
+    u={"m":60,"h":3600,"d":86400,"w":604800}
+    if s and s[-1] in u:
+        try: return timedelta(seconds=int(s[:-1])*u[s[-1]])
+        except ValueError: return "error"
     return "error"
-
-
 @dp.message(Command("AiBan"))
-async def cmd_aiban(message: Message):
-    if not message.from_user or not is_admin(message.from_user.id):
-        return
-    parts = (message.text or "").split(maxsplit=3)
-    if len(parts) < 2:
-        await safe_send(message.reply, "📛 <code>/AiBan &lt;id&gt; [время] [причина]</code>")
-        return
-    try:
-        target = int(parts[1])
-    except ValueError:
-        await safe_send(message.reply, "user_id — целое число.")
-        return
-    duration = None
-    reason = "без причины"
-    banned_until = None
-    if len(parts) >= 3:
-        parsed = parse_duration(parts[2])
-        if parsed == "error":
-            reason = " ".join(parts[2:])
+async def cmd_aiban(message:Message):
+    if not message.from_user or not is_admin(message.from_user.id): return
+    parts=(message.text or "").split(maxsplit=3)
+    if len(parts)<2: await safe_send(message.reply,"📛 <code>/AiBan &lt;id&gt; [время] [причина]</code>"); return
+    try: t=int(parts[1])
+    except ValueError: await safe_send(message.reply,"user_id — целое"); return
+    dur=None; reason="без причины"; bu=None
+    if len(parts)>=3:
+        p=parse_duration(parts[2])
+        if p=="error": reason=" ".join(parts[2:])
         else:
-            duration = parsed
-            reason = parts[3] if len(parts) > 3 else "без причины"
-            if duration is not None:
-                banned_until = (datetime.now(timezone.utc) + duration).isoformat()
-    await ban_user(message.chat.id, target, reason, message.from_user.id, banned_until)
-
-    if banned_until:
-        await safe_send(message.reply,
-            f"🔨 <code>{target}</code> забанен до <b>{banned_until[:19].replace('T', ' ')} UTC</b>\nПричина: {reason}")
-    else:
-        await safe_send(message.reply, f"🔨 <code>{target}</code> забанен <b>навсегда</b>\nПричина: {reason}")
-
-
+            dur=p; reason=parts[3] if len(parts)>3 else "без причины"
+            if dur is not None: bu=(datetime.now(timezone.utc)+dur).isoformat()
+    await ban_user(message.chat.id,t,reason,message.from_user.id,bu)
+    if bu: await safe_send(message.reply,f"🔨 <code>{t}</code> до <b>{bu[:19].replace('T',' ')} UTC</b>\nПричина: {reason}")
+    else: await safe_send(message.reply,f"🔨 <code>{t}</code> <b>навсегда</b>\nПричина: {reason}")
 @dp.message(Command("AiUnban"))
-async def cmd_aiunban(message: Message):
-    if not message.from_user or not is_admin(message.from_user.id):
-        return
-    parts = (message.text or "").split()
-    if len(parts) != 2:
-        await safe_send(message.reply, "Формат: <code>/AiUnban &lt;user_id&gt;</code>")
-        return
-    try:
-        target = int(parts[1])
-    except ValueError:
-        await safe_send(message.reply, "user_id — целое.")
-        return
-    await unban_user(message.chat.id, target)
-    await safe_send(message.reply, f"✅ <code>{target}</code> разбанен.")
-
-
+async def cmd_aiunban(message:Message):
+    if not message.from_user or not is_admin(message.from_user.id): return
+    parts=(message.text or "").split()
+    if len(parts)!=2: await safe_send(message.reply,"Формат: <code>/AiUnban &lt;id&gt;</code>"); return
+    try: t=int(parts[1])
+    except ValueError: await safe_send(message.reply,"user_id — целое"); return
+    await unban_user(message.chat.id,t); await safe_send(message.reply,f"✅ <code>{t}</code> разбанен")
 @dp.callback_query(F.data.startswith("adm:"))
-async def on_admin_cb(cb: CallbackQuery):
-    if not cb.from_user or not is_admin(cb.from_user.id):
-        await cb.answer("⛔", show_alert=True)
-        return
-    if not isinstance(cb.message, Message):
-        await cb.answer()
-        return
-    cid = cb.message.chat.id
-    action = cb.data.split(":")[1]
-
-    if action == "toggle":
+async def on_admin_cb(cb:CallbackQuery):
+    if not cb.from_user or not is_admin(cb.from_user.id): await cb.answer("⛔",show_alert=True); return
+    if not isinstance(cb.message,Message): await cb.answer(); return
+    cid=cb.message.chat.id; action=cb.data.split(":")[1]
+    if action=="toggle":
         if cid in QUIZ_ENABLED:
-            QUIZ_ENABLED.discard(cid)
-            ACTIVE_QUESTIONS.pop(cid, None)
-            await clear_active(cid)
-            await cb.answer("Выключено")
-        else:
-            QUIZ_ENABLED.add(cid)
-            await cb.answer("Включено")
-        await safe_edit(cb.message.edit_text, admin_text(cid), reply_markup=admin_kb(cid))
+            QUIZ_ENABLED.discard(cid); ACTIVE_QUESTIONS.pop(cid,None); await clear_active(cid); await cb.answer("Выкл")
+        else: QUIZ_ENABLED.add(cid); await cb.answer("Вкл")
+        await safe_edit(cb.message.edit_text,admin_text(cid),reply_markup=admin_kb(cid)); return
+    if action=="ask": QUIZ_ENABLED.add(cid); await cb.answer("Задаю..."); asyncio.create_task(ask_question(cid)); return
+    if action=="difficulty":
+        s=await get_chat_settings(cid); cur=s.get("difficulty","medium")
+        def m(d): return f"{'✅ ' if d==cur else ''}{DIFFICULTY_LABELS[d]}"
+        kb=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=m("easy"),callback_data="adm:diff_set:easy")],[InlineKeyboardButton(text=m("medium"),callback_data="adm:diff_set:medium")],[InlineKeyboardButton(text=m("hard"),callback_data="adm:diff_set:hard")],[InlineKeyboardButton(text=m("extreme"),callback_data="adm:diff_set:extreme")],[InlineKeyboardButton(text="⬅️ Назад",callback_data="adm:menu")]])
+        await safe_edit(cb.message.edit_text,f"🎯 <b>Сложность</b>\n\nТекущая: <b>{DIFFICULTY_LABELS.get(cur,cur)}</b>\n\n🟢 Легко\n🟡 Средне\n🟠 Сложно\n🔴 Экстрим",reply_markup=kb); await cb.answer(); return
+    if action=="diff_set":
+        d=cb.data.split(":")[2]
+        if d not in ("easy","medium","hard","extreme"): await cb.answer("Ошибка",show_alert=True); return
+        ok=await update_chat_setting(cid,"difficulty",d)
+        if not ok: await cb.answer("❌",show_alert=True); return
+        await cb.answer(f"ОК: {DIFFICULTY_LABELS[d]}")
+        s=await get_chat_settings(cid); cur=s.get("difficulty","medium")
+        def mm(x): return f"{'✅ ' if x==cur else ''}{DIFFICULTY_LABELS[x]}"
+        kb=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=mm("easy"),callback_data="adm:diff_set:easy")],[InlineKeyboardButton(text=mm("medium"),callback_data="adm:diff_set:medium")],[InlineKeyboardButton(text=mm("hard"),callback_data="adm:diff_set:hard")],[InlineKeyboardButton(text=mm("extreme"),callback_data="adm:diff_set:extreme")],[InlineKeyboardButton(text="⬅️ Назад",callback_data="adm:menu")]])
+        await safe_edit(cb.message.edit_reply_markup,reply_markup=kb); return
+    if action=="menu": await safe_edit(cb.message.edit_text,admin_text(cid),reply_markup=admin_kb(cid)); await cb.answer(); return
+    if action=="stats":
+        await cb.answer("Собираю..."); pl,po,ba,su=await get_stats()
+        tb=sum(float(p["balance"]) for p in pl); tc=sum(int(p["correct_answers"]) for p in pl)
+        fin=[p for p in po if p["status"]=="finished"]; ps=sum(float(p["amount"]) for p in fin)
+        h=await get_house_total(cid); pt=await get_pot(cid)
+        await safe_send(cb.message.answer,f"📊 <b>Стата</b>\n\n👥 Игроков: {len(pl)}\n🏆 Очков: {tc}\n💎 Подписчиков: {len(su)}\n🚫 Забанено: {len(ba)}\n\n💰 Балансы: ${tb:.4f}\n💼 Касса: ${h:.4f}\n🎰 Копилка: ${pt:.4f}\n💸 Выплат: {len(fin)} (${ps:.4f})"); return
+    if action=="pot":
+        await cb.answer(); p=await get_pot(cid)
+        kb=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🎉 Раздать сейчас",callback_data="adm:potgive")],[InlineKeyboardButton(text="🔄 Обновить",callback_data="adm:pot")],[InlineKeyboardButton(text="⬅️ Назад",callback_data="adm:menu")]])
+        await safe_send(cb.message.answer,f"🎰 <b>Копилка</b>\n\nВ фонде: <b>${p:.4f}</b>\n\n/AiPotAdd 0.50\n/AiPotTake 0.50\n\nАвто: <b>{POT_HOUR}:00 МСК</b>",reply_markup=kb); return
+    if action=="potgive":
+        await cb.answer("Раздаю..."); ok,info=await distribute_pot(cid,reason="manual")
+        if not ok: await safe_send(cb.message.answer,f"❌ {info}")
         return
-
-    if action == "ask":
-        QUIZ_ENABLED.add(cid)
-        await cb.answer("Задаю...")
-        asyncio.create_task(ask_question(cid))
-        return
-
-    if action == "difficulty":
-        s = await get_chat_settings(cid)
-        cur = s.get("difficulty", "medium")
-        def m(d):
-            return f"{'✅ ' if d == cur else ''}{DIFFICULTY_LABELS[d]}"
-        kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text=m("easy"), callback_data="adm:diff_set:easy")],
-            [InlineKeyboardButton(text=m("medium"), callback_data="adm:diff_set:medium")],
-            [InlineKeyboardButton(text=m("hard"), callback_data="adm:diff_set:hard")],
-            [InlineKeyboardButton(text=m("extreme"), callback_data="adm:diff_set:extreme")],
-            [InlineKeyboardButton(text="⬅️ Назад", callback_data="adm:menu")],
-        ])
-        await safe_edit(cb.message.edit_text,
-            f"🎯 <b>Сложность викторины</b>\n\nТекущая: <b>{DIFFICULTY_LABELS.get(cur, cur)}</b>\n\n"
-            f"🟢 Легко\n🟡 Средне\n🟠 Сложно\n🔴 Экстрим\n\n<i>+1 очко за любой правильный ответ</i>",
-            reply_markup=kb)
-        await cb.answer()
-        return
-
-    if action == "diff_set":
-        d = cb.data.split(":")[2]
-        if d not in ("easy", "medium", "hard", "extreme"):
-            await cb.answer("Ошибка", show_alert=True)
-            return
-        ok = await update_chat_setting(cid, "difficulty", d)
-        if not ok:
-            await cb.answer("❌ Не сохранилось. Смотри логи.", show_alert=True)
-            return
-        await cb.answer(f"Установлено: {DIFFICULTY_LABELS[d]}")
-        s = await get_chat_settings(cid)
-        cur = s.get("difficulty", "medium")
-        def m(x):
-            return f"{'✅ ' if x == cur else ''}{DIFFICULTY_LABELS[x]}"
-        kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text=m("easy"), callback_data="adm:diff_set:easy")],
-            [InlineKeyboardButton(text=m("medium"), callback_data="adm:diff_set:medium")],
-            [InlineKeyboardButton(text=m("hard"), callback_data="adm:diff_set:hard")],
-            [InlineKeyboardButton(text=m("extreme"), callback_data="adm:diff_set:extreme")],
-            [InlineKeyboardButton(text="⬅️ Назад", callback_data="adm:menu")],
-        ])
-        await safe_edit(cb.message.edit_reply_markup, reply_markup=kb)
-        return
-
-    if action == "menu":
-        await safe_edit(cb.message.edit_text, admin_text(cid), reply_markup=admin_kb(cid))
-        await cb.answer()
-        return
-
-    if action == "stats":
-        await cb.answer("Собираю...")
-        players, payouts, bans, subs = await get_stats()
-        tb = sum(float(p["balance"]) for p in players)
-        tc = sum(int(p["correct_answers"]) for p in players)
-        fin = [p for p in payouts if p["status"] == "finished"]
-        ps = sum(float(p["amount"]) for p in fin)
-        house = await get_house_total(cid)
-        pot = await get_pot(cid)
-        await safe_send(cb.message.answer,
-            f"📊 <b>Статистика</b>\n\n👥 Игроков: {len(players)}\n🏆 Очков: {tc}\n"
-            f"💎 Подписчиков: {len(subs)}\n🚫 Забанено: {len(bans)}\n\n"
-            f"💰 Балансов: ${tb:.4f}\n💼 Касса: ${house:.4f}\n🎰 Копилка: ${pot:.4f}\n"
-            f"💸 Выплат: {len(fin)} (${ps:.4f})")
-        return
-
-    if action == "pot":
-        await cb.answer()
-        pot = await get_pot(cid)
-        kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🎉 Раздать сейчас", callback_data="adm:potgive")],
-            [InlineKeyboardButton(text="🔄 Обновить", callback_data="adm:pot")],
-            [InlineKeyboardButton(text="⬅️ Назад", callback_data="adm:menu")],
-        ])
-        await safe_send(cb.message.answer,
-            f"🎰 <b>Копилка чата</b>\n\nСейчас в фонде: <b>${pot:.4f}</b>\n\n"
-            f"Пополнить: <code>/AiPotAdd 0.50</code>\nСнять: <code>/AiPotTake 0.50</code>\n"
-            f"Авто-раздача в <b>{POT_HOUR}:00 МСК</b>",
-            reply_markup=kb)
-        return
-
-    if action == "potgive":
-        await cb.answer("Раздаю...")
-        ok, info = await distribute_pot(cid, reason="manual")
-        if not ok:
-            await safe_send(cb.message.answer, f"❌ {info}")
-        return
-
-    if action == "house":
-        await cb.answer()
-        total = await get_house_total(cid)
-        total_all = await get_house_total(None)
-        by = await get_house_by_source()
-        lines = [f"💼 <b>Касса</b>\n", f"💰 В этом чате: <b>${total:.4f}</b>", f"📈 Всего: <b>${total_all:.4f}</b>\n"]
+    if action=="house":
+        await cb.answer(); t=await get_house_total(cid); ta=await get_house_total(None); by=await get_house_by_source()
+        lines=[f"💼 <b>Касса</b>\n",f"💰 Чат: <b>${t:.4f}</b>",f"📈 Всего: <b>${ta:.4f}</b>\n"]
         if by:
-            lines.append("<b>По источникам:</b>")
-            for src, amt in sorted(by.items(), key=lambda x: -x[1]):
-                lines.append(f"• {src}: ${amt:.4f}")
-        await safe_send(cb.message.answer, "\n".join(lines))
-        return
-
-    if action == "payouts":
-        await cb.answer()
-        rows = await get_payouts(20)
-        if not rows:
-            await safe_send(cb.message.answer, "Выплат не было.")
-            return
-        lines = ["💸 <b>Выплаты</b>"]
+            lines.append("<b>Источники:</b>")
+            for s,a in sorted(by.items(),key=lambda x:-x[1]): lines.append(f"• {s}: ${a:.4f}")
+        await safe_send(cb.message.answer,"\n".join(lines)); return
+    if action=="payouts":
+        await cb.answer(); rows=await get_payouts(20)
+        if not rows: await safe_send(cb.message.answer,"Выплат не было."); return
+        lines=["💸 <b>Выплаты</b>"]
         for p in rows:
-            dt = (p.get("created_at") or "")[:19].replace("T", " ")
-            em = "✅" if p["status"] == "finished" else "❌"
+            dt=(p.get("created_at") or "")[:19].replace("T"," "); em="✅" if p["status"]=="finished" else "❌"
             lines.append(f"{em} ${float(p['amount']):.4f} · <code>{p['user_id']}</code> · {dt}")
-        await safe_send(cb.message.answer, "\n".join(lines))
-        return
-
-    if action == "top":
+        await safe_send(cb.message.answer,"\n".join(lines)); return
+    if action=="top":
+        await cb.answer(); rows=await get_top(cid,10)
+        if not rows: await safe_send(cb.message.answer,"Никто не играл."); return
+        lines=["🏆 <b>Топ</b>"]
+        for i,r in enumerate(rows,1):
+            ca=int(r.get("correct_answers",0)); _,em,_,_,_,_=level_info(ca)
+            nm=r.get("first_name") or r.get("username") or str(r["user_id"]); med=["🥇","🥈","🥉"][i-1] if i<=3 else f"{i}."
+            lines.append(f"{med} {em} {nm} — {ca} очк · ${float(r['balance']):.4f}")
+        await safe_send(cb.message.answer,"\n".join(lines)); return
+    if action=="bans":
         await cb.answer()
-        rows = await get_top(cid, 10)
-        if not rows:
-            await safe_send(cb.message.answer, "Никто не играл.")
-            return
-        lines = ["🏆 <b>Топ по очкам</b>"]
-        for i, row in enumerate(rows, 1):
-            ca = int(row.get("correct_answers", 0))
-            _, emoji, _, _, _, _ = level_info(ca)
-            nm = row.get("first_name") or row.get("username") or str(row["user_id"])
-            medal = ["🥇", "🥈", "🥉"][i-1] if i <= 3 else f"{i}."
-            lines.append(f"{medal} {emoji} {nm} — {ca} очк. · ${float(row['balance']):.4f}")
-        await safe_send(cb.message.answer, "\n".join(lines))
-        return
-
-    if action == "bans":
-        await cb.answer()
-        def _q():
-            try:
-                return supabase.table("quiz_bans").select("*").eq("chat_id", cid).execute().data or []
-            except Exception:
-                return []
-        rows = await asyncio.to_thread(_q)
-        if not rows:
-            await safe_send(cb.message.answer, "Забаненных нет.")
-            return
-        lines = ["🚫 <b>Забаненные</b>"]
+        def q():
+            try: return supabase.table("quiz_bans").select("*").eq("chat_id",cid).execute().data or []
+            except Exception: return []
+        rows=await asyncio.to_thread(q)
+        if not rows: await safe_send(cb.message.answer,"Забаненных нет."); return
+        lines=["🚫 <b>Забаненные</b>"]
         for b in rows:
-            until = b.get("banned_until")
-            if until:
-                lines.append(f"<code>{b['user_id']}</code> — до {until[:19].replace('T', ' ')} UTC · {b.get('reason','—')}")
-            else:
-                lines.append(f"<code>{b['user_id']}</code> — навсегда · {b.get('reason','—')}")
-        await safe_send(cb.message.answer, "\n".join(lines))
-        return
-
-    if action == "xrdbg":
-        await cb.answer("Проверяю...")
-        msg = await safe_send(cb.message.answer, "⏳ Проверка...")
-        info = await xrocket_debug()
+            u=b.get("banned_until")
+            if u: lines.append(f"<code>{b['user_id']}</code> — до {u[:19].replace('T',' ')} UTC · {b.get('reason','—')}")
+            else: lines.append(f"<code>{b['user_id']}</code> — навсегда · {b.get('reason','—')}")
+        await safe_send(cb.message.answer,"\n".join(lines)); return
+    if action=="xrdbg":
+        await cb.answer("Проверяю..."); msg=await safe_send(cb.message.answer,"⏳..."); info=await xrocket_debug()
         if msg:
-            try:
-                await msg.edit_text(info)
-            except Exception:
-                pass
+            try: await msg.edit_text(info)
+            except Exception: pass
         return
-
-
 async def xrocket_debug():
-    lines = ["🧪 <b>xRocket</b>", f"Key: <code>{XROCKET_API_KEY[:12]}...</code>", ""]
-    if not XROCKET_API_KEY:
-        lines.append("❌ XROCKET_API_KEY пуст")
-        return "\n".join(lines)
+    lines=["🧪 <b>xRocket</b>",f"Key: <code>{XROCKET_API_KEY[:12]}...</code>",""]
+    if not XROCKET_API_KEY: lines.append("❌ пусто"); return "\n".join(lines)
     try:
-        s = await get_http()
-        for url in (f"{XROCKET_BASE}/api/v1/me", f"{XROCKET_BASE}/api/v1/balance"):
+        s=await get_http()
+        for u in (f"{XROCKET_BASE}/api/v1/me",f"{XROCKET_BASE}/api/v1/balance"):
             try:
-                async with s.get(url, headers={"Authorization": f"Bearer {XROCKET_API_KEY}"}) as r:
-                    text = (await r.text())[:200]
-                    lines.append(f"[{r.status}] <code>{url}</code>\n<code>{text}</code>\n")
-            except Exception as e:
-                lines.append(f"[ERR] {url}: <code>{e}</code>")
-    except Exception as e:
-        lines.append(f"[ERR] {e}")
+                async with s.get(u,headers={"Authorization":f"Bearer {XROCKET_API_KEY}"}) as r:
+                    t=(await r.text())[:200]; lines.append(f"[{r.status}] <code>{u}</code>\n<code>{t}</code>\n")
+            except Exception as e: lines.append(f"[ERR] {u}: <code>{e}</code>")
+    except Exception as e: lines.append(f"[ERR] {e}")
     return "\n".join(lines)
-
-
 @dp.message(Command("AiSubscribe"))
-async def cmd_aisub(message: Message):
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="💎 Оформить $0.50/нед", url=XROCKET_SUBSCRIBE_URL)],
-    ])
-    await safe_send(message.reply,
-        f"💎 <b>Подписка ×{SUBSCRIBER_MULTIPLIER}</b>\n\n"
-        f"Цена: <b>${SUBSCRIPTION_PRICE:.2f}/нед</b>\n\nОформить через @xrocket:",
-        reply_markup=kb)
-
-
+async def cmd_aisub(message:Message):
+    kb=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="💎 Оформить $0.50/нед",url=XROCKET_SUBSCRIBE_URL)]])
+    await safe_send(message.reply,f"💎 <b>Подписка ×{SUBSCRIBER_MULTIPLIER}</b>\n\nЦена: <b>${SUBSCRIPTION_PRICE:.2f}/нед</b>\n\nОформить через @xrocket:",reply_markup=kb)
 @dp.message(Command("AiBalance"))
-async def cmd_aibalance(message: Message):
-    if message.chat.type not in ("group", "supergroup") or not message.from_user:
-        return
-    p = await get_player(message.chat.id, message.from_user.id,
-                         message.from_user.username, message.from_user.first_name)
-    today = await withdrawn_today(message.chat.id, message.from_user.id)
-    ca = int(p["correct_answers"])
-    _, _, _, _, title_str, _ = level_info(ca)
-    bar = make_progress_bar(ca)
-    sub = is_subscriber_cached(message.chat.id, message.from_user.id)
-    sub_line = f"\n💎 Подписка · ×{SUBSCRIBER_MULTIPLIER}" if sub else ""
-    await safe_send(message.reply,
-        f"💰 <b>${float(p['balance']):.4f} USDT</b>\n🎖 {title_str}\n🏆 Очков: <b>{ca}</b>\n"
-        f"<code>{bar}</code>{sub_line}\n"
-        f"💸 Выведено сегодня: ${today:.4f} / ${DAILY_WITHDRAW_LIMIT:.2f}\n"
-        f"📅 /AiDaily · 💳 /AiDeposit")
-
-
+async def cmd_aibalance(message:Message):
+    if message.chat.type not in ("group","supergroup") or not message.from_user: return
+    p=await get_player(message.chat.id,message.from_user.id,message.from_user.username,message.from_user.first_name)
+    td=await withdrawn_today(message.chat.id,message.from_user.id); ca=int(p["correct_answers"])
+    _,_,_,_,ts,_=level_info(ca); bar=make_progress_bar(ca); sub=is_subscriber_cached(message.chat.id,message.from_user.id)
+    sl=f"\n💎 Подписка · ×{SUBSCRIBER_MULTIPLIER}" if sub else ""
+    await safe_send(message.reply,f"💰 <b>${float(p['balance']):.4f} USDT</b>\n🎖 {ts}\n🏆 Очков: <b>{ca}</b>\n<code>{bar}</code>{sl}\n💸 Сегодня: ${td:.4f} / ${DAILY_WITHDRAW_LIMIT:.2f}\n💳 /AiDeposit · 🎴 /AiCard")
+@dp.message(Command("AiCard"))
+async def cmd_aicard(message:Message):
+    if message.chat.type not in ("group","supergroup") or not message.from_user: return
+    cid,uid=message.chat.id,message.from_user.id
+    p=await get_player(cid,uid,message.from_user.username,message.from_user.first_name)
+    ca=int(p["correct_answers"]); lvl,em,nm,_,_,_=level_info(ca)
+    place=await get_player_place(cid,uid); td=await withdrawn_today(cid,uid)
+    sub=is_subscriber_cached(cid,uid)
+    try:
+        png=render_profile_card(message.from_user.first_name or "Игрок",em,nm,lvl,ca,place,float(p["balance"]),td,sub)
+        buf=BufferedInputFile(png,filename="card.png")
+        await safe_send(bot.send_photo,cid,buf,caption=f"🎴 <b>{message.from_user.first_name}</b> · {em} {nm} (ур. {lvl})\n🏆 {ca} очк · 💰 ${float(p['balance']):.4f}")
+    except Exception as e:
+        log.warning("card: %s",e)
+        await safe_send(message.reply,f"🎴 {em} {nm} (ур. {lvl})\n🏆 {ca} очк · 💰 ${float(p['balance']):.4f}\n📍 #{place if place else '—'}")
 @dp.message(Command("AiProfile"))
-async def cmd_aiprofile(message: Message):
-    if message.chat.type not in ("group", "supergroup") or not message.from_user:
-        return
-    p = await get_player(message.chat.id, message.from_user.id,
-                         message.from_user.username, message.from_user.first_name)
-    ca = int(p["correct_answers"])
-    lvl, _, _, _, title_str, _ = level_info(ca)
-    bar = make_progress_bar(ca)
-    sub = is_subscriber_cached(message.chat.id, message.from_user.id)
-
-    place = await get_player_place(message.chat.id, message.from_user.id)
-    place_str = f"#{place}" if place else "—"
-    today = await withdrawn_today(message.chat.id, message.from_user.id)
-
-    if lvl >= MAX_LEVEL:
-        next_line = "🏆 Максимальный уровень!"
-    else:
-        in_lvl = ca - (lvl - 1) * ANSWERS_PER_LEVEL
-        rem = ANSWERS_PER_LEVEL - in_lvl
-        next_line = f"⬆️ До {LEVELS[lvl][1]} <b>{LEVELS[lvl][2]}</b>: <b>{rem}</b> очк."
-
-    sub_line = f"\n💎 Подписка: <b>активна</b>" if sub else "\n💎 Подписка: нет"
-    await safe_send(message.reply,
-        f"👤 <b>{message.from_user.first_name}</b>\n\n"
-        f"🎖 <b>{title_str}</b>{sub_line}\n\n<code>{bar}</code>\n{next_line}\n\n"
-        f"💰 Баланс: <b>${float(p['balance']):.4f}</b>\n💸 Выведено: ${today:.4f}\n"
-        f"🏆 Очков: <b>{ca}</b>\n📍 Место: <b>{place_str}</b>")
-
-
+async def cmd_aiprofile(message:Message):
+    if message.chat.type not in ("group","supergroup") or not message.from_user: return
+    p=await get_player(message.chat.id,message.from_user.id,message.from_user.username,message.from_user.first_name)
+    ca=int(p["correct_answers"]); lvl,_,_,_,ts,_=level_info(ca); bar=make_progress_bar(ca)
+    sub=is_subscriber_cached(message.chat.id,message.from_user.id)
+    place=await get_player_place(message.chat.id,message.from_user.id); ps=f"#{place}" if place else "—"
+    td=await withdrawn_today(message.chat.id,message.from_user.id)
+    nl="🏆 Максимальный уровень!" if lvl>=MAX_LEVEL else f"⬆️ До {LEVELS[lvl][1]} <b>{LEVELS[lvl][2]}</b>: <b>{ANSWERS_PER_LEVEL-(ca-(lvl-1)*ANSWERS_PER_LEVEL)}</b> очк."
+    sl=f"\n💎 Подписка: <b>активна</b>" if sub else "\n💎 Подписка: нет"
+    await safe_send(message.reply,f"👤 <b>{message.from_user.first_name}</b>\n\n🎖 <b>{ts}</b>{sl}\n\n<code>{bar}</code>\n{nl}\n\n💰 <b>${float(p['balance']):.4f}</b>\n💸 ${td:.4f}\n🏆 <b>{ca}</b>\n📍 <b>{ps}</b>\n\n🎴 /AiCard — карточка")
 @dp.message(Command("AiLevels"))
-async def cmd_ailevels(message: Message):
-    if message.chat.type not in ("group", "supergroup"):
-        return
-    lines = ["🎖 <b>Уровни</b>\n"]
-    for lvl, emoji, name in LEVELS:
-        mn = (lvl - 1) * ANSWERS_PER_LEVEL
-        req = f"{mn}+" if lvl == MAX_LEVEL else f"{mn}-{mn + ANSWERS_PER_LEVEL - 1}"
-        lines.append(f"{emoji} <b>Ур. {lvl}</b> · {name} · <i>{req} очк.</i>")
-    await safe_send(message.reply, "\n".join(lines))
-
-
+async def cmd_ailevels(message:Message):
+    if message.chat.type not in ("group","supergroup"): return
+    lines=["🎖 <b>Уровни</b>\n"]
+    for lvl,em,nm in LEVELS:
+        mn=(lvl-1)*ANSWERS_PER_LEVEL; req=f"{mn}+" if lvl==MAX_LEVEL else f"{mn}-{mn+ANSWERS_PER_LEVEL-1}"
+        lines.append(f"{em} <b>Ур. {lvl}</b> · {nm} · <i>{req} очк.</i>")
+    await safe_send(message.reply,"\n".join(lines))
 @dp.message(Command("AiTop"))
-async def cmd_aitop(message: Message):
-    if message.chat.type not in ("group", "supergroup"):
-        return
-    rows = await get_top(message.chat.id, 10)
-    if not rows:
-        await safe_send(message.reply, "Никто не играл.")
-        return
-    admin_view = message.from_user and is_admin(message.from_user.id)
-    lines = ["🏆 <b>Топ по очкам</b>"]
-    for i, row in enumerate(rows, 1):
-        ca = int(row.get("correct_answers", 0))
-        _, emoji, _, _, _, _ = level_info(ca)
-        nm = row.get("first_name") or row.get("username") or str(row["user_id"])
-        medal = ["🥇", "🥈", "🥉"][i-1] if i <= 3 else f"{i}."
-        uid = f" · <code>{row['user_id']}</code>" if admin_view else ""
-        lines.append(f"{medal} {emoji} {nm} — {ca} очк. · ${float(row['balance']):.4f}{uid}")
-    await safe_send(message.reply, "\n".join(lines))
-
-
+async def cmd_aitop(message:Message):
+    if message.chat.type not in ("group","supergroup"): return
+    rows=await get_top(message.chat.id,10)
+    if not rows: await safe_send(message.reply,"Никто не играл."); return
+    av=message.from_user and is_admin(message.from_user.id); lines=["🏆 <b>Топ</b>"]
+    for i,r in enumerate(rows,1):
+        ca=int(r.get("correct_answers",0)); _,em,_,_,_,_=level_info(ca)
+        nm=r.get("first_name") or r.get("username") or str(r["user_id"]); med=["🥇","🥈","🥉"][i-1] if i<=3 else f"{i}."
+        uid=f" · <code>{r['user_id']}</code>" if av else ""
+        lines.append(f"{med} {em} {nm} — {ca} очк · ${float(r['balance']):.4f}{uid}")
+    await safe_send(message.reply,"\n".join(lines))
 @dp.message(Command("AiDeposit"))
-async def cmd_deposit(message: Message):
-    if message.chat.type not in ("group", "supergroup") or not message.from_user:
-        return
-    parts = (message.text or "").split()
-    if len(parts) != 2:
-        await safe_send(message.reply,
-            f"💳 <b>Пополнение</b>\n\nФормат: <code>/AiDeposit 1.0</code>\n"
-            f"Мин: ${DEPOSIT_MIN:.2f} · Макс: ${DEPOSIT_MAX:.2f}")
-        return
-    try:
-        amount = round(float(parts[1]), 4)
-    except ValueError:
-        await safe_send(message.reply, "Сумма — число.")
-        return
-    if amount < DEPOSIT_MIN or amount > DEPOSIT_MAX:
-        await safe_send(message.reply, f"Сумма: ${DEPOSIT_MIN:.2f} — ${DEPOSIT_MAX:.2f}")
-        return
-
-    client_inv_id = f"dep_{message.from_user.id}_{uuid.uuid4().hex[:12]}"
-    ok, result = await xrocket_create_invoice(client_inv_id, amount, f"Deposit (user {message.from_user.id})")
-    if not ok:
-        await safe_send(message.reply, f"❌ <code>{result}</code>")
-        return
-
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=f"💳 Оплатить ${amount:.2f}", url=result)],
-    ])
-    sent = await safe_send(message.reply,
-        f"💳 <b>Счёт на пополнение</b>\n\nСумма: <b>${amount:.4f}</b> USDT\n"
-        f"Действителен 1 час.\n\nОплати в @xrocket — баланс зачислится автоматически.",
-        reply_markup=kb)
-    msg_id = sent.message_id if sent else None
-    await create_invoice(client_inv_id, message.from_user.id, message.chat.id, amount, msg_id, kind="deposit")
-
-
+async def cmd_deposit(message:Message):
+    if message.chat.type not in ("group","supergroup") or not message.from_user: return
+    parts=(message.text or "").split()
+    if len(parts)!=2: await safe_send(message.reply,f"💳 <b>Пополнение</b>\n\nФормат: <code>/AiDeposit 1.0</code>\nМин: ${DEPOSIT_MIN:.2f} · Макс: ${DEPOSIT_MAX:.2f}"); return
+    try: a=round(float(parts[1]),4)
+    except ValueError: await safe_send(message.reply,"Число."); return
+    if a<DEPOSIT_MIN or a>DEPOSIT_MAX: await safe_send(message.reply,f"${DEPOSIT_MIN:.2f}–${DEPOSIT_MAX:.2f}"); return
+    ciid=f"dep_{message.from_user.id}_{uuid.uuid4().hex[:12]}"; ok,res=await xrocket_create_invoice(ciid,a,f"Deposit {message.from_user.id}")
+    if not ok: await safe_send(message.reply,f"❌ <code>{res}</code>"); return
+    kb=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=f"💳 Оплатить ${a:.2f}",url=res)]])
+    sent=await safe_send(message.reply,f"💳 <b>Счёт</b>\n\nСумма: <b>${a:.4f}</b> USDT\nДействителен 1 час.\n\nОплати в @xrocket.",reply_markup=kb)
+    mid=sent.message_id if sent else None; await create_invoice(ciid,message.from_user.id,message.chat.id,a,mid,kind="deposit")
 @dp.message(Command("AiDuel"))
-async def cmd_duel(message: Message):
-    if message.chat.type not in ("group", "supergroup") or not message.from_user:
-        return
-    cid, uid = message.chat.id, message.from_user.id
-    if is_banned_cached(cid, uid):
-        await safe_send(message.reply, "🚫 Ты в бане.")
-        return
-    parts = (message.text or "").split()
-    if len(parts) < 2:
-        await safe_send(message.reply,
-            f"🎲 <b>Дуэль на кубах</b>\n\nФормат: <code>/AiDuel 0.20</code>\n"
-            f"Ставка: ${DUEL_MIN:.2f} — ${DUEL_MAX:.2f}")
-        return
-    try:
-        amount = round(float(parts[1]), 4)
-    except ValueError:
-        await safe_send(message.reply, "Ставка — число.")
-        return
-    if amount < DUEL_MIN or amount > DUEL_MAX:
-        await safe_send(message.reply, f"Ставка: ${DUEL_MIN:.2f} — ${DUEL_MAX:.2f}")
-        return
-
-    opponent_id = opponent_name = None
+async def cmd_duel(message:Message):
+    if message.chat.type not in ("group","supergroup") or not message.from_user: return
+    cid,uid=message.chat.id,message.from_user.id
+    if is_banned_cached(cid,uid): await safe_send(message.reply,"🚫 Бан"); return
+    parts=(message.text or "").split()
+    if len(parts)<2: await safe_send(message.reply,f"🎲 <b>Дуэль</b>\n\n<code>/AiDuel 0.20</code>\nСтавка: ${DUEL_MIN:.2f}–${DUEL_MAX:.2f}"); return
+    try: a=round(float(parts[1]),4)
+    except ValueError: await safe_send(message.reply,"Число."); return
+    if a<DUEL_MIN or a>DUEL_MAX: await safe_send(message.reply,f"${DUEL_MIN:.2f}–${DUEL_MAX:.2f}"); return
+    oid=onm=None
     if message.reply_to_message and message.reply_to_message.from_user:
-        opp = message.reply_to_message.from_user
-        opponent_id, opponent_name = opp.id, opp.first_name
+        o=message.reply_to_message.from_user; oid,onm=o.id,o.first_name
     elif message.entities:
-        for ent in message.entities:
-            if ent.type == "text_mention" and ent.user:
-                opponent_id, opponent_name = ent.user.id, ent.user.first_name
-                break
-
-    if not opponent_id:
-        await safe_send(message.reply, "Ответь на сообщение противника.")
-        return
-    if opponent_id == uid:
-        await safe_send(message.reply, "Себе нельзя 😄")
-        return
-    if opponent_id == bot.id:
-        await safe_send(message.reply, "С ботом нельзя 😄")
-        return
-
-    p_c = await get_player(cid, uid, message.from_user.username, message.from_user.first_name)
-    p_o = await get_player(cid, opponent_id)
-    if float(p_c["balance"]) < amount:
-        await safe_send(message.reply, f"❌ У тебя ${float(p_c['balance']):.4f}")
-        return
-    if float(p_o["balance"]) < amount:
-        await safe_send(message.reply, f"❌ У противника ${float(p_o['balance']):.4f}")
-        return
-    if uid in DUEL_BUSY or opponent_id in DUEL_BUSY:
-        await safe_send(message.reply, "⏳ Кто-то уже в дуэли.")
-        return
-
-    kb = InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="✅ Принять", callback_data=f"duel:a:{uid}:{opponent_id}:{amount}"),
-        InlineKeyboardButton(text="❌ Отклонить", callback_data=f"duel:r:{uid}:{opponent_id}:{amount}"),
-    ]])
-    sent = await safe_send(message.reply,
-        f"🎲 <b>Дуэль!</b>\n\n<b>{message.from_user.first_name}</b> вызывает <b>{opponent_name}</b>\n\n"
-        f"💵 Ставка: <b>${amount:.4f}</b>\n💰 Банк: <b>${amount*2:.4f}</b>\n"
-        f"<i>Рейк {RAKE_PCT*100:.0f}%</i>", reply_markup=kb)
-    if not sent:
-        return
-
-    async def auto_close():
+        for e in message.entities:
+            if e.type=="text_mention" and e.user: oid,onm=e.user.id,e.user.first_name; break
+    if not oid: await safe_send(message.reply,"Ответь на сообщение противника."); return
+    if oid==uid: await safe_send(message.reply,"Себе нельзя 😄"); return
+    if oid==bot.id: await safe_send(message.reply,"С ботом нельзя 😄"); return
+    pc=await get_player(cid,uid,message.from_user.username,message.from_user.first_name); po=await get_player(cid,oid)
+    if float(pc["balance"])<a: await safe_send(message.reply,f"❌ У тебя ${float(pc['balance']):.4f}"); return
+    if float(po["balance"])<a: await safe_send(message.reply,f"❌ У противника ${float(po['balance']):.4f}"); return
+    if uid in DUEL_BUSY or oid in DUEL_BUSY: await safe_send(message.reply,"⏳ Кто-то в дуэли"); return
+    kb=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="✅ Принять",callback_data=f"duel:a:{uid}:{oid}:{a}"),InlineKeyboardButton(text="❌ Отклонить",callback_data=f"duel:r:{uid}:{oid}:{a}")]])
+    sent=await safe_send(message.reply,f"🎲 <b>Дуэль!</b>\n\n<b>{message.from_user.first_name}</b> vs <b>{onm}</b>\n\n💵 <b>${a:.4f}</b>\n💰 Банк: <b>${a*2:.4f}</b>\n<i>Рейк {RAKE_PCT*100:.0f}%</i>",reply_markup=kb)
+    if not sent: return
+    async def ac():
         await asyncio.sleep(DUEL_TTL)
         try:
-            await bot.edit_message_reply_markup(cid, sent.message_id, reply_markup=None)
-            await bot.edit_message_text(chat_id=cid, message_id=sent.message_id,
-                text=f"⌛ <b>Дуэль истекла.</b>\n{opponent_name} не ответил.")
-        except Exception:
-            pass
-    asyncio.create_task(auto_close())
-
-
+            await bot.edit_message_reply_markup(cid,sent.message_id,reply_markup=None); await bot.edit_message_text(chat_id=cid,message_id=sent.message_id,text=f"⌛ <b>Истекла.</b>\n{onm} не ответил.")
+        except Exception: pass
+    asyncio.create_task(ac())
 @dp.callback_query(F.data.startswith("duel:"))
-async def on_duel_cb(cb: CallbackQuery):
-    if not cb.from_user or not isinstance(cb.message, Message):
-        await cb.answer()
-        return
-    parts = cb.data.split(":")
-    if len(parts) != 5:
-        await cb.answer("Ошибка", show_alert=True)
-        return
-    _, action, ch_s, op_s, amt_s = parts
-    try:
-        challenger_id = int(ch_s)
-        opponent_id = int(op_s)
-        amount = float(amt_s)
-    except ValueError:
-        await cb.answer("Ошибка", show_alert=True)
-        return
-    cid = cb.message.chat.id
-    if cb.from_user.id != opponent_id:
-        await cb.answer("Это не твой вызов.", show_alert=True)
-        return
-    if action == "r":
-        try:
-            await cb.message.edit_text(f"❌ <b>Отклонено.</b>\n{cb.from_user.first_name} отказался.")
-        except Exception:
-            pass
-        await cb.answer("Отклонено")
-        return
-
+async def on_duel_cb(cb:CallbackQuery):
+    if not cb.from_user or not isinstance(cb.message,Message): await cb.answer(); return
+    parts=cb.data.split(":")
+    if len(parts)!=5: await cb.answer("Ошибка",show_alert=True); return
+    _,action,cs,os_,as_=parts
+    try: ch=int(cs); op=int(os_); a=float(as_)
+    except ValueError: await cb.answer("Ошибка",show_alert=True); return
+    cid=cb.message.chat.id
+    if cb.from_user.id!=op: await cb.answer("Не твой вызов.",show_alert=True); return
+    if action=="r":
+        try: await cb.message.edit_text(f"❌ <b>Отклонено.</b>\n{cb.from_user.first_name} отказался.")
+        except Exception: pass
+        await cb.answer("Отклонено"); return
     await cb.answer("Поехали!")
-    if challenger_id in DUEL_BUSY or opponent_id in DUEL_BUSY:
-        try:
-            await cb.message.edit_text("⏳ Кто-то уже в дуэли.")
-        except Exception:
-            pass
+    if ch in DUEL_BUSY or op in DUEL_BUSY:
+        try: await cb.message.edit_text("⏳ Кто-то в дуэли")
+        except Exception: pass
         return
-    DUEL_BUSY.add(challenger_id)
-    DUEL_BUSY.add(opponent_id)
+    DUEL_BUSY.add(ch); DUEL_BUSY.add(op)
     try:
-        p_c = await get_player(cid, challenger_id)
-        p_o = await get_player(cid, opponent_id)
-        if float(p_c["balance"]) < amount or float(p_o["balance"]) < amount:
-            try:
-                await cb.message.edit_text("❌ У кого-то не хватает.")
-            except Exception:
-                pass
+        pc=await get_player(cid,ch); po=await get_player(cid,op)
+        if float(pc["balance"])<a or float(po["balance"])<a:
+            try: await cb.message.edit_text("❌ У кого-то не хватает")
+            except Exception: pass
             return
-        if not await deduct_balance(cid, challenger_id, amount):
-            try:
-                await cb.message.edit_text("❌ Не списать у вызывающего.")
-            except Exception:
-                pass
+        if not await deduct_balance(cid,ch,a):
+            try: await cb.message.edit_text("❌ Не списать у вызывающего")
+            except Exception: pass
             return
-        if not await deduct_balance(cid, opponent_id, amount):
-            await add_balance(cid, challenger_id, amount)
-            try:
-                await cb.message.edit_text("❌ Не списать у соперника.")
-            except Exception:
-                pass
+        if not await deduct_balance(cid,op,a):
+            await add_balance(cid,ch,a)
+            try: await cb.message.edit_text("❌ Не списать у соперника")
+            except Exception: pass
             return
-
-        # === КВЕСТЫ: дуэль началась ===
-        _day = _today_local()
-        try:
-            await daily_add_progress(cid, challenger_id, _day, "duel_play_1", 1)
-            await daily_add_progress(cid, opponent_id, _day, "duel_play_1", 1)
-            if amount > 0.50:
-                await daily_add_progress(cid, challenger_id, _day, "duel_big", 1)
-                await daily_add_progress(cid, opponent_id, _day, "duel_big", 1)
-        except Exception as e:
-            log.warning("duel quests: %s", e)
-
-        name_c = p_c.get("first_name") or str(challenger_id)
-        name_o = p_o.get("first_name") or str(opponent_id)
-        try:
-            await cb.message.edit_text(f"🎲 <b>Дуэль началась!</b>\n\n💰 Банк: <b>${amount*2:.4f}</b>\n🎯 {name_c} vs {name_o}")
-        except Exception:
-            pass
-        await asyncio.sleep(1)
-        m1 = await safe_send(bot.send_dice, cid, emoji="🎲")
-        r1 = m1.dice.value if m1 and m1.dice else 0
+        nc=pc.get("first_name") or str(ch); no=po.get("first_name") or str(op)
+        try: await cb.message.edit_text(f"🎲 <b>Началась!</b>\n\n💰 Банк: <b>${a*2:.4f}</b>\n🎯 {nc} vs {no}")
+        except Exception: pass
+        await asyncio.sleep(1); m1=await safe_send(bot.send_dice,cid,emoji="🎲"); r1=m1.dice.value if m1 and m1.dice else 0
+        await asyncio.sleep(2); m2=await safe_send(bot.send_dice,cid,emoji="🎲"); r2=m2.dice.value if m2 and m2.dice else 0
         await asyncio.sleep(2)
-        m2 = await safe_send(bot.send_dice, cid, emoji="🎲")
-        r2 = m2.dice.value if m2 and m2.dice else 0
-        await asyncio.sleep(2)
-
-        if r1 == r2:
-            await add_balance(cid, challenger_id, amount)
-            await add_balance(cid, opponent_id, amount)
-            await safe_send(bot.send_message, cid, f"🤝 <b>Ничья! {r1} : {r2}</b>\nСтавки возвращены.")
-            return
-
-        winner_id, winner_name = (challenger_id, name_c) if r1 > r2 else (opponent_id, name_o)
-        loser_id = opponent_id if winner_id == challenger_id else challenger_id
-
-        total_pot = round(amount * 2, 4)
-        rake = round(total_pot * RAKE_PCT, 4)
-        payout = round(total_pot - rake, 4)
-        await add_balance(cid, winner_id, payout)
-        await log_house_income(cid, rake, "duel")
-
-        # === КВЕСТ: победа в дуэли ===
-        try:
-            await daily_add_progress(cid, winner_id, _day, "duel_win_1", 1)
-        except Exception:
-            pass
-
-        await safe_send(bot.send_message, cid,
-            f"🏆 <b>{winner_name} победил!</b>\n\n🎲 {name_c}: <b>{r1}</b>\n🎲 {name_o}: <b>{r2}</b>\n\n"
-            f"💰 Забирает: <b>${payout:.4f}</b>\n<i>рейк {RAKE_PCT*100:.0f}% = ${rake:.4f}</i>")
-
-        try:
-            await bot.send_message(loser_id,
-                f"💔 <b>Проиграл дуэль</b> против {winner_name}\nСтавка <b>${amount:.4f}</b> списана.")
-        except Exception:
-            pass
+        if r1==r2:
+            await add_balance(cid,ch,a); await add_balance(cid,op,a)
+            await safe_send(bot.send_message,cid,f"🤝 <b>Ничья! {r1}:{r2}</b>\nСтавки возвращены."); return
+        wid,wn=(ch,nc) if r1>r2 else (op,no); lid=op if wid==ch else ch
+        tp=round(a*2,4); rk=round(tp*RAKE_PCT,4); pay=round(tp-rk,4)
+        await add_balance(cid,wid,pay); await log_house_income(cid,rk,"duel")
+        await safe_send(bot.send_message,cid,f"🏆 <b>{wn} победил!</b>\n\n🎲 {nc}: <b>{r1}</b>\n🎲 {no}: <b>{r2}</b>\n\n💰 <b>${pay:.4f}</b>\n<i>рейк {RAKE_PCT*100:.0f}% = ${rk:.4f}</i>")
+        try: await bot.send_message(lid,f"💔 <b>Проиграл</b> против {wn}\nСтавка <b>${a:.4f}</b> списана.")
+        except Exception: pass
     finally:
-        DUEL_BUSY.discard(challenger_id)
-        DUEL_BUSY.discard(opponent_id)
-
-
+        DUEL_BUSY.discard(ch); DUEL_BUSY.discard(op)
 @dp.message(Command("AiWithdraw"))
-async def cmd_aiwithdraw(message: Message):
-    if message.chat.type not in ("group", "supergroup") or not message.from_user:
-        return
-    cid, uid = message.chat.id, message.from_user.id
-    if is_banned_cached(cid, uid):
-        await safe_send(message.reply, "🚫 Ты в бане.")
-        return
-    p = await get_player(cid, uid, message.from_user.username, message.from_user.first_name)
-    bal = float(p["balance"])
-    if bal < MIN_WITHDRAW:
-        await safe_send(message.reply, f"❌ Минимум ${MIN_WITHDRAW:.2f}. У тебя ${bal:.4f}")
-        return
-    today = await withdrawn_today(cid, uid)
-    rem = DAILY_WITHDRAW_LIMIT - today
-    if rem <= 0:
-        await safe_send(message.reply, f"❌ Дневной лимит исчерпан.")
-        return
-    amount = min(bal, rem)
-
-    kb = InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="✅ Принять", callback_data=f"wd:accept:{uid}"),
-        InlineKeyboardButton(text="❌ Отклонить", callback_data=f"wd:reject:{uid}"),
-    ]])
-    sent = await safe_send(message.reply,
-        f"💸 <b>Вывод</b>\n\nСумма: <b>${amount:.4f}</b> USDT\nКуда: ID <code>{uid}</code>\n\n"
-        f"⚠️ Зайди в <a href=\"{XROCKET_REFERRAL_URL}\">@xrocket</a>.\n\n"
-        f"Запрос: {WITHDRAW_CONFIRM_TTL // 60} мин.", reply_markup=kb)
-    if not sent:
-        return
-    PENDING_WITHDRAWS[sent.message_id] = {"chat_id": cid, "user_id": uid, "amount": amount, "ts": time.time()}
-
-    async def auto_cancel():
-        await asyncio.sleep(WITHDRAW_CONFIRM_TTL)
-        info = PENDING_WITHDRAWS.pop(sent.message_id, None)
-        if not info:
-            return
-        try:
-            await bot.edit_message_text(chat_id=cid, message_id=sent.message_id,
-                text="⌛ <b>Запрос истёк.</b> /AiWithdraw снова.")
-        except Exception:
-            pass
-    asyncio.create_task(auto_cancel())
-
-
+async def cmd_aiwithdraw(message:Message):
+    if message.chat.type not in ("group","supergroup") or not message.from_user: return
+    cid,uid=message.chat.id,message.from_user.id
+    if is_banned_cached(cid,uid): await safe_send(message.reply,"🚫 Бан"); return
+    p=await get_player(cid,uid,message.from_user.username,message.from_user.first_name); bal=float(p["balance"])
+    if bal<MIN_WITHDRAW: await safe_send(message.reply,f"❌ Мин ${MIN_WITHDRAW:.2f}. У тебя ${bal:.4f}"); return
+    td=await withdrawn_today(cid,uid); rem=DAILY_WITHDRAW_LIMIT-td
+    if rem<=0: await safe_send(message.reply,"❌ Лимит на сутки"); return
+    a=min(bal,rem)
+    kb=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="✅ Принять",callback_data=f"wd:accept:{uid}"),InlineKeyboardButton(text="❌ Отклонить",callback_data=f"wd:reject:{uid}")]])
+    sent=await safe_send(message.reply,f"💸 <b>Вывод</b>\n\nСумма: <b>${a:.4f}</b> USDT\nКуда: <code>{uid}</code>\n\n⚠️ Зайди в <a href=\"{XROCKET_REFERRAL_URL}\">@xrocket</a>.\n\nЗапрос: {WITHDRAW_CONFIRM_TTL//60} мин.",reply_markup=kb)
+    if not sent: return
+    PENDING_WITHDRAWS[sent.message_id]={"chat_id":cid,"user_id":uid,"amount":a,"ts":time.time()}
+    async def ac():
+        await asyncio.sleep(WITHDRAW_CONFIRM_TTL); info=PENDING_WITHDRAWS.pop(sent.message_id,None)
+        if not info: return
+        try: await bot.edit_message_text(chat_id=cid,message_id=sent.message_id,text="⌛ <b>Запрос истёк.</b> /AiWithdraw снова.")
+        except Exception: pass
+    asyncio.create_task(ac())
 @dp.callback_query(F.data.startswith("wd:"))
-async def on_withdraw_cb(cb: CallbackQuery):
-    if not cb.from_user or not isinstance(cb.message, Message):
-        await cb.answer()
-        return
-    parts = cb.data.split(":")
-    if len(parts) != 3:
-        await cb.answer("Ошибка", show_alert=True)
-        return
-    action, owner_s = parts[1], parts[2]
-    try:
-        owner_id = int(owner_s)
-    except ValueError:
-        await cb.answer("Ошибка", show_alert=True)
-        return
-    if cb.from_user.id != owner_id:
-        await cb.answer("⛔ Не твой запрос.", show_alert=True)
-        return
-    info = PENDING_WITHDRAWS.pop(cb.message.message_id, None)
-    if not info:
-        await cb.answer("⌛ Уже истёк.", show_alert=True)
-        return
-    cid, uid, amount = info["chat_id"], info["user_id"], info["amount"]
-
-    if action == "reject":
-        try:
-            await cb.message.edit_text(f"❌ Отменено. ${amount:.4f} на балансе.")
-        except Exception:
-            pass
-        await cb.answer("Отменено")
-        return
-
+async def on_withdraw_cb(cb:CallbackQuery):
+    if not cb.from_user or not isinstance(cb.message,Message): await cb.answer(); return
+    parts=cb.data.split(":")
+    if len(parts)!=3: await cb.answer("Ошибка",show_alert=True); return
+    action,os_=parts[1],parts[2]
+    try: oid=int(os_)
+    except ValueError: await cb.answer("Ошибка",show_alert=True); return
+    if cb.from_user.id!=oid: await cb.answer("⛔ Не твой.",show_alert=True); return
+    info=PENDING_WITHDRAWS.pop(cb.message.message_id,None)
+    if not info: await cb.answer("⌛ Истёк",show_alert=True); return
+    cid,uid,a=info["chat_id"],info["user_id"],info["amount"]
+    if action=="reject":
+        try: await cb.message.edit_text(f"❌ Отменено. ${a:.4f} на балансе.")
+        except Exception: pass
+        await cb.answer("Отменено"); return
     await cb.answer("Принято...")
-    if not await try_lock_withdraw(cid, uid):
-        try:
-            await cb.message.edit_text("⏳ Другой вывод обрабатывается.")
-        except Exception:
-            pass
+    if not await try_lock_withdraw(cid,uid):
+        try: await cb.message.edit_text("⏳ Другой вывод обрабатывается")
+        except Exception: pass
         return
     try:
-        p = await get_player(cid, uid)
-        bal = float(p["balance"])
-        amount = min(bal, amount)
-        if amount < MIN_WITHDRAW:
-            try:
-                await cb.message.edit_text(f"❌ Недостаточно. Минимум ${MIN_WITHDRAW:.2f}.")
-            except Exception:
-                pass
+        p=await get_player(cid,uid); bal=float(p["balance"]); a=min(bal,a)
+        if a<MIN_WITHDRAW:
+            try: await cb.message.edit_text(f"❌ Мин ${MIN_WITHDRAW:.2f}")
+            except Exception: pass
             return
-        try:
-            await cb.message.edit_text(f"⏳ Отправляю ${amount:.4f}...")
-        except Exception:
-            pass
-        ok, result = await xrocket_payout(cid, uid, amount)
+        try: await cb.message.edit_text(f"⏳ Отправляю ${a:.4f}...")
+        except Exception: pass
+        ok,res=await xrocket_payout(cid,uid,a)
         if ok:
-            await deduct_balance(cid, uid, amount)
-            await log_payout(cid, uid, amount, result, "finished")
-            # === КВЕСТ: вывод ===
-            try:
-                await daily_add_progress(cid, uid, _today_local(), "withdraw", 1)
-            except Exception:
-                pass
-            try:
-                await cb.message.edit_text(f"✅ <b>Выплачено ${amount:.4f}</b>\nID: <code>{result}</code>")
-            except Exception:
-                pass
+            await deduct_balance(cid,uid,a); await log_payout(cid,uid,a,res,"finished")
+            try: await cb.message.edit_text(f"✅ <b>Выплачено ${a:.4f}</b>\nID: <code>{res}</code>")
+            except Exception: pass
         else:
-            await log_payout(cid, uid, amount, "", "failed")
-            try:
-                await cb.message.edit_text(f"❌ <b>Ошибка</b>\n<code>{result}</code>")
-            except Exception:
-                pass
-    finally:
-        await unlock_withdraw(cid, uid)
-
-
-@dp.message(F.text & ~F.text.startswith("/") & F.chat.type.in_({"group", "supergroup"}))
-async def handle_answer(message: Message):
-    if not message.from_user:
-        return
-
-    if message.from_user.id in TOURNAMENT_EDIT:
-        raise SkipHandler()
-
-    cid, uid = message.chat.id, message.from_user.id
-    text = (message.text or "").strip().lower()
-
+            await log_payout(cid,uid,a,"","failed")
+            try: await cb.message.edit_text(f"❌ <b>Ошибка</b>\n<code>{res}</code>")
+            except Exception: pass
+    finally: await unlock_withdraw(cid,uid)
+@dp.message(F.text & ~F.text.startswith("/") & F.chat.type.in_({"group","supergroup"}))
+async def handle_answer(message:Message):
+    if not message.from_user: return
+    if message.from_user.id in TOURNAMENT_EDIT: raise SkipHandler()
+    cid,uid=message.chat.id,message.from_user.id; text=(message.text or "").strip().lower()
     if cid in TOURNAMENT_ACTIVE:
-        st = TOURNAMENT_STATE.get(cid)
-        if st and not st.get("answered_by"):
-            if text in st["answers"]:
-                st["answered_by"] = uid
+        st=TOURNAMENT_STATE.get(cid)
+        if st and not st.get("answered_by") and text in st["answers"]: st["answered_by"]=uid
         return
-
-    q = ACTIVE_QUESTIONS.get(cid)
-    if not q:
-        # === КВЕСТ: просто написал сообщение ===
-        if not is_banned_cached(cid, uid):
-            try:
-                await daily_add_progress(cid, uid, _today_local(), "message_1", 1)
-            except Exception:
-                pass
-        return
-
+    q=ACTIVE_QUESTIONS.get(cid)
+    if not q: return
     if text not in q["answers"]:
         if is_admin(uid):
-            try:
-                await bot.set_message_reaction(cid, message.message_id, ["❌"])
-            except Exception:
-                pass
+            try: await bot.set_message_reaction(cid,message.message_id,["❌"])
+            except Exception: pass
         return
-
-    if is_banned_cached(cid, uid):
-        return
-    popped = ACTIVE_QUESTIONS.pop(cid, None)
-    if popped is None:
-        return
-
-    tsk = popped.get("timer_task")
-    if tsk:
-        tsk.cancel()
-
-    p, _ = await asyncio.gather(
-        get_player(cid, uid, message.from_user.username, message.from_user.first_name),
-        clear_active(cid),
-        return_exceptions=True,
-    )
-    if isinstance(p, Exception) or p is None:
-        p = await get_player(cid, uid, message.from_user.username, message.from_user.first_name)
-
-    old_lvl = level_from_correct(int(p["correct_answers"]))
-    old_top1 = TOP_CACHE.get(cid)
-
-    await add_score(cid, uid)
-
-    new_correct = int(p["correct_answers"]) + 1
-    new_lvl = level_from_correct(new_correct)
-
-    TOP1_COUNTER[cid] = TOP1_COUNTER.get(cid, 0) + 1
-    if TOP1_COUNTER[cid] % TOP1_CHECK_EVERY == 0:
-        new_top1 = await get_top1(cid)
-        if new_top1 and new_top1 != old_top1:
-            TOP_CACHE[cid] = new_top1
-            if old_top1 is not None:
+    if is_banned_cached(cid,uid): return
+    popped=ACTIVE_QUESTIONS.pop(cid,None)
+    if popped is None: return
+    tsk=popped.get("timer_task")
+    if tsk: tsk.cancel()
+    p,_=await asyncio.gather(get_player(cid,uid,message.from_user.username,message.from_user.first_name),clear_active(cid),return_exceptions=True)
+    if isinstance(p,Exception) or p is None: p=await get_player(cid,uid,message.from_user.username,message.from_user.first_name)
+    ol=level_from_correct(int(p["correct_answers"])); ot=TOP_CACHE.get(cid)
+    await add_score(cid,uid)
+    nc=int(p["correct_answers"])+1; nl=level_from_correct(nc)
+    TOP1_COUNTER[cid]=TOP1_COUNTER.get(cid,0)+1
+    if TOP1_COUNTER[cid]%TOP1_CHECK_EVERY==0:
+        nt=await get_top1(cid)
+        if nt and nt!=ot:
+            TOP_CACHE[cid]=nt
+            if ot is not None:
                 try:
-                    tp = await get_player(cid, new_top1)
-                    nm = tp.get("first_name") or tp.get("username") or str(new_top1)
-                    await safe_send(bot.send_message, cid, f"👑 <b>{nm}</b> вышел на первое место!")
-                except Exception:
-                    pass
-
-    # === КВЕСТЫ ===
-    try:
-        _day = _today_local()
-        await daily_add_progress(cid, uid, _day, "answer_5", 1)
-        await daily_add_progress(cid, uid, _day, "message_1", 1)
-
-        is_first = await first_answer_marker(cid, _day)
-        if is_first:
-            await daily_add_progress(cid, uid, _day, "first_answer", 1)
-
-        now_local = datetime.now(TZ)
-        if now_local.hour >= 23:
-            await daily_add_progress(cid, uid, _day, "last_answer", 1)
-    except Exception as e:
-        log.warning("answer quests: %s", e)
-
-    phrase = random.choice(CORRECT_PHRASES)
-    if q["is_multi"]:
-        answer_shown = "любой из: " + ", ".join(q["answers"][:5]) + ("..." if len(q["answers"]) > 5 else "")
-    else:
-        answer_shown = q["answers"][0]
-
-    msg = f"{phrase}\n{message.from_user.first_name} +1 очко\n<i>Ответ: {answer_shown}</i>"
-
-    if new_lvl > old_lvl:
-        n_emoji = LEVELS[new_lvl - 1][1]
-        n_name = LEVELS[new_lvl - 1][2]
-        msg += f"\n\n{n_emoji} <b>НОВЫЙ УРОВЕНЬ {new_lvl}!</b>\n🎖 {n_name}"
-
-    sent = await safe_send(message.reply, msg)
+                    tp=await get_player(cid,nt); nm=tp.get("first_name") or tp.get("username") or str(nt)
+                    await safe_send(bot.send_message,cid,f"👑 <b>{nm}</b> вышел на первое место!")
+                except Exception: pass
+    phrase=random.choice(CORRECT_PHRASES)
+    if q["is_multi"]: ash="любой из: "+", ".join(q["answers"][:5])+("..." if len(q["answers"])>5 else "")
+    else: ash=q["answers"][0]
+    msg=f"{phrase}\n{message.from_user.first_name} +1 очко\n<i>Ответ: {ash}</i>"
+    if nl>ol: msg+=f"\n\n{LEVELS[nl-1][1]} <b>НОВЫЙ УРОВЕНЬ {nl}!</b>\n🎖 {LEVELS[nl-1][2]}"
+    sent=await safe_send(message.reply,msg)
     if sent:
-        try:
-            await bot.set_message_reaction(cid, message.message_id, ["✅"])
-        except Exception:
-            pass
-
-
+        try: await bot.set_message_reaction(cid,message.message_id,["✅"])
+        except Exception: pass
 async def main():
-    print("=" * 50)
-    print("Quiz Bot · турниры с топ-N · сложности · копилка · квесты")
+    print("="*50); print("Quiz Bot · турниры · дуэли · копилка · /AiGive · /AiCard")
     print(f"Easy: {len(EASY_QUESTIONS)} · Medium: {len(MEDIUM_QUESTIONS)} · Hard: {len(HARD_QUESTIONS)} · Extreme: {len(EXTREME_QUESTIONS)}")
     print(f"Админы: {sorted(ADMIN_IDS)}")
-
-    await get_http()
-    await asyncio.to_thread(unlock_all_withdrawals_sync)
-
-    global BANNED_CACHE, SUBSCRIBERS_CACHE
-    BANNED_CACHE = await asyncio.to_thread(load_bans_sync)
-    SUBSCRIBERS_CACHE = await asyncio.to_thread(load_subscribers_sync)
-
-    active_rows = await asyncio.to_thread(load_active_sync)
+    await get_http(); await asyncio.to_thread(unlock_all_withdrawals_sync)
+    global BANNED_CACHE,SUBSCRIBERS_CACHE
+    BANNED_CACHE=await asyncio.to_thread(load_bans_sync); SUBSCRIBERS_CACHE=await asyncio.to_thread(load_subscribers_sync)
+    active_rows=await asyncio.to_thread(load_active_sync)
     for row in active_rows:
-        answers = row["answer"].split("||")
-        ACTIVE_QUESTIONS[int(row["chat_id"])] = {
-            "question": row["question"],
-            "answers": [a.lower() for a in answers],
-            "is_multi": row.get("is_multi", False),
-            "timer": False,
-            "timer_task": None,
-        }
+        answers=row["answer"].split("||")
+        ACTIVE_QUESTIONS[int(row["chat_id"])]={"question":row["question"],"answers":[a.lower() for a in answers],"is_multi":row.get("is_multi",False),"timer":False,"timer_task":None}
         QUIZ_ENABLED.add(int(row["chat_id"]))
-
     for cid in QUIZ_ENABLED:
         try:
-            t = await get_top1(cid)
-            if t:
-                TOP_CACHE[cid] = t
-        except Exception:
-            pass
-
-    me = await bot.get_me()
-    print(f"Подключился как @{me.username}")
+            t=await get_top1(cid)
+            if t: TOP_CACHE[cid]=t
+        except Exception: pass
+    me=await bot.get_me(); print(f"Подключился как @{me.username}")
     await start_webhook_server()
-
-    asyncio.create_task(question_scheduler())
-    asyncio.create_task(caches_refresh_loop())
-    asyncio.create_task(pot_payout_loop())
-    print("Запущен.")
-    print("=" * 50)
-
-    try:
-        await dp.start_polling(bot)
-    finally:
-        await close_http()
-
-
-if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        pass
+    asyncio.create_task(question_scheduler()); asyncio.create_task(caches_refresh_loop()); asyncio.create_task(pot_payout_loop())
+    print("Запущен."); print("="*50)
+    try: await dp.start_polling(bot)
+    finally: await close_http()
+if __name__=="__main__":
+    try: asyncio.run(main())
+    except KeyboardInterrupt: pass
     except Exception as e:
-        print("!!! УПАЛ !!!")
-        print(type(e).__name__, "-", e)
-        raise
+        print("!!! УПАЛ !!!"); print(type(e).__name__,"-",e); raise
