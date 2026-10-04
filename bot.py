@@ -84,9 +84,7 @@ WITHDRAW_CONFIRM_TTL = 120
 
 WEBHOOK_MAX_AGE_SEC = 300
 
-# Оптимизация: как часто пересчитывать топ-1 (в ответах)
 TOP1_CHECK_EVERY = 5
-# Оптимизация: TTL кэша настроек чата (сек)
 CHAT_SETTINGS_TTL = 60
 
 CORRECT_PHRASES = [
@@ -102,6 +100,26 @@ LEVELS = [
     (7, "💎", "Легенда"), (8, "👑", "Гений"), (9, "🔥", "Титан"),
     (10, "⚡", "Бог викторины"),
 ]
+
+# ===== ДНЕВНЫЕ КВЕСТЫ =====
+
+DAILY_QUESTS = {
+    "answer_5":     {"title": "Ответить на 5 вопросов",     "target": 5, "reward": 0.02, "emoji": "🎯"},
+    "daily_login":  {"title": "Забрать /AiDaily",            "target": 1, "reward": 0.01, "emoji": "📅"},
+    "deposit_050":  {"title": "Сделать депозит ≥ $0.50",     "target": 1, "reward": 0.03, "emoji": "💳"},
+    "message_1":    {"title": "Написать сообщение в чат",    "target": 1, "reward": 0.01, "emoji": "💬"},
+    "duel_play_1":  {"title": "Сыграть 1 дуэль",             "target": 1, "reward": 0.02, "emoji": "🎲"},
+    "duel_win_1":   {"title": "Выиграть 1 дуэль",            "target": 1, "reward": 0.03, "emoji": "🏆"},
+    "tourn_top3":   {"title": "Попасть в топ-3 турнира",     "target": 1, "reward": 0.10, "emoji": "🥉"},
+    "withdraw":     {"title": "Сделать вывод на xRocket",    "target": 1, "reward": 0.02, "emoji": "💸"},
+    "deposit_2":    {"title": "Пополнить ≥ $2 за сутки",     "target": 1, "reward": 0.05, "emoji": "💰"},
+    "duel_big":     {"title": "Дуэль со ставкой > $0.50",    "target": 1, "reward": 0.03, "emoji": "🎰"},
+    "first_answer": {"title": "Первый ответ дня в чате",     "target": 1, "reward": 0.02, "emoji": "🥇"},
+    "last_answer":  {"title": "Последний ответ дня",         "target": 1, "reward": 0.02, "emoji": "🌙"},
+}
+
+DAILY_STREAK_BASE = 0.01
+DAILY_STREAK_MAX  = 0.05
 
 if not TOKEN or not SUPABASE_URL or not SUPABASE_KEY:
     print("!!! Не заданы BOT_TOKEN / SUPABASE_URL / SUPABASE_KEY")
@@ -122,7 +140,6 @@ TOP1_COUNTER = {}
 HTTP_SESSION = None
 _FONT_PATH = None
 
-# Кэш настроек чата: {cid: (data, ts)}
 _CHAT_SETTINGS_CACHE = {}
 
 TOURNAMENT_STATE = {}
@@ -548,7 +565,6 @@ def get_top1_sync(chat_id):
 
 
 def get_player_place_sync(chat_id, user_id):
-    """Оптимизированный подсчёт места: 2 лёгких запроса вместо выгрузки всех."""
     try:
         me = supabase.table("quiz_players").select("correct_answers").eq(
             "chat_id", chat_id).eq("user_id", user_id).execute()
@@ -766,6 +782,145 @@ def sponsor_mark_used_sync(qid):
         log.warning("sponsor_mark_used: %s", e)
 
 
+# ===== ДНЕВНЫЕ КВЕСТЫ: SYNC =====
+
+def _today_local():
+    return datetime.now(TZ).date()
+
+
+def daily_get_all_sync(chat_id, user_id, day):
+    try:
+        res = (supabase.table("quiz_daily")
+               .select("quest_key,progress,claimed")
+               .eq("chat_id", chat_id).eq("user_id", user_id)
+               .eq("day", day.isoformat()).execute())
+        return {r["quest_key"]: {"progress": int(r["progress"]), "claimed": bool(r["claimed"])}
+                for r in (res.data or [])}
+    except Exception as e:
+        log.warning("daily_get_all: %s", e)
+        return {}
+
+
+def daily_add_progress_sync(chat_id, user_id, day, quest_key, amount=1):
+    try:
+        cur = (supabase.table("quiz_daily")
+               .select("progress,claimed")
+               .eq("chat_id", chat_id).eq("user_id", user_id)
+               .eq("day", day.isoformat()).eq("quest_key", quest_key).execute())
+        if cur.data:
+            row = cur.data[0]
+            if row.get("claimed"):
+                return True
+            new_progress = int(row["progress"]) + amount
+            supabase.table("quiz_daily").update({
+                "progress": new_progress,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }).eq("chat_id", chat_id).eq("user_id", user_id) \
+              .eq("day", day.isoformat()).eq("quest_key", quest_key).execute()
+        else:
+            supabase.table("quiz_daily").insert({
+                "chat_id": chat_id, "user_id": user_id,
+                "day": day.isoformat(), "quest_key": quest_key,
+                "progress": amount, "claimed": False,
+            }).execute()
+        return True
+    except Exception as e:
+        log.warning("daily_add_progress (%s): %s", quest_key, e)
+        return False
+
+
+def daily_claim_sync(chat_id, user_id, day, quest_key, reward):
+    try:
+        cur = (supabase.table("quiz_daily")
+               .select("progress,claimed")
+               .eq("chat_id", chat_id).eq("user_id", user_id)
+               .eq("day", day.isoformat()).eq("quest_key", quest_key).execute())
+        if not cur.data:
+            return False
+        row = cur.data[0]
+        if row.get("claimed"):
+            return False
+        target = DAILY_QUESTS.get(quest_key, {}).get("target", 1)
+        if int(row["progress"]) < target:
+            return False
+
+        upd = supabase.table("quiz_daily").update({
+            "claimed": True,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }).eq("chat_id", chat_id).eq("user_id", user_id) \
+          .eq("day", day.isoformat()).eq("quest_key", quest_key) \
+          .eq("claimed", False).execute()
+        if not upd.data:
+            return False
+
+        add_balance_sync(chat_id, user_id, reward)
+        return True
+    except Exception as e:
+        log.warning("daily_claim (%s): %s", quest_key, e)
+        return False
+
+
+def streak_get_sync(chat_id, user_id):
+    try:
+        res = (supabase.table("quiz_streak")
+               .select("streak,last_claim")
+               .eq("chat_id", chat_id).eq("user_id", user_id).execute())
+        if res.data:
+            r = res.data[0]
+            last = r.get("last_claim")
+            if last:
+                try:
+                    last = datetime.fromisoformat(str(last).replace("Z", "+00:00")).date()
+                except Exception:
+                    try:
+                        last = datetime.strptime(str(last), "%Y-%m-%d").date()
+                    except Exception:
+                        last = None
+            return int(r["streak"] or 0), last
+        return 0, None
+    except Exception as e:
+        log.warning("streak_get: %s", e)
+        return 0, None
+
+
+def streak_update_sync(chat_id, user_id, today, streak, last_claim):
+    try:
+        payload = {
+            "chat_id": chat_id, "user_id": user_id,
+            "streak": int(streak),
+            "last_claim": today.isoformat() if last_claim else None,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+        cur = (supabase.table("quiz_streak")
+               .select("chat_id")
+               .eq("chat_id", chat_id).eq("user_id", user_id).execute())
+        if cur.data:
+            supabase.table("quiz_streak").update(payload) \
+                .eq("chat_id", chat_id).eq("user_id", user_id).execute()
+        else:
+            supabase.table("quiz_streak").insert(payload).execute()
+        return True
+    except Exception as e:
+        log.warning("streak_update: %s", e)
+        return False
+
+
+def first_answer_marker_sync(chat_id, day):
+    try:
+        try:
+            supabase.table("quiz_daily").insert({
+                "chat_id": chat_id, "user_id": 0,
+                "day": day.isoformat(), "quest_key": "_first_answer_day",
+                "progress": 1, "claimed": True,
+            }).execute()
+            return True
+        except Exception:
+            return False
+    except Exception as e:
+        log.warning("first_answer_marker: %s", e)
+        return False
+
+
 # ===== ASYNC-ОБЁРТКИ =====
 
 async def get_player(cid, uid, un=None, fn=None):
@@ -845,7 +1000,6 @@ async def get_coins_stats(cid=None):
 
 
 async def get_chat_settings(cid):
-    """С кэшем на CHAT_SETTINGS_TTL секунд — настройки меняются редко."""
     now = time.time()
     cached = _CHAT_SETTINGS_CACHE.get(cid)
     if cached and now - cached[1] < CHAT_SETTINGS_TTL:
@@ -887,6 +1041,30 @@ async def sponsor_get_next(cid):
 
 async def sponsor_mark_used(qid):
     await asyncio.to_thread(sponsor_mark_used_sync, qid)
+
+
+async def daily_get_all(cid, uid, day):
+    return await asyncio.to_thread(daily_get_all_sync, cid, uid, day)
+
+
+async def daily_add_progress(cid, uid, day, key, amount=1):
+    return await asyncio.to_thread(daily_add_progress_sync, cid, uid, day, key, amount)
+
+
+async def daily_claim(cid, uid, day, key, reward):
+    return await asyncio.to_thread(daily_claim_sync, cid, uid, day, key, reward)
+
+
+async def streak_get(cid, uid):
+    return await asyncio.to_thread(streak_get_sync, cid, uid)
+
+
+async def streak_update(cid, uid, today, streak, last_claim):
+    return await asyncio.to_thread(streak_update_sync, cid, uid, today, streak, last_claim)
+
+
+async def first_answer_marker(cid, day):
+    return await asyncio.to_thread(first_answer_marker_sync, cid, day)
 
 
 def is_banned_cached(cid, uid):
@@ -1060,6 +1238,13 @@ async def process_paid_invoice(client_invoice_id: str):
     if new_balance is None:
         p = await get_player(chat_id, user_id)
         new_balance = float(p.get("balance", 0))
+
+    # === КВЕСТЫ: депозиты ===
+    day = _today_local()
+    if amount >= 0.50:
+        await daily_add_progress(chat_id, user_id, day, "deposit_050", 1)
+    if amount >= 2.00:
+        await daily_add_progress(chat_id, user_id, day, "deposit_2", 1)
 
     if msg_id:
         try:
@@ -1319,6 +1504,12 @@ async def run_tournament(tid, chat_id, settings):
         lines = ["🏆 <b>ТУРНИР ЗАВЕРШЁН!</b>", ""]
         medals = ["🥇", "🥈", "🥉", "4.", "5.", "6.", "7.", "8.", "9.", "10."]
         for i, (uid, share) in enumerate(shares):
+            # === КВЕСТ: топ-3 турнира ===
+            if i < 3:
+                try:
+                    await daily_add_progress(chat_id, uid, _today_local(), "tourn_top3", 1)
+                except Exception:
+                    pass
             try:
                 pp = await get_player(chat_id, uid)
                 pnm = pp.get("first_name") or pp.get("username") or str(uid)
@@ -1546,6 +1737,159 @@ async def on_turik_cb(cb: CallbackQuery):
         return
 
 
+# ===== ДНЕВНЫЕ КВЕСТЫ: UI =====
+
+def daily_kb(cid, uid, day, progress, streak_claimed_today):
+    rows = []
+
+    if not streak_claimed_today:
+        rows.append([InlineKeyboardButton(
+            text="🎁 Забрать ежедневный бонус",
+            callback_data="daily:streak")])
+
+    for key, q in DAILY_QUESTS.items():
+        st = progress.get(key)
+        if not st:
+            continue
+        if st["claimed"]:
+            continue
+        if st["progress"] >= q["target"]:
+            rows.append([InlineKeyboardButton(
+                text=f"✅ Забрать: {q['emoji']} {q['title']} (+${q['reward']:.2f})",
+                callback_data=f"daily:claim:{key}")])
+
+    rows.append([InlineKeyboardButton(text="🔄 Обновить", callback_data="daily:refresh")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def daily_text(cid, uid, day, progress, streak, streak_claimed_today):
+    if streak_claimed_today:
+        streak_line = f"🔥 Стрик: <b>{streak}</b> дн. · ✅ бонус получен сегодня"
+    else:
+        next_streak = streak + 1
+        reward = min(DAILY_STREAK_BASE * max(next_streak, 1), DAILY_STREAK_MAX)
+        streak_line = f"🔥 Стрик: <b>{streak}</b> дн. · 🎁 бонус сегодня: <b>${reward:.2f}</b>"
+
+    lines = [
+        "📅 <b>ЕЖЕДНЕВНЫЙ БОНУС И КВЕСТЫ</b>",
+        "",
+        streak_line,
+        "",
+        f"📋 <b>Квесты на {day.strftime('%d.%m.%Y')}</b>",
+        "",
+    ]
+
+    total_available = 0.0
+    total_claimed = 0.0
+
+    for key, q in DAILY_QUESTS.items():
+        st = progress.get(key)
+        if st:
+            p = min(st["progress"], q["target"])
+            claimed = st["claimed"]
+        else:
+            p = 0
+            claimed = False
+
+        if claimed:
+            mark = "💵"
+            tail = "<i>получено</i>"
+            total_claimed += q["reward"]
+        elif p >= q["target"]:
+            mark = "✅"
+            tail = f"<b>+${q['reward']:.2f}</b>"
+            total_available += q["reward"]
+        else:
+            mark = "⬜"
+            tail = f"+${q['reward']:.2f}"
+
+        lines.append(f"{mark} {q['emoji']} {q['title']} — {p}/{q['target']} · {tail}")
+
+    lines.append("")
+    lines.append(f"💵 Доступно к получению: <b>${total_available:.2f}</b>")
+    lines.append(f"💼 Уже забрано: <b>${total_claimed:.2f}</b>")
+    return "\n".join(lines)
+
+
+async def _render_daily(cid, uid, edit_msg=None):
+    day = _today_local()
+    progress = await daily_get_all(cid, uid, day)
+    streak, last_claim = await streak_get(cid, uid)
+    streak_claimed_today = (last_claim == day)
+    text = daily_text(cid, uid, day, progress, streak, streak_claimed_today)
+    kb = daily_kb(cid, uid, day, progress, streak_claimed_today)
+    if edit_msg:
+        await safe_edit(edit_msg.edit_text, text, reply_markup=kb)
+    else:
+        return await safe_send(bot.send_message, cid, text, reply_markup=kb)
+
+
+@dp.message(Command("AiDaily"))
+async def cmd_daily(message: Message):
+    if message.chat.type not in ("group", "supergroup") or not message.from_user:
+        return
+    cid, uid = message.chat.id, message.from_user.id
+    if is_banned_cached(cid, uid):
+        await safe_send(message.reply, "🚫 Ты в бане.")
+        return
+    await _render_daily(cid, uid)
+
+
+@dp.callback_query(F.data.startswith("daily:"))
+async def on_daily_cb(cb: CallbackQuery):
+    if not cb.from_user or not isinstance(cb.message, Message):
+        await cb.answer()
+        return
+    cid, uid = cb.message.chat.id, cb.from_user.id
+    parts = cb.data.split(":")
+    action = parts[1] if len(parts) > 1 else ""
+    day = _today_local()
+
+    if action == "refresh":
+        await cb.answer("Обновляю...")
+        await _render_daily(cid, uid, edit_msg=cb.message)
+        return
+
+    if action == "streak":
+        streak, last_claim = await streak_get(cid, uid)
+        if last_claim == day:
+            await cb.answer("Ты уже получал сегодня", show_alert=True)
+            return
+
+        yesterday = day - timedelta(days=1)
+        if last_claim == yesterday:
+            new_streak = streak + 1
+        else:
+            new_streak = 1
+
+        reward = min(DAILY_STREAK_BASE * new_streak, DAILY_STREAK_MAX)
+        reward = round(reward, 4)
+
+        await streak_update(cid, uid, day, new_streak, day)
+        await add_balance(cid, uid, reward)
+        await daily_add_progress(cid, uid, day, "daily_login", 1)
+
+        await cb.answer(f"🔥 +${reward:.2f} · стрик {new_streak} дн.", show_alert=True)
+        await _render_daily(cid, uid, edit_msg=cb.message)
+        return
+
+    if action == "claim":
+        key = parts[2] if len(parts) > 2 else ""
+        q = DAILY_QUESTS.get(key)
+        if not q:
+            await cb.answer("Ошибка", show_alert=True)
+            return
+        ok = await daily_claim(cid, uid, day, key, q["reward"])
+        if ok:
+            await cb.answer(f"✅ +${q['reward']:.2f}", show_alert=True)
+            await _render_daily(cid, uid, edit_msg=cb.message)
+        else:
+            await cb.answer("Уже получено или не выполнено", show_alert=True)
+        return
+
+    await cb.answer()
+
+
 # ===== ПРОЧИЕ ХЕНДЛЕРЫ =====
 
 @dp.message(CommandStart())
@@ -1560,6 +1904,7 @@ async def cmd_start(message: Message):
         f"👋 <b>Викторина с дуэлями!</b>\n\n"
         f"🎯 Квиз: +1 очко за правильный ответ\n"
         f"📈 10 уровней за очки\n"
+        f"📅 /AiDaily — бонус и квесты\n"
         f"🎲 Дуэли: <code>/AiDuel 0.20</code>\n"
         f"💳 Пополнить: <code>/AiDeposit 1.0</code>\n"
         f"💸 Вывод от ${MIN_WITHDRAW:.2f}\n\n"
@@ -1575,6 +1920,7 @@ async def cmd_aihelp(message: Message):
         "📖 <b>СПРАВКА</b>\n\n"
         "<b>🎮 Игра</b>\n"
         "/AiBalance · /AiProfile · /AiTop · /AiLevels · /AiCoins\n"
+        "/AiDaily — бонус и квесты\n"
         "/AiDuel 0.20 — дуэль на кубах\n\n"
         "<b>💰 Деньги</b>\n"
         f"/AiDeposit 0.05 — пополнить (от ${DEPOSIT_MIN:.2f})\n"
@@ -2144,7 +2490,8 @@ async def cmd_aibalance(message: Message):
     await safe_send(message.reply,
         f"💰 <b>${float(p['balance']):.4f} USDT</b>\n🎖 {title_str}\n🏆 Очков: <b>{ca}</b>\n"
         f"<code>{bar}</code>{sub_line}\n"
-        f"💸 Выведено сегодня: ${today:.4f} / ${DAILY_WITHDRAW_LIMIT:.2f}\n💳 Пополнить: /AiDeposit")
+        f"💸 Выведено сегодня: ${today:.4f} / ${DAILY_WITHDRAW_LIMIT:.2f}\n"
+        f"📅 /AiDaily · 💳 /AiDeposit")
 
 
 @dp.message(Command("AiProfile"))
@@ -2382,6 +2729,18 @@ async def on_duel_cb(cb: CallbackQuery):
             except Exception:
                 pass
             return
+
+        # === КВЕСТЫ: дуэль началась ===
+        _day = _today_local()
+        try:
+            await daily_add_progress(cid, challenger_id, _day, "duel_play_1", 1)
+            await daily_add_progress(cid, opponent_id, _day, "duel_play_1", 1)
+            if amount > 0.50:
+                await daily_add_progress(cid, challenger_id, _day, "duel_big", 1)
+                await daily_add_progress(cid, opponent_id, _day, "duel_big", 1)
+        except Exception as e:
+            log.warning("duel quests: %s", e)
+
         name_c = p_c.get("first_name") or str(challenger_id)
         name_o = p_o.get("first_name") or str(opponent_id)
         try:
@@ -2410,6 +2769,12 @@ async def on_duel_cb(cb: CallbackQuery):
         payout = round(total_pot - rake, 4)
         await add_balance(cid, winner_id, payout)
         await log_house_income(cid, rake, "duel")
+
+        # === КВЕСТ: победа в дуэли ===
+        try:
+            await daily_add_progress(cid, winner_id, _day, "duel_win_1", 1)
+        except Exception:
+            pass
 
         await safe_send(bot.send_message, cid,
             f"🏆 <b>{winner_name} победил!</b>\n\n🎲 {name_c}: <b>{r1}</b>\n🎲 {name_o}: <b>{r2}</b>\n\n"
@@ -2527,6 +2892,11 @@ async def on_withdraw_cb(cb: CallbackQuery):
         if ok:
             await deduct_balance(cid, uid, amount)
             await log_payout(cid, uid, amount, result, "finished")
+            # === КВЕСТ: вывод ===
+            try:
+                await daily_add_progress(cid, uid, _today_local(), "withdraw", 1)
+            except Exception:
+                pass
             try:
                 await cb.message.edit_text(f"✅ <b>Выплачено ${amount:.4f}</b>\nID: <code>{result}</code>")
             except Exception:
@@ -2552,7 +2922,6 @@ async def handle_answer(message: Message):
     cid, uid = message.chat.id, message.from_user.id
     text = (message.text or "").strip().lower()
 
-    # Турнир
     if cid in TOURNAMENT_ACTIVE:
         st = TOURNAMENT_STATE.get(cid)
         if st and not st.get("answered_by"):
@@ -2562,9 +2931,14 @@ async def handle_answer(message: Message):
 
     q = ACTIVE_QUESTIONS.get(cid)
     if not q:
+        # === КВЕСТ: просто написал сообщение ===
+        if not is_banned_cached(cid, uid):
+            try:
+                await daily_add_progress(cid, uid, _today_local(), "message_1", 1)
+            except Exception:
+                pass
         return
 
-    # Не совпало
     if text not in q["answers"]:
         if is_admin(uid):
             try:
@@ -2573,11 +2947,8 @@ async def handle_answer(message: Message):
                 pass
         return
 
-    # Бан — до того, как отвечаем (не палим ответ)
     if is_banned_cached(cid, uid):
         return
-
-    # Атомарно вынимаем вопрос из активных
     popped = ACTIVE_QUESTIONS.pop(cid, None)
     if popped is None:
         return
@@ -2586,26 +2957,22 @@ async def handle_answer(message: Message):
     if tsk:
         tsk.cancel()
 
-    # === ОПТИМИЗАЦИЯ: get_player и clear_active параллельно ===
     p, _ = await asyncio.gather(
         get_player(cid, uid, message.from_user.username, message.from_user.first_name),
         clear_active(cid),
         return_exceptions=True,
     )
     if isinstance(p, Exception) or p is None:
-        # fallback: пробуем ещё раз, но последовательно
         p = await get_player(cid, uid, message.from_user.username, message.from_user.first_name)
 
     old_lvl = level_from_correct(int(p["correct_answers"]))
     old_top1 = TOP_CACHE.get(cid)
 
-    # Начисляем очко
     await add_score(cid, uid)
 
     new_correct = int(p["correct_answers"]) + 1
     new_lvl = level_from_correct(new_correct)
 
-    # === ОПТИМИЗАЦИЯ: топ-1 проверяем не каждый раз, а раз в N ответов ===
     TOP1_COUNTER[cid] = TOP1_COUNTER.get(cid, 0) + 1
     if TOP1_COUNTER[cid] % TOP1_CHECK_EVERY == 0:
         new_top1 = await get_top1(cid)
@@ -2618,10 +2985,22 @@ async def handle_answer(message: Message):
                     await safe_send(bot.send_message, cid, f"👑 <b>{nm}</b> вышел на первое место!")
                 except Exception:
                     pass
-    else:
-        # локально обновим кэш, если текущий игрок обогнал (без запроса)
-        if old_top1 != uid and uid not in (None,):
-            pass  # проверим в следующий раз
+
+    # === КВЕСТЫ ===
+    try:
+        _day = _today_local()
+        await daily_add_progress(cid, uid, _day, "answer_5", 1)
+        await daily_add_progress(cid, uid, _day, "message_1", 1)
+
+        is_first = await first_answer_marker(cid, _day)
+        if is_first:
+            await daily_add_progress(cid, uid, _day, "first_answer", 1)
+
+        now_local = datetime.now(TZ)
+        if now_local.hour >= 23:
+            await daily_add_progress(cid, uid, _day, "last_answer", 1)
+    except Exception as e:
+        log.warning("answer quests: %s", e)
 
     phrase = random.choice(CORRECT_PHRASES)
     if q["is_multi"]:
@@ -2636,7 +3015,6 @@ async def handle_answer(message: Message):
         n_name = LEVELS[new_lvl - 1][2]
         msg += f"\n\n{n_emoji} <b>НОВЫЙ УРОВЕНЬ {new_lvl}!</b>\n🎖 {n_name}"
 
-    # === ОПТИМИЗАЦИЯ: убран send_chat_action ===
     sent = await safe_send(message.reply, msg)
     if sent:
         try:
@@ -2647,7 +3025,7 @@ async def handle_answer(message: Message):
 
 async def main():
     print("=" * 50)
-    print("Quiz Bot · турниры с топ-N · сложности · копилка")
+    print("Quiz Bot · турниры с топ-N · сложности · копилка · квесты")
     print(f"Easy: {len(EASY_QUESTIONS)} · Medium: {len(MEDIUM_QUESTIONS)} · Hard: {len(HARD_QUESTIONS)} · Extreme: {len(EXTREME_QUESTIONS)}")
     print(f"Админы: {sorted(ADMIN_IDS)}")
 
@@ -2660,46 +3038,4 @@ async def main():
 
     active_rows = await asyncio.to_thread(load_active_sync)
     for row in active_rows:
-        answers = row["answer"].split("||")
-        ACTIVE_QUESTIONS[int(row["chat_id"])] = {
-            "question": row["question"],
-            "answers": [a.lower() for a in answers],
-            "is_multi": row.get("is_multi", False),
-            "timer": False,
-            "timer_task": None,
-        }
-        QUIZ_ENABLED.add(int(row["chat_id"]))
-
-    for cid in QUIZ_ENABLED:
-        try:
-            t = await get_top1(cid)
-            if t:
-                TOP_CACHE[cid] = t
-        except Exception:
-            pass
-
-    me = await bot.get_me()
-    print(f"Подключился как @{me.username}")
-    await start_webhook_server()
-
-    asyncio.create_task(question_scheduler())
-    asyncio.create_task(caches_refresh_loop())
-    asyncio.create_task(pot_payout_loop())
-    print("Запущен.")
-    print("=" * 50)
-
-    try:
-        await dp.start_polling(bot)
-    finally:
-        await close_http()
-
-
-if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        pass
-    except Exception as e:
-        print("!!! УПАЛ !!!")
-        print(type(e).__name__, "-", e)
-        raise
+        answers = row["
