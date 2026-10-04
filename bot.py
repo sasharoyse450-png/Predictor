@@ -28,6 +28,8 @@ ANSWERS_PER_LEVEL=10; MAX_LEVEL=10; RAKE_PCT=0.05
 SUBSCRIBER_MULTIPLIER=2.0
 SUBSCRIPTION_PRICE=0.50
 SUBSCRIPTION_DAYS=7
+DEPOSIT_COMMISSION=0.05
+WITHDRAW_COMMISSION=0.05
 
 MIN_WITHDRAW=0.05; DAILY_WITHDRAW_LIMIT=5.00; DEPOSIT_MIN=0.05; DEPOSIT_MAX=50.0
 DUEL_MIN=0.05; DUEL_MAX=1.00; DUEL_TTL=120; TIMER_PROBABILITY=0.20; TIMER_SECONDS=10
@@ -659,13 +661,36 @@ async def process_paid_invoice(ciid):
         except Exception: pass
         return
 
-    nb=await add_balance(cid,uid,amt)
+    # ===== ДЕПОЗИТ с комиссией =====
+    commission=round(amt*DEPOSIT_COMMISSION,4)
+    credited=round(amt-commission,4)
+    if credited<=0:
+        credited=0
+    nb=await add_balance(cid,uid,credited)
     if nb is None:
         p=await get_player(cid,uid); nb=float(p.get("balance",0))
-    if mid:
-        try: await bot.edit_message_text(chat_id=cid,message_id=int(mid),text=f"✅ <b>Пополнение успешно!</b>\n\n💳 Зачислено: <b>${amt:.4f}</b> USDT\n💰 Баланс: <b>${nb:.4f}</b>\n\n<i>Спасибо!</i>")
+    # комиссия в кассу
+    if commission>0:
+        try: await log_house_income(cid, commission, "deposit_commission")
         except Exception: pass
-    try: await bot.send_message(uid,f"✅ <b>Баланс пополнен!</b>\n\n💰 Сумма: <b>${amt:.4f}</b>\n💼 Баланс: <b>${nb:.4f}</b>")
+
+    if mid:
+        try:
+            await bot.edit_message_text(chat_id=cid,message_id=int(mid),
+                text=(f"✅ <b>Пополнение успешно!</b>\n\n"
+                      f"💳 Оплачено: <b>${amt:.4f}</b> USDT\n"
+                      f"🏦 Комиссия {DEPOSIT_COMMISSION*100:.0f}%: <b>-${commission:.4f}</b>\n"
+                      f"💰 Зачислено: <b>${credited:.4f}</b>\n"
+                      f"💼 Баланс: <b>${nb:.4f}</b>\n\n"
+                      f"<i>Спасибо!</i>"))
+        except Exception: pass
+    try:
+        await bot.send_message(uid,
+            f"✅ <b>Баланс пополнен!</b>\n\n"
+            f"💳 Оплачено: <b>${amt:.4f}</b>\n"
+            f"🏦 Комиссия {DEPOSIT_COMMISSION*100:.0f}%: <b>-${commission:.4f}</b>\n"
+            f"💰 Зачислено: <b>${credited:.4f}</b>\n"
+            f"💼 Баланс: <b>${nb:.4f}</b>")
     except Exception: pass
 
 async def start_webhook_server():
@@ -942,7 +967,8 @@ async def cmd_start(message:Message):
 async def cmd_aihelp(message:Message):
     if message.chat.type not in ("group","supergroup"): return
     text=("📖 <b>СПРАВКА</b>\n\n<b>🎮 Игра</b>\n/AiBalance · /AiProfile · /AiCard · /AiTop · /AiLevels · /AiCoins\n/AiDuel 0.20 — дуэль\n\n<b>💰 Деньги</b>\n"
-          f"/AiDeposit 0.05 — пополнить (от ${DEPOSIT_MIN:.2f})\n/AiWithdraw — вывод от ${MIN_WITHDRAW:.2f}\n"
+          f"/AiDeposit 0.05 — пополнить (от ${DEPOSIT_MIN:.2f}, комиссия {DEPOSIT_COMMISSION*100:.0f}%)\n"
+          f"/AiWithdraw — вывод от ${MIN_WITHDRAW:.2f} (комиссия {WITHDRAW_COMMISSION*100:.0f}%)\n"
           f"/AiSubscribe — подписка ×{SUBSCRIBER_MULTIPLIER:.0f} (${SUBSCRIPTION_PRICE:.2f}/{SUBSCRIPTION_DAYS}дн)\n/AiSponsor — спонсорские вопросы (в ЛС)\n\n<b>📜 Общее</b>\n/AiRules · /AiHelp\n")
     if message.from_user and is_admin(message.from_user.id):
         text+=("\n<b>🛠 Админ</b>\n/AiAdmin — панель\n/AiTurik — турниры\n/AiGive &lt;id&gt; &lt;сумма&gt; — выдать\n"
@@ -953,7 +979,7 @@ async def cmd_aihelp(message:Message):
 @dp.message(Command("AiRules"))
 async def cmd_airules(message:Message):
     if message.chat.type not in ("group","supergroup"): return
-    await safe_send(message.reply,"📜 <b>ПРАВИЛА</b>\n\n1. Оскорбления — бан.\n2. Обход бана — перманентный.\n3. Скрипты — бан.\n4. Спам — бан.\n5. Фиктивные дуэли — бан обоим.\n6. Обман вывода — бан + обнуление.\n\n"+f"💸 Вывод: ${MIN_WITHDRAW:.2f} · ${DAILY_WITHDRAW_LIMIT:.2f}/сутки\n🎲 Рейк: {RAKE_PCT*100:.0f}%\n\n<i>Незнание не освобождает.</i>")
+    await safe_send(message.reply,"📜 <b>ПРАВИЛА</b>\n\n1. Оскорбления — бан.\n2. Обход бана — перманентный.\n3. Скрипты — бан.\n4. Спам — бан.\n5. Фиктивные дуэли — бан обоим.\n6. Обман вывода — бан + обнуление.\n\n"+f"💸 Вывод: ${MIN_WITHDRAW:.2f} · ${DAILY_WITHDRAW_LIMIT:.2f}/сутки · комиссия {WITHDRAW_COMMISSION*100:.0f}%\n💳 Депозит: комиссия {DEPOSIT_COMMISSION*100:.0f}%\n🎲 Рейк дуэли: {RAKE_PCT*100:.0f}%\n\n<i>Незнание не освобождает.</i>")
 
 @dp.message(Command("AiCoins"))
 async def cmd_aicoins(message:Message):
@@ -1010,7 +1036,7 @@ def admin_kb(cid):
 def admin_text(cid):
     st="🟢 вкл" if cid in QUIZ_ENABLED else "🔴 выкл"; cur=ACTIVE_QUESTIONS.get(cid)
     ct=f"\n🔓 Открыт: {cur['question']}" if cur else ""
-    return f"🛠 <b>Админ</b>\nВикторина: {st}\nРейк: <b>{RAKE_PCT*100:.0f}%</b>\nДепозит: ${DEPOSIT_MIN:.2f}\nВывод: ${MIN_WITHDRAW:.2f}{ct}"
+    return f"🛠 <b>Админ</b>\nВикторина: {st}\nРейк дуэли: <b>{RAKE_PCT*100:.0f}%</b>\nДепозит комиссия: <b>{DEPOSIT_COMMISSION*100:.0f}%</b>\nВывод комиссия: <b>{WITHDRAW_COMMISSION*100:.0f}%</b>\nВывод мин: ${MIN_WITHDRAW:.2f}{ct}"
 
 @dp.message(Command("AiAdmin"))
 async def cmd_aiadmin(message:Message):
@@ -1344,14 +1370,23 @@ async def cmd_aitop(message:Message):
 async def cmd_deposit(message:Message):
     if message.chat.type not in ("group","supergroup") or not message.from_user: return
     parts=(message.text or "").split()
-    if len(parts)!=2: await safe_send(message.reply,f"💳 <b>Пополнение</b>\n\nФормат: <code>/AiDeposit 1.0</code>\nМин: ${DEPOSIT_MIN:.2f} · Макс: ${DEPOSIT_MAX:.2f}"); return
+    if len(parts)!=2:
+        await safe_send(message.reply,f"💳 <b>Пополнение</b>\n\nФормат: <code>/AiDeposit 1.0</code>\nМин: ${DEPOSIT_MIN:.2f} · Макс: ${DEPOSIT_MAX:.2f}\n⚠️ Комиссия пополнения: <b>{DEPOSIT_COMMISSION*100:.0f}%</b>")
+        return
     try: a=round(float(parts[1]),4)
     except ValueError: await safe_send(message.reply,"Число."); return
     if a<DEPOSIT_MIN or a>DEPOSIT_MAX: await safe_send(message.reply,f"${DEPOSIT_MIN:.2f}–${DEPOSIT_MAX:.2f}"); return
+    commission=round(a*DEPOSIT_COMMISSION,4); credited=round(a-commission,4)
     ciid=f"dep_{message.from_user.id}_{uuid.uuid4().hex[:12]}"; ok,res=await xrocket_create_invoice(ciid,a,f"Deposit {message.from_user.id}")
     if not ok: await safe_send(message.reply,f"❌ <code>{res}</code>"); return
     kb=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=f"💳 Оплатить ${a:.2f}",url=res)]])
-    sent=await safe_send(message.reply,f"💳 <b>Счёт</b>\n\nСумма: <b>${a:.4f}</b> USDT\nДействителен 1 час.\n\nОплати в @xrocket.",reply_markup=kb)
+    sent=await safe_send(message.reply,
+        f"💳 <b>Счёт на пополнение</b>\n\n"
+        f"💵 Оплата: <b>${a:.4f}</b> USDT\n"
+        f"🏦 Комиссия {DEPOSIT_COMMISSION*100:.0f}%: <b>-${commission:.4f}</b>\n"
+        f"💰 Зачислится: <b>${credited:.4f}</b>\n\n"
+        f"Действителен 1 час. Оплати в @xrocket.",
+        reply_markup=kb)
     mid=sent.message_id if sent else None; await create_invoice(ciid,message.from_user.id,message.chat.id,a,mid,kind="deposit")
 
 @dp.message(Command("AiDuel"))
@@ -1450,8 +1485,16 @@ async def cmd_aiwithdraw(message:Message):
     td=await withdrawn_today(cid,uid); rem=DAILY_WITHDRAW_LIMIT-td
     if rem<=0: await safe_send(message.reply,"❌ Лимит на сутки"); return
     a=min(bal,rem)
+    commission=round(a*WITHDRAW_COMMISSION,4); receive=round(a-commission,4)
     kb=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="✅ Принять",callback_data=f"wd:accept:{uid}"),InlineKeyboardButton(text="❌ Отклонить",callback_data=f"wd:reject:{uid}")]])
-    sent=await safe_send(message.reply,f"💸 <b>Вывод</b>\n\nСумма: <b>${a:.4f}</b> USDT\nКуда: <code>{uid}</code>\n\n⚠️ Зайди в <a href=\"{XROCKET_REFERRAL_URL}\">@xrocket</a>.\n\nЗапрос: {WITHDRAW_CONFIRM_TTL//60} мин.",reply_markup=kb)
+    sent=await safe_send(message.reply,
+        f"💸 <b>Вывод</b>\n\n"
+        f"💼 Со баланса: <b>${a:.4f}</b> USDT\n"
+        f"🏦 Комиссия {WITHDRAW_COMMISSION*100:.0f}%: <b>-${commission:.4f}</b>\n"
+        f"📤 Получишь: <b>${receive:.4f}</b>\n"
+        f"Куда: ID <code>{uid}</code>\n\n"
+        f"⚠️ Зайди в <a href=\"{XROCKET_REFERRAL_URL}\">@xrocket</a>.\n\nЗапрос: {WITHDRAW_CONFIRM_TTL//60} мин.",
+        reply_markup=kb)
     if not sent: return
     PENDING_WITHDRAWS[sent.message_id]={"chat_id":cid,"user_id":uid,"amount":a,"ts":time.time()}
     async def ac():
@@ -1488,12 +1531,26 @@ async def on_withdraw_cb(cb:CallbackQuery):
             try: await cb.message.edit_text(f"❌ Мин ${MIN_WITHDRAW:.2f}")
             except Exception: pass
             return
-        try: await cb.message.edit_text(f"⏳ Отправляю ${a:.4f}...")
+        commission=round(a*WITHDRAW_COMMISSION,4); receive=round(a-commission,4)
+        if receive<=0:
+            try: await cb.message.edit_text("❌ Сумма слишком мала после комиссии")
+            except Exception: pass
+            return
+        try: await cb.message.edit_text(f"⏳ Отправляю ${receive:.4f}...")
         except Exception: pass
-        ok,res=await xrocket_payout(cid,uid,a)
+        ok,res=await xrocket_payout(cid,uid,receive)
         if ok:
-            await deduct_balance(cid,uid,a); await log_payout(cid,uid,a,res,"finished")
-            try: await cb.message.edit_text(f"✅ <b>Выплачено ${a:.4f}</b>\nID: <code>{res}</code>")
+            await deduct_balance(cid,uid,a)
+            await log_payout(cid,uid,a,res,"finished")
+            if commission>0:
+                try: await log_house_income(cid,commission,"withdraw_commission")
+                except Exception: pass
+            try: await cb.message.edit_text(
+                f"✅ <b>Выплачено</b>\n\n"
+                f"💼 Списано: <b>${a:.4f}</b>\n"
+                f"🏦 Комиссия: <b>${commission:.4f}</b>\n"
+                f"📤 Получено: <b>${receive:.4f}</b>\n"
+                f"ID: <code>{res}</code>")
             except Exception: pass
         else:
             await log_payout(cid,uid,a,"","failed")
@@ -1552,9 +1609,10 @@ async def handle_answer(message:Message):
         except Exception: pass
 
 async def main():
-    print("="*50); print("Quiz Bot · подписка через xRocket-инвойс")
+    print("="*50); print("Quiz Bot · комиссия 5% депозит/вывод · подписка xRocket")
     print(f"Easy: {len(EASY_QUESTIONS)} · Medium: {len(MEDIUM_QUESTIONS)} · Hard: {len(HARD_QUESTIONS)} · Extreme: {len(EXTREME_QUESTIONS)}")
     print(f"Админы: {sorted(ADMIN_IDS)}")
+    print(f"Комиссии: депозит {DEPOSIT_COMMISSION*100:.0f}%, вывод {WITHDRAW_COMMISSION*100:.0f}%")
     await get_http(); await asyncio.to_thread(unlock_all_withdrawals_sync)
     global BANNED_CACHE,SUBSCRIBERS_CACHE
     BANNED_CACHE=await asyncio.to_thread(load_bans_sync); SUBSCRIBERS_CACHE=await asyncio.to_thread(load_subscribers_sync)
