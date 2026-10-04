@@ -10,7 +10,7 @@ from aiogram.exceptions import TelegramRetryAfter, TelegramBadRequest
 from aiogram.filters import Command, CommandStart
 from aiogram.dispatcher.event.bases import SkipHandler
 from aiogram.types import Message, CallbackQuery, BufferedInputFile, InlineKeyboardMarkup, InlineKeyboardButton
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFont, ImageFilter
 from supabase import create_client, Client
 from questions import EASY_QUESTIONS, MEDIUM_QUESTIONS, HARD_QUESTIONS, EXTREME_QUESTIONS, DIFFICULTY_LABELS, random_question
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s", datefmt="%H:%M:%S")
@@ -34,8 +34,9 @@ if not TOKEN or not SUPABASE_URL or not SUPABASE_KEY:
     print("!!! Не заданы BOT_TOKEN / SUPABASE_URL / SUPABASE_KEY"); raise SystemExit(1)
 bot=Bot(TOKEN,default=DefaultBotProperties(parse_mode=ParseMode.HTML)); dp=Dispatcher(); supabase:Client=create_client(SUPABASE_URL,SUPABASE_KEY)
 ACTIVE_QUESTIONS={}; QUIZ_ENABLED=set(); PENDING_WITHDRAWS={}; BANNED_CACHE={}; SUBSCRIBERS_CACHE={}
-DUEL_BUSY=set(); TOP_CACHE={}; TOP1_COUNTER={}; HTTP_SESSION=None; _FONT_PATH=None; _CHAT_SETTINGS_CACHE={}
+DUEL_BUSY=set(); TOP_CACHE={}; TOP1_COUNTER={}; HTTP_SESSION=None; _FONT_PATH=None; _FONT_PATH_BOLD=None; _CHAT_SETTINGS_CACHE={}
 TOURNAMENT_STATE={}; TOURNAMENT_ACTIVE={}; TOURNAMENT_EDIT={}; SPONSOR_SESSION={}
+AVATAR_CACHE={}  # uid -> (bytes, ts)
 def is_admin(uid): return uid in ADMIN_IDS
 def level_from_correct(c): return min(c//ANSWERS_PER_LEVEL+1,MAX_LEVEL)
 def level_info(c):
@@ -47,61 +48,134 @@ def make_progress_bar(c):
     if lvl>=MAX_LEVEL: return "▓"*10+" 10/10"
     il=c-(lvl-1)*ANSWERS_PER_LEVEL
     return f"{'▓'*il}{'▒'*(ANSWERS_PER_LEVEL-il)} {il}/{ANSWERS_PER_LEVEL}"
-def get_font(size=64):
-    global _FONT_PATH
-    cands=["/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf","/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf","/usr/share/fonts/TTF/DejaVuSans-Bold.ttf"]
-    if _FONT_PATH is None:
+def get_font(size=64, bold=False):
+    global _FONT_PATH, _FONT_PATH_BOLD
+    cands_bold=["/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf","/usr/share/fonts/TTF/DejaVuSans-Bold.ttf"]
+    cands_reg=["/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf","/usr/share/fonts/TTF/DejaVuSans.ttf"]
+    target = "_FONT_PATH_BOLD" if bold else "_FONT_PATH"
+    cands = cands_bold if bold else cands_reg
+    if (bold and _FONT_PATH_BOLD is None) or (not bold and _FONT_PATH is None):
         for p in cands:
-            if os.path.exists(p): _FONT_PATH=p; break
-        if _FONT_PATH is None: _FONT_PATH=""
+            if os.path.exists(p):
+                if bold: _FONT_PATH_BOLD = p
+                else: _FONT_PATH = p
+                break
+        if bold and _FONT_PATH_BOLD is None: _FONT_PATH_BOLD = ""
+        if not bold and _FONT_PATH is None: _FONT_PATH = ""
+    path = _FONT_PATH_BOLD if bold else _FONT_PATH
+    if not path and bold: path = _FONT_PATH
     try:
-        if _FONT_PATH: return ImageFont.truetype(_FONT_PATH,size)
+        if path: return ImageFont.truetype(path, size)
     except Exception: pass
     return ImageFont.load_default()
 def render_question_image(text):
-    W,H=800,300; img=Image.new("RGB",(W,H),"white"); draw=ImageDraw.Draw(img); font=get_font(80)
+    W,H=800,300; img=Image.new("RGB",(W,H),"white"); draw=ImageDraw.Draw(img); font=get_font(80,bold=True)
     bbox=draw.textbbox((0,0),text,font=font); tw,th=bbox[2]-bbox[0],bbox[3]-bbox[1]
     while tw>W-60:
         cs=getattr(font,"size",0)
         if cs<=20: break
-        font=get_font(cs-5); bbox=draw.textbbox((0,0),text,font=font); tw,th=bbox[2]-bbox[0],bbox[3]-bbox[1]
+        font=get_font(cs-5,bold=True); bbox=draw.textbbox((0,0),text,font=font); tw,th=bbox[2]-bbox[0],bbox[3]-bbox[1]
     draw.text(((W-tw)/2-bbox[0],(H-th)/2-bbox[1]),text,fill=(20,20,80),font=font)
     buf=io.BytesIO(); img.save(buf,format="PNG"); return buf.getvalue()
-def render_profile_card(name,le,ln,lvl,correct,place,balance,wd,is_sub):
-    W,H=900,500; img=Image.new("RGB",(W,H),(18,20,40)); draw=ImageDraw.Draw(img)
+async def fetch_avatar(user_id):
+    now=time.time(); cached=AVATAR_CACHE.get(user_id)
+    if cached and now-cached[1]<3600: return cached[0]
+    try:
+        photos=await bot.get_user_profile_photos(user_id, limit=1)
+        if not photos or not photos.total_count:
+            AVATAR_CACHE[user_id]=(None,now); return None
+        sizes=photos.photos[0]
+        file_id=sizes[-1].file_id if len(sizes)>0 else sizes[0].file_id
+        f=await bot.get_file(file_id)
+        buf=io.BytesIO(); await bot.download_file(f.file_path, buf)
+        data=buf.getvalue(); AVATAR_CACHE[user_id]=(data,now); return data
+    except Exception as e:
+        log.warning("fetch_avatar: %s",e); AVATAR_CACHE[user_id]=(None,now); return None
+def _circle_mask(size):
+    m=Image.new("L",(size,size),0); d=ImageDraw.Draw(m); d.ellipse([0,0,size-1,size-1],fill=255); return m
+def render_profile_card(name, username, lvl, correct, place, balance, wd, is_sub, avatar_bytes=None):
+    W,H=1000,620; img=Image.new("RGB",(W,H),(10,10,28)); draw=ImageDraw.Draw(img)
+    # фон-градиент
     for y in range(H):
-        r=int(18+(60-18)*y/H); g=int(20+(30-20)*y/H); b=int(40+(110-40)*y/H); draw.line([(0,y),(W,y)],fill=(r,g,b))
-    draw.rectangle([10,10,W-11,H-11],outline=(255,215,0),width=3)
-    fb=get_font(52); fm=get_font(30); fs=get_font(22); fx=get_font(20); fxs=get_font(16)
-    draw.text((40,30),(name or "Player")[:24],fill=(255,255,255),font=fb)
-    draw.text((40,100),f"LVL {lvl}  -  {ln}",fill=(255,215,0),font=fm)
-    draw.line([(40,150),(W-40,150)],fill=(255,215,0),width=2)
-    y=175; dy=52
-    draw.text((40,y),"P O I N T S",fill=(150,150,180),font=fxs)
-    draw.text((40,y+18),str(correct),fill=(255,255,255),font=fm)
-    y+=dy
-    draw.text((40,y),"R A N K",fill=(150,150,180),font=fxs)
-    draw.text((40,y+18),f"#{place}" if place else "-",fill=(255,255,255),font=fm)
-    y+=dy
-    draw.text((40,y),"B A L A N C E",fill=(150,150,180),font=fxs)
-    draw.text((40,y+18),f"${balance:.4f}",fill=(80,255,120),font=fm)
-    y+=dy
-    draw.text((40,y),"W I T H D R A W N   T O D A Y",fill=(150,150,180),font=fxs)
-    draw.text((40,y+18),f"${wd:.4f}",fill=(255,200,100),font=fm)
+        t=y/H
+        r=int(18+int(50*t)); g=int(14+int(24*t)); b=int(46+int(110*t))
+        draw.line([(0,y),(W,y)],fill=(r,g,b))
+    # лёгкие декоративные круги
+    for cx,cy,rad,col in [(W-80,80,180,(255,200,60,18)),(80,H-60,220,(120,80,255,15))]:
+        overlay=Image.new("RGBA",(W,H),(0,0,0,0)); od=ImageDraw.Draw(overlay)
+        od.ellipse([cx-rad,cy-rad,cx+rad,cy+rad],fill=col)
+        img=Image.alpha_composite(img.convert("RGBA"),overlay).convert("RGB")
+    draw=ImageDraw.Draw(img)
+    # золотая рамка
+    draw.rounded_rectangle([14,14,W-15,H-15],radius=24,outline=(255,210,70),width=3)
+    # аватар
+    av_size=150; av_x=60; av_y=60
+    draw.ellipse([av_x-4,av_y-4,av_x+av_size+4,av_y+av_size+4],fill=(255,210,70))
+    draw.ellipse([av_x,av_y,av_x+av_size,av_y+av_size],fill=(30,32,64))
+    if avatar_bytes:
+        try:
+            av=Image.open(io.BytesIO(avatar_bytes)).convert("RGB").resize((av_size,av_size),Image.LANCZOS)
+            img.paste(av,(av_x,av_y),_circle_mask(av_size))
+        except Exception:
+            avatar_bytes=None
+    if not avatar_bytes:
+        f_av=get_font(76,bold=True); letter=(name or "?")[0].upper()
+        bb=draw.textbbox((0,0),letter,font=f_av); tw,th=bb[2]-bb[0],bb[3]-bb[1]
+        draw.text((av_x+av_size/2-tw/2-bb[0], av_y+av_size/2-th/2-bb[1]), letter, fill=(255,210,70), font=f_av)
+    # имя и юзернейм
+    f_name=get_font(48,bold=True); f_user=get_font(22)
+    draw.text((240,72),(name or "Player")[:18],fill=(255,255,255),font=f_name)
+    un_str=f"@{username[:22]}" if username else f"ID {correct and '' or ''}"
+    if not username: un_str=""
+    if un_str: draw.text((242,130),un_str,fill=(150,160,200),font=f_user)
+    # уровень справа
+    f_lvl=get_font(40,bold=True); f_lvl_sub=get_font(22)
+    lvl_str=f"LEVEL {lvl}"
+    bb=draw.textbbox((0,0),lvl_str,font=f_lvl); tw=bb[2]-bb[0]
+    draw.text((W-tw-70,66),lvl_str,fill=(255,210,70),font=f_lvl)
+    lname=LEVELS[lvl-1][2]
+    bb=draw.textbbox((0,0),lname,font=f_lvl_sub); tw=bb[2]-bb[0]
+    draw.text((W-tw-70,118),lname,fill=(210,180,110),font=f_lvl_sub)
+    # бейдж подписки
     if is_sub:
-        draw.text((W-260,30),"SUBSCRIBER",fill=(255,120,220),font=fm)
-        draw.text((W-260,68),"x2 to score",fill=(200,120,200),font=fxs)
+        f_bdg=get_font(18,bold=True); btxt="✦ SUBSCRIBER x2"
+        bb=draw.textbbox((0,0),btxt,font=f_bdg); bw_=bb[2]-bb[0]+34; bh_=34
+        bx=W-bw_-70; by=160
+        draw.rounded_rectangle([bx,by,bx+bw_,by+bh_],radius=17,fill=(190,55,175))
+        draw.text((bx+17,by+8),btxt,fill=(255,255,255),font=f_bdg)
     else:
-        draw.text((W-260,30),"FREE USER",fill=(120,120,140),font=fm)
-    bx,by,bw,bh=40,440,W-80,24
+        f_bdg=get_font(18); btxt="◇ FREE USER"
+        bb=draw.textbbox((0,0),btxt,font=f_bdg); bw_=bb[2]-bb[0]+34; bh_=34
+        bx=W-bw_-70; by=160
+        draw.rounded_rectangle([bx,by,bx+bw_,by+bh_],radius=17,fill=(50,50,80))
+        draw.text((bx+17,by+8),btxt,fill=(180,180,210),font=f_bdg)
+    # разделитель
+    draw.line([(60,245),(W-60,245)],fill=(255,210,70),width=1)
+    # 2x2 статистика
+    f_lbl=get_font(16); f_val=get_font(44,bold=True)
+    cols_x=[70, W//2+10]; rows_y=[285, 405]
+    stats=[("POINTS", str(correct), (100,220,255)),
+           ("RANK", f"#{place}" if place else "—", (255,210,70)),
+           ("BALANCE", f"${balance:.4f}", (95,255,145)),
+           ("WITHDRAWN TODAY", f"${wd:.4f}", (255,160,90))]
+    for i,(lbl,val,col) in enumerate(stats):
+        cx=cols_x[i%2]; cy=rows_y[i//2]
+        draw.text((cx,cy),lbl,fill=(130,140,180),font=f_lbl)
+        draw.text((cx,cy+26),val,fill=col,font=f_val)
+    # прогресс-бар
+    bx,by,bw,bh=70,520,W-140,34
     il=correct-(lvl-1)*ANSWERS_PER_LEVEL
     if lvl>=MAX_LEVEL: filled,bt=bw,"MAX LEVEL"
-    else: filled,bt=int(bw*il/ANSWERS_PER_LEVEL),f"{il} / {ANSWERS_PER_LEVEL}"
-    draw.rectangle([bx,by,bx+bw,by+bh],outline=(100,100,140),width=2)
-    if filled>0: draw.rectangle([bx+2,by+2,bx+filled-2,by+bh-2],fill=(255,215,0))
-    bbox=draw.textbbox((0,0),bt,font=fx); tw=bbox[2]-bbox[0]; th=bbox[3]-bbox[1]
-    draw.text((bx+(bw-tw)/2,by+(bh-th)/2-bbox[1]),bt,fill=(20,20,40),font=fx)
-    buf=io.BytesIO(); img.save(buf,format="PNG"); return buf.getvalue()
+    else: filled,bt=int(bw*il/ANSWERS_PER_LEVEL),f"{il} / {ANSWERS_PER_LEVEL} to next level"
+    draw.rounded_rectangle([bx,by,bx+bw,by+bh],radius=bh//2,fill=(28,28,54),outline=(70,70,110),width=2)
+    if filled>2: draw.rounded_rectangle([bx,by,bx+filled,by+bh],radius=bh//2,fill=(255,210,70))
+    f_bar=get_font(20,bold=True); bb=draw.textbbox((0,0),bt,font=f_bar); tw,th=bb[2]-bb[0],bb[3]-bb[1]
+    bar_text_x=bx+bw/2-tw/2
+    bar_center=bx+bw/2
+    if filled>bar_center: tcol=(25,25,45)
+    else: tcol=(230,230,240)
+    draw.text((bar_text_x, by+bh/2-th/2-bb[1]), bt, fill=tcol, font=f_bar)
+    buf=io.BytesIO(); img.save(buf,format="PNG",optimize=True); return buf.getvalue()
 async def get_http():
     global HTTP_SESSION
     if HTTP_SESSION is None or HTTP_SESSION.closed:
@@ -820,7 +894,6 @@ async def cmd_aigive(message:Message):
     except ValueError: await safe_send(message.reply,"user_id и сумма — числа."); return
     if amt<=0 or amt>100: await safe_send(message.reply,"Сумма: 0.0001-100"); return
     reason=" ".join(parts[3:]) if len(parts)>3 else "admin_give"
-    # если игрока нет — создадим запись
     await get_player(message.chat.id,target)
     nb=await add_balance(message.chat.id,target,amt)
     if nb is None: await safe_send(message.reply,"❌ Ошибка начисления"); return
@@ -977,10 +1050,13 @@ async def cmd_aicard(message:Message):
     place=await get_player_place(cid,uid); td=await withdrawn_today(cid,uid)
     sub=is_subscriber_cached(cid,uid)
     name=message.from_user.first_name or "Player"
+    try: await bot.send_chat_action(cid, "upload_photo")
+    except Exception: pass
+    avatar=await fetch_avatar(uid)
     try:
-        png=render_profile_card(name,"","",lvl,ca,place,float(p["balance"]),td,sub)
-        buf=BufferedInputFile(png,filename="card.png")
-        await safe_send(bot.send_photo,cid,buf,caption=f"<b>{name}</b> · LVL {lvl} ({nm})\nPoints: {ca} · Balance: ${float(p['balance']):.4f}")
+        png=render_profile_card(name,message.from_user.username,lvl,ca,place,float(p["balance"]),td,sub,avatar)
+        buf=BufferedInputFile(png,filename=f"card_{uid}.png")
+        await safe_send(bot.send_photo,cid,buf,caption=f"<b>{name}</b> · {nm} (ур. {lvl})")
     except Exception as e:
         log.warning("card: %s",e)
         await safe_send(message.reply,f"🎴 {nm} (ур. {lvl})\n🏆 {ca} очк · 💰 ${float(p['balance']):.4f}\n📍 #{place if place else '—'}")
@@ -1217,7 +1293,7 @@ async def handle_answer(message:Message):
         try: await bot.set_message_reaction(cid,message.message_id,["✅"])
         except Exception: pass
 async def main():
-    print("="*50); print("Quiz Bot · турниры · дуэли · копилка · /AiGive · /AiCard")
+    print("="*50); print("Quiz Bot · турниры · дуэли · копилка · /AiGive · /AiCard pro")
     print(f"Easy: {len(EASY_QUESTIONS)} · Medium: {len(MEDIUM_QUESTIONS)} · Hard: {len(HARD_QUESTIONS)} · Extreme: {len(EXTREME_QUESTIONS)}")
     print(f"Админы: {sorted(ADMIN_IDS)}")
     await get_http(); await asyncio.to_thread(unlock_all_withdrawals_sync)
