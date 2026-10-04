@@ -3038,4 +3038,46 @@ async def main():
 
     active_rows = await asyncio.to_thread(load_active_sync)
     for row in active_rows:
-        answers = row["
+        answers = row["answer"].split("||")
+        ACTIVE_QUESTIONS[int(row["chat_id"])] = {
+            "question": row["question"],
+            "answers": [a.lower() for a in answers],
+            "is_multi": row.get("is_multi", False),
+            "timer": False,
+            "timer_task": None,
+        }
+        QUIZ_ENABLED.add(int(row["chat_id"]))
+
+    for cid in QUIZ_ENABLED:
+        try:
+            t = await get_top1(cid)
+            if t:
+                TOP_CACHE[cid] = t
+        except Exception:
+            pass
+
+    me = await bot.get_me()
+    print(f"Подключился как @{me.username}")
+    await start_webhook_server()
+
+    asyncio.create_task(question_scheduler())
+    asyncio.create_task(caches_refresh_loop())
+    asyncio.create_task(pot_payout_loop())
+    print("Запущен.")
+    print("=" * 50)
+
+    try:
+        await dp.start_polling(bot)
+    finally:
+        await close_http()
+
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass
+    except Exception as e:
+        print("!!! УПАЛ !!!")
+        print(type(e).__name__, "-", e)
+        raise
