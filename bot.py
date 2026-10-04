@@ -29,6 +29,8 @@ MIN_WITHDRAW=0.05; DAILY_WITHDRAW_LIMIT=5.00; DEPOSIT_MIN=0.05; DEPOSIT_MAX=50.0
 DUEL_MIN=0.05; DUEL_MAX=1.00; DUEL_TTL=120; TIMER_PROBABILITY=0.20; TIMER_SECONDS=10
 POT_PERCENT=0.05; POT_HOUR=21; SPONSOR_PRICE=5.00; SPONSOR_QUESTIONS=20
 LOTTERY_PRICE=0.05; LOTTERY_HOUR=21; LOTTERY_WINNER_SHARE=0.50; LOTTERY_MAX_TICKETS=20
+LOTTERY_REFUND=True
+LOTTERY_PACKS={1:0.05, 5:0.20, 10:0.35}
 ADMIN_IDS={8130244626,6173495222}
 TZ=ZoneInfo(os.getenv("TZ","Europe/Moscow")); WORK_HOURS=list(range(8,24)); WITHDRAW_CONFIRM_TTL=120
 WEBHOOK_MAX_AGE_SEC=300; TOP1_CHECK_EVERY=5; CHAT_SETTINGS_TTL=60
@@ -273,71 +275,99 @@ def loto_my_sync(cid,uid):
         r=supabase.table("quiz_invoices").select("id").eq("chat_id",cid).eq("user_id",uid).eq("kind","lottery_ticket").eq("status","paid").execute()
         return len(r.data or [])
     except Exception as e: log.warning("loto_my: %s",e); return 0
-def loto_buy_sync(cid,uid):
+def loto_buy_pack_sync(cid,uid,count):
     try:
-        ciid=f"lotto_{cid}_{uid}_{uuid.uuid4().hex[:10]}"
-        supabase.table("quiz_invoices").insert({
-            "client_invoice_id":ciid,"user_id":uid,"chat_id":cid,
-            "amount":LOTTERY_PRICE,"kind":"lottery_ticket","status":"paid",
-            "paid_at":datetime.now(timezone.utc).isoformat(),
-        }).execute()
+        rows=[]
+        for i in range(count):
+            ciid=f"lotto_{cid}_{uid}_{uuid.uuid4().hex[:10]}"
+            rows.append({"client_invoice_id":ciid,"user_id":uid,"chat_id":cid,"amount":LOTTERY_PRICE,"kind":"lottery_ticket","status":"paid","paid_at":datetime.now(timezone.utc).isoformat()})
+        supabase.table("quiz_invoices").insert(rows).execute()
         return True
     except Exception as e: log.warning("loto_buy: %s",e); return False
 def loto_clear_sync(cid):
     try:
-        supabase.table("quiz_invoices").update({"kind":"lottery_drawn"}).eq("chat_id",cid).eq("kind","lottery_ticket").execute()
-        return True
+        supabase.table("quiz_invoices").update({"kind":"lottery_drawn"}).eq("chat_id",cid).eq("kind","lottery_ticket").execute(); return True
     except Exception as e: log.warning("loto_clear: %s",e); return False
 async def loto_bank(cid): return await asyncio.to_thread(loto_bank_sync,cid)
 async def loto_tickets(cid): return await asyncio.to_thread(loto_tickets_sync,cid)
 async def loto_my(cid,uid): return await asyncio.to_thread(loto_my_sync,cid,uid)
-async def loto_buy(cid,uid): return await asyncio.to_thread(loto_buy_sync,cid,uid)
+async def loto_buy_pack(cid,uid,count): return await asyncio.to_thread(loto_buy_pack_sync,cid,uid,count)
 async def loto_clear(cid): return await asyncio.to_thread(loto_clear_sync,cid)
+
 async def loto_text(cid,uid=None):
     bank=await loto_bank(cid); tickets=await loto_tickets(cid); total=len(tickets)
     h,m=loto_time_left()
-    lines=["🎰 <b>ЛОТЕРЕЯ</b>","",f"💰 Банк: <b>${bank:.4f}</b>",f"🎟 Билетов продано: <b>{total}</b>",
+    lines=["🎰 <b>ЛОТЕРЕЯ</b>","",
+           f"💰 Банк: <b>${bank:.4f}</b>",
+           f"🎟 Билетов продано: <b>{total}</b>",
            f"⏳ До розыгрыша: <b>{h}ч {m}м</b>","",
-           f"🎫 Цена билета: <b>${LOTTERY_PRICE:.2f}</b>",
-           f"🏆 Победитель получает <b>{int(LOTTERY_WINNER_SHARE*100)}%</b> банка",
-           f"🏦 Касса — <b>{int((1-LOTTERY_WINNER_SHARE)*100)}%</b>"]
+           f"🎫 Цена билета: <b>${LOTTERY_PRICE:.2f}</b>","",
+           "<b>🏆 Что получает победитель:</b>",
+           "• 💵 Возврат всех потраченных на билеты",
+           f"• 💰 Плюс <b>{int(LOTTERY_WINNER_SHARE*100)}%</b> от банка","",
+           "<i>Пример: купил 5 билетов ($0.25), банк $1.00 → получишь $0.25 + $0.50 = $0.75</i>","",
+           "<b>📦 Пакеты:</b>"]
+    for cnt,price in LOTTERY_PACKS.items():
+        base=round(cnt*LOTTERY_PRICE,4)
+        if price<base:
+            disc=int(round((1-price/base)*100))
+            lines.append(f"🎫 {cnt} бил. — <b>${price:.2f}</b> <s>${base:.2f}</s> (−{disc}%)")
+        else:
+            lines.append(f"🎫 {cnt} бил. — <b>${price:.2f}</b>")
     if uid is not None:
-        my=await loto_my(cid,uid); lines.append(""); lines.append(f"🎟 Твоих билетов: <b>{my}</b>")
-        if my>=LOTTERY_MAX_TICKETS: lines.append(f"<i>Лимит {LOTTERY_MAX_TICKETS} билетов</i>")
-    lines.append(""); lines.append(f"<i>Розыгрыш каждый день в {LOTTERY_HOUR}:00 МСК · билеты сохраняются</i>")
+        my=await loto_my(cid,uid); lines.append(""); lines.append(f"🎟 У тебя билетов: <b>{my}</b>")
+        if my>=LOTTERY_MAX_TICKETS: lines.append(f"<i>Достигнут лимит {LOTTERY_MAX_TICKETS}</i>")
+    lines.append(""); lines.append(f"<i>Розыгрыш ежедневно в {LOTTERY_HOUR}:00 МСК</i>")
     return "\n".join(lines)
 def loto_kb(uid):
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=f"🎫 Купить за ${LOTTERY_PRICE:.2f}",callback_data=f"loto:buy:{uid}")],
-        [InlineKeyboardButton(text="🔄 Обновить",callback_data=f"loto:refresh:{uid}")]])
+    rows=[]
+    for cnt,price in LOTTERY_PACKS.items():
+        base=round(cnt*LOTTERY_PRICE,4)
+        if price<base:
+            disc=int(round((1-price/base)*100))
+            txt=f"🎫 {cnt} билетов — ${price:.2f} (−{disc}%)"
+        else:
+            txt=f"🎫 {cnt} билет — ${price:.2f}"
+        rows.append([InlineKeyboardButton(text=txt,callback_data=f"loto:buy:{uid}:{cnt}")])
+    rows.append([InlineKeyboardButton(text="🔄 Обновить",callback_data=f"loto:refresh:{uid}")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 async def loto_draw(cid):
     bank=await loto_bank(cid); tickets=await loto_tickets(cid)
     if not tickets or bank<LOTTERY_PRICE*2:
         await loto_clear(cid); return
     winner=random.choice(tickets)
-    win=round(bank*LOTTERY_WINNER_SHARE,4); house=round(bank-win,4)
-    await add_balance(cid,winner,win)
-    if house>0:
+    winner_count=tickets.count(winner)
+    refund=round(winner_count*LOTTERY_PRICE,4) if LOTTERY_REFUND else 0.0
+    half=round(bank*LOTTERY_WINNER_SHARE,4)
+    total_win=round(refund+half,4)
+    house=round(bank-total_win,4)
+    if total_win>0:
+        await add_balance(cid,winner,total_win)
+    if house!=0:
         try: await log_house_income(cid,house,"lottery")
         except Exception: pass
     try:
         pl=await get_player(cid,winner); nm=pl.get("first_name") or pl.get("username") or str(winner)
     except Exception: nm=str(winner)
-    await safe_send(bot.send_message,cid,
-        f"🎰 <b>РОЗЫГРЫШ ЛОТЕРЕИ!</b>\n\n💰 Банк: <b>${bank:.4f}</b>\n🎟 Билетов: <b>{len(tickets)}</b>\n\n"
-        f"🏆 Победитель: <b>{nm}</b> (ID <code>{winner}</code>)\n💰 Выигрыш: <b>${win:.4f}</b>\n🏦 В кассу: <b>${house:.4f}</b>")
+    lines=[f"🎰 <b>РОЗЫГРЫШ ЛОТЕРЕИ!</b>","",
+           f"💰 Банк: <b>${bank:.4f}</b>",
+           f"🎟 Билетов: <b>{len(tickets)}</b>","",
+           f"🏆 <b>{nm}</b> (ID <code>{winner}</code>)",
+           f"🎫 Его билетов: <b>{winner_count}</b>",
+           f"💵 Возврат за билеты: <b>${refund:.4f}</b>",
+           f"💰 Доля банка ({int(LOTTERY_WINNER_SHARE*100)}%): <b>${half:.4f}</b>",
+           f"🎉 Итого выигрыш: <b>${total_win:.4f}</b>"]
+    if house>0: lines.append(f"🏦 В кассу: <b>${house:.4f}</b>")
+    elif house<0: lines.append(f"⚠️ Касса: <b>-${abs(house):.4f}</b>")
+    await safe_send(bot.send_message,cid,"\n".join(lines))
     await loto_clear(cid)
 async def loto_remind(cid):
     bank=await loto_bank(cid); tickets=await loto_tickets(cid); total=len(tickets)
     h,m=loto_time_left()
     if bank<=0 and total==0:
-        await safe_send(bot.send_message,cid,
-            f"🎰 <b>ЛОТЕРЕЯ</b>\n\n💰 Банк пуст — стань первым!\n⏳ До розыгрыша: <b>{h}ч {m}м</b>\n\n"
-            f"🎫 Билет — <b>${LOTTERY_PRICE:.2f}</b>\n👉 /AiLoto")
+        await safe_send(bot.send_message,cid,f"🎰 <b>ЛОТЕРЕЯ</b>\n\n💰 Банк пуст — стань первым!\n⏳ До розыгрыша: <b>{h}ч {m}м</b>\n\n🎫 Билет — <b>${LOTTERY_PRICE:.2f}</b>\n💎 Возврат билетов + {int(LOTTERY_WINNER_SHARE*100)}% банка победителю\n👉 /AiLoto")
     else:
-        await safe_send(bot.send_message,cid,
-            f"🎰 <b>ЛОТЕРЕЯ</b> · напоминание\n\n💰 Банк: <b>${bank:.4f}</b>\n🎟 Билетов: <b>{total}</b>\n⏳ До розыгрыша: <b>{h}ч {m}м</b>\n\n"
-            f"🎫 Билет — <b>${LOTTERY_PRICE:.2f}</b>\n🏆 Победитель забирает <b>{int(LOTTERY_WINNER_SHARE*100)}%</b>\n\n👉 /AiLoto")
+        await safe_send(bot.send_message,cid,f"🎰 <b>ЛОТЕРЕЯ</b> · напоминание\n\n💰 Банк: <b>${bank:.4f}</b>\n🎟 Билетов: <b>{total}</b>\n⏳ До розыгрыша: <b>{h}ч {m}м</b>\n\n🎫 Билет — <b>${LOTTERY_PRICE:.2f}</b>\n💎 Возврат билетов + {int(LOTTERY_WINNER_SHARE*100)}% банка\n👉 /AiLoto")
 async def loto_loop():
     await asyncio.sleep(45)
     last_hour=datetime.now(TZ).strftime("%Y-%m-%d-%H")
@@ -377,15 +407,22 @@ async def on_loto_cb(cb:CallbackQuery):
         except Exception: pass
         await cb.answer(); return
     if act=="buy":
+        try: count=int(p[3])
+        except (ValueError,IndexError): count=1
+        if count not in LOTTERY_PACKS: await cb.answer("Ошибка",show_alert=True); return
+        price=LOTTERY_PACKS[count]
         my=await loto_my(cid,uid)
-        if my>=LOTTERY_MAX_TICKETS: await cb.answer(f"❌ Лимит {LOTTERY_MAX_TICKETS}",show_alert=True); return
+        if my+count>LOTTERY_MAX_TICKETS:
+            await cb.answer(f"❌ Лимит {LOTTERY_MAX_TICKETS} (у тебя {my})",show_alert=True); return
         pl=await get_player(cid,uid)
-        if float(pl["balance"])<LOTTERY_PRICE: await cb.answer(f"❌ Нужно ${LOTTERY_PRICE:.2f}",show_alert=True); return
-        if not await deduct_balance(cid,uid,LOTTERY_PRICE): await cb.answer("❌",show_alert=True); return
-        ok=await loto_buy(cid,uid)
+        if float(pl["balance"])<price:
+            await cb.answer(f"❌ Нужно ${price:.2f}",show_alert=True); return
+        if not await deduct_balance(cid,uid,price):
+            await cb.answer("❌",show_alert=True); return
+        ok=await loto_buy_pack(cid,uid,count)
         if not ok:
-            await add_balance(cid,uid,LOTTERY_PRICE); await cb.answer("❌ Ошибка записи",show_alert=True); return
-        await cb.answer(f"🎫 Билет куплен! У тебя: {my+1}",show_alert=True)
+            await add_balance(cid,uid,price); await cb.answer("❌ Ошибка записи",show_alert=True); return
+        await cb.answer(f"🎫 Куплено {count} билетов! Всего: {my+count}",show_alert=True)
         try: await cb.message.edit_text(await loto_text(cid,uid),reply_markup=loto_kb(uid))
         except Exception: pass
         return
@@ -782,7 +819,7 @@ async def process_paid_invoice(ciid):
     if mid:
         try: await bot.edit_message_text(chat_id=cid,message_id=int(mid),text=f"✅ <b>Пополнение успешно!</b>\n\n💳 Оплачено: <b>${amt:.4f}</b>\n🏦 Комиссия {ec*100:.0f}%: <b>-${com:.4f}</b>\n💰 Зачислено: <b>${cr:.4f}</b>\n💼 Баланс: <b>${nb:.4f}</b>")
         except Exception: pass
-    try: await bot.send_message(uid,f"✅ <b>Баланс пополнен!</b>\n\n💳 Оплачено: <b>${amt:.4f}</b>\n🏦 Комиссия {ec*100:.0f}%: <b>-${com:.4f}</b>\n💰 Зачислено: <b>${cr:.4f}</b>\n💼 Баланс: <b>${nb:.4f}</b>")
+    try: await bot.send_message(uid,f"✅ <b>Баланс пополнен!</b>\n\n💳 Оплачено: <b>${amt:.4f}</b>\n🏦 Комиссия {ec*100:.0f}%: <b>-${com:.4f}</b>\n💰 Зачислено: <b>${cr:.4f}</b>\n💼 Баланс: <b>{nb:.4f}</b>")
     except Exception: pass
 async def start_webhook_server():
     app=web.Application(); app.router.add_post("/webhook",handle_webhook); app.router.get("/",lambda r: web.Response(text="ok"))
@@ -1053,7 +1090,7 @@ async def cmd_aisub(message:Message):
 async def cmd_start(message:Message):
     if message.from_user: TOURNAMENT_EDIT.pop(message.from_user.id,None)
     kb=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="💎 Подписка $0.50/нед",url=XROCKET_SUBSCRIBE_URL)],[InlineKeyboardButton(text="🎰 Лотерея /AiLoto",callback_data="loto:open:0")]])
-    await safe_send(message.reply,f"👋 <b>Викторина!</b>\n\n🎯 +1 очко\n📈 10 уровней\n🎴 /AiCard\n🎰 /AiLoto — лотерея\n🎲 /AiDuel 0.20\n💳 /AiDeposit 1.0\n💸 Вывод ${MIN_WITHDRAW:.2f}\n\n📖 /AiHelp",reply_markup=kb)
+    await safe_send(message.reply,f"👋 <b>Викторина!</b>\n\n🎯 +1 очко\n📈 10 уровней\n🎴 /AiCard\n🎰 /AiLoto — лотерея (возврат билетов + 50%)\n🎲 /AiDuel 0.20\n💳 /AiDeposit 1.0\n💸 Вывод ${MIN_WITHDRAW:.2f}\n\n📖 /AiHelp",reply_markup=kb)
 @dp.callback_query(F.data=="loto:open:0")
 async def on_loto_open(cb:CallbackQuery):
     if not cb.from_user or not isinstance(cb.message,Message): await cb.answer(); return
@@ -1065,14 +1102,14 @@ async def cmd_aihelp(message:Message):
     t=("📖 <b>СПРАВКА</b>\n\n<b>🎮 Игра</b>\n/AiBalance · /AiProfile · /AiCard · /AiTop · /AiLevels · /AiCoins\n/AiDuel 0.20\n\n<b>💰 Деньги</b>\n"
        f"/AiDeposit — комиссия {DEPOSIT_COMMISSION*100:.0f}%\n/AiWithdraw — комиссия {WITHDRAW_COMMISSION*100:.0f}%, мин ${MIN_WITHDRAW:.2f}\n"
        f"/AiSubscribe — ×{SUBSCRIBER_MULTIPLIER:.0f} (${SUBSCRIPTION_PRICE:.2f}/{SUBSCRIPTION_DAYS}дн)\n"
-       f"/AiLoto — лотерея (${LOTTERY_PRICE:.2f}/билет, {int(LOTTERY_WINNER_SHARE*100)}% победителю)\n/AiSponsor — в ЛС\n\n<b>📜</b> /AiRules\n")
+       f"/AiLoto — лотерея (${LOTTERY_PRICE:.2f}/билет, возврат + {int(LOTTERY_WINNER_SHARE*100)}% банка)\n/AiSponsor — в ЛС\n\n<b>📜</b> /AiRules\n")
     if message.from_user and is_admin(message.from_user.id):
         t+=("\n<b>🛠 Админ</b>\n/AiAdmin · /AiBoost · /AiTurik · /AiGive · /AiSubGive\n/AiSubInfo · /AiSubList · /AiSubDel\n/AiPot · /AiPotAdd · /AiPotTake · /AiPotGive\n/AiBan · /AiUnban\n")
     await safe_send(message.reply,t)
 @dp.message(Command("AiRules"))
 async def cmd_airules(message:Message):
     if message.chat.type not in ("group","supergroup"): return
-    await safe_send(message.reply,f"📜 <b>ПРАВИЛА</b>\n\n1. Оскорбления — бан.\n2. Обход бана — перманентный.\n3. Скрипты — бан.\n4. Спам — бан.\n5. Фиктивные дуэли — бан.\n6. Обман вывода — бан.\n\n💸 Вывод: ${MIN_WITHDRAW:.2f} · комиссия {WITHDRAW_COMMISSION*100:.0f}%\n💳 Депозит: комиссия {DEPOSIT_COMMISSION*100:.0f}%\n🎰 Лотерея: ${LOTTERY_PRICE:.2f}/билет · {LOTTERY_HOUR}:00 МСК\n🎲 Рейк: {RAKE_PCT*100:.0f}%")
+    await safe_send(message.reply,f"📜 <b>ПРАВИЛА</b>\n\n1. Оскорбления — бан.\n2. Обход бана — перманентный.\n3. Скрипты — бан.\n4. Спам — бан.\n5. Фиктивные дуэли — бан.\n6. Обман вывода — бан.\n\n💸 Вывод: ${MIN_WITHDRAW:.2f} · комиссия {WITHDRAW_COMMISSION*100:.0f}%\n💳 Депозит: комиссия {DEPOSIT_COMMISSION*100:.0f}%\n🎰 Лотерея: ${LOTTERY_PRICE:.2f}/билет · {LOTTERY_HOUR}:00 МСК · возврат + {int(LOTTERY_WINNER_SHARE*100)}%\n🎲 Рейк: {RAKE_PCT*100:.0f}%")
 @dp.message(Command("AiCoins"))
 async def cmd_aicoins(message:Message):
     if message.chat.type not in ("group","supergroup"): return
@@ -1658,11 +1695,11 @@ async def handle_answer(message:Message):
         except Exception: pass
 
 async def main():
-    print("="*50); print("Quiz Bot · boosters · lottery(persistent) · subscription · commissions")
+    print("="*50); print("Quiz Bot · boosters · lottery v2(packages+refund) · commissions")
     print(f"Easy {len(EASY_QUESTIONS)} · Medium {len(MEDIUM_QUESTIONS)} · Hard {len(HARD_QUESTIONS)} · Extreme {len(EXTREME_QUESTIONS)}")
     print(f"Admins: {sorted(ADMIN_IDS)}")
     print(f"Commissions: dep {DEPOSIT_COMMISSION*100:.0f}% / wd {WITHDRAW_COMMISSION*100:.0f}%")
-    print(f"Lottery: {LOTTERY_PRICE:.2f}/ticket · winner {int(LOTTERY_WINNER_SHARE*100)}% · {LOTTERY_HOUR}:00 MSK (persistent in quiz_invoices)")
+    print(f"Lottery: {LOTTERY_PRICE:.2f}/ticket · refund+{int(LOTTERY_WINNER_SHARE*100)}% · packs {list(LOTTERY_PACKS.keys())} · {LOTTERY_HOUR}:00 MSK")
     await get_http(); await asyncio.to_thread(unlock_all_withdrawals_sync)
     global BANNED_CACHE,SUBSCRIBERS_CACHE
     BANNED_CACHE=await asyncio.to_thread(load_bans_sync); SUBSCRIBERS_CACHE=await asyncio.to_thread(load_subscribers_sync)
