@@ -1565,3 +1565,125 @@ async def on_withdraw_cb(cb:CallbackQuery):
         try: await cb.message.edit_text(f"❌ Отменено. ${a:.4f}")
         except Exception: pass
         await cb.answer("Отменено"); return
+    await cb.answer("...")
+    if not await try_lock_withdraw(cid,uid):
+        try: await cb.message.edit_text("⏳")
+        except Exception: pass
+        return
+    try:
+        p=await get_player(cid,uid); bal=float(p["balance"]); a=min(bal,a)
+        if a<MIN_WITHDRAW:
+            try: await cb.message.edit_text(f"❌ Мин ${MIN_WITHDRAW:.2f}")
+            except Exception: pass
+            return
+        cm=booster_mult(cid,"commission",1.0); ec=WITHDRAW_COMMISSION*cm
+        com=round(a*ec,4); rc=round(a-com,4)
+        if rc<=0:
+            try: await cb.message.edit_text("❌ Мало")
+            except Exception: pass
+            return
+        try: await cb.message.edit_text(f"⏳ ${rc:.4f}...")
+        except Exception: pass
+        ok,res=await xrocket_payout(cid,uid,rc)
+        if ok:
+            await deduct_balance(cid,uid,a); await log_payout(cid,uid,a,res,"finished")
+            if com>0:
+                try: await log_house_income(cid,com,"withdraw_commission")
+                except Exception: pass
+            try: await cb.message.edit_text(f"✅ <b>Выплачено</b>\n💼 -${a:.4f}\n🏦 ${com:.4f}\n📤 <b>${rc:.4f}</b>\nID <code>{res}</code>")
+            except Exception: pass
+        else:
+            await log_payout(cid,uid,a,"","failed")
+            try: await cb.message.edit_text(f"❌ <code>{res}</code>")
+            except Exception: pass
+    finally: await unlock_withdraw(cid,uid)
+@dp.message(F.text & ~F.text.startswith("/") & F.chat.type.in_({"group","supergroup"}))
+async def handle_answer(message:Message):
+    if not message.from_user: return
+    if message.from_user.id in TOURNAMENT_EDIT: raise SkipHandler()
+    cid,uid=message.chat.id,message.from_user.id; tx=(message.text or "").strip().lower()
+    if cid in TOURNAMENT_ACTIVE:
+        st=TOURNAMENT_STATE.get(cid)
+        if st and not st.get("answered_by") and tx in st["answers"]: st["answered_by"]=uid
+        return
+    q=ACTIVE_QUESTIONS.get(cid)
+    if not q: return
+    if tx not in q["answers"]:
+        if is_admin(uid):
+            try: await bot.set_message_reaction(cid,message.message_id,["❌"])
+            except Exception: pass
+        return
+    if is_banned_cached(cid,uid): return
+    pp=ACTIVE_QUESTIONS.pop(cid,None)
+    if pp is None: return
+    tk=pp.get("timer_task")
+    if tk: tk.cancel()
+    p,_=await asyncio.gather(get_player(cid,uid,message.from_user.username,message.from_user.first_name),clear_active(cid),return_exceptions=True)
+    if isinstance(p,Exception) or p is None: p=await get_player(cid,uid,message.from_user.username,message.from_user.first_name)
+    ol=level_from_correct(int(p["correct_answers"])); ot=TOP_CACHE.get(cid)
+    is_sub=is_subscriber_cached(cid,uid)
+    base=2 if is_sub else 1
+    pm=booster_mult(cid,"points",1.0)
+    pg=int(base*pm)
+    mm=booster_mult(cid,"money",0.0)
+    await add_score(cid,uid)
+    for _ in range(pg-1): await add_score(cid,uid)
+    if mm>0:
+        rw=round(BASE_MONEY_PER_CORRECT*mm,4)
+        if rw>0:
+            try: await add_balance(cid,uid,rw)
+            except Exception: pass
+    nc=int(p["correct_answers"])+pg; nl=level_from_correct(nc)
+    TOP1_COUNTER[cid]=TOP1_COUNTER.get(cid,0)+1
+    if TOP1_COUNTER[cid]%TOP1_CHECK_EVERY==0:
+        nt=await get_top1(cid)
+        if nt and nt!=ot:
+            TOP_CACHE[cid]=nt
+            if ot is not None:
+                try:
+                    tp=await get_player(cid,nt); nm=tp.get("first_name") or tp.get("username") or str(nt)
+                    await safe_send(bot.send_message,cid,f"👑 <b>{nm}</b> №1!")
+                except Exception: pass
+    ph=random.choice(CORRECT_PHRASES)
+    if q["is_multi"]: ash="любой из: "+", ".join(q["answers"][:5])+("..." if len(q["answers"])>5 else "")
+    else: ash=q["answers"][0]
+    parts2=[f"+{pg} очк"]
+    if is_sub: parts2.append("💎")
+    if mm>0: parts2.append(f"+${round(BASE_MONEY_PER_CORRECT*mm,4):.4f} 💰")
+    msg=f"{ph}\n{message.from_user.first_name} — {' · '.join(parts2)}\n<i>Ответ: {ash}</i>"
+    if nl>ol: msg+=f"\n\n{LEVELS[nl-1][1]} <b>НОВЫЙ УРОВЕНЬ {nl}!</b>\n🎖 {LEVELS[nl-1][2]}"
+    sent=await safe_send(message.reply,msg)
+    if sent:
+        try: await bot.set_message_reaction(cid,message.message_id,["✅"])
+        except Exception: pass
+
+async def main():
+    print("="*50); print("Quiz Bot · boosters · lottery(persistent) · subscription · commissions")
+    print(f"Easy {len(EASY_QUESTIONS)} · Medium {len(MEDIUM_QUESTIONS)} · Hard {len(HARD_QUESTIONS)} · Extreme {len(EXTREME_QUESTIONS)}")
+    print(f"Admins: {sorted(ADMIN_IDS)}")
+    print(f"Commissions: dep {DEPOSIT_COMMISSION*100:.0f}% / wd {WITHDRAW_COMMISSION*100:.0f}%")
+    print(f"Lottery: {LOTTERY_PRICE:.2f}/ticket · winner {int(LOTTERY_WINNER_SHARE*100)}% · {LOTTERY_HOUR}:00 MSK (persistent in quiz_invoices)")
+    await get_http(); await asyncio.to_thread(unlock_all_withdrawals_sync)
+    global BANNED_CACHE,SUBSCRIBERS_CACHE
+    BANNED_CACHE=await asyncio.to_thread(load_bans_sync); SUBSCRIBERS_CACHE=await asyncio.to_thread(load_subscribers_sync)
+    ar=await asyncio.to_thread(load_active_sync)
+    for row in ar:
+        ans=row["answer"].split("||")
+        ACTIVE_QUESTIONS[int(row["chat_id"])]={"question":row["question"],"answers":[a.lower() for a in ans],"is_multi":row.get("is_multi",False),"timer":False,"timer_task":None}
+        QUIZ_ENABLED.add(int(row["chat_id"]))
+    for cid in QUIZ_ENABLED:
+        try:
+            t=await get_top1(cid)
+            if t: TOP_CACHE[cid]=t
+        except Exception: pass
+    me=await bot.get_me(); print(f"@{me.username}")
+    await start_webhook_server()
+    asyncio.create_task(question_scheduler()); asyncio.create_task(caches_refresh_loop()); asyncio.create_task(pot_payout_loop()); asyncio.create_task(loto_loop())
+    print("Запущен."); print("="*50)
+    try: await dp.start_polling(bot)
+    finally: await close_http()
+if __name__=="__main__":
+    try: asyncio.run(main())
+    except KeyboardInterrupt: pass
+    except Exception as e:
+        print("!!!",type(e).__name__,"-",e); raise
