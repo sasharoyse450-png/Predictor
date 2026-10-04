@@ -24,7 +24,9 @@ XROCKET_REFERRAL_URL=os.getenv("XROCKET_REFERRAL_URL","https://t.me/xRocket")
 PORT=int(os.getenv("PORT",8080))
 ANSWERS_PER_LEVEL=10; MAX_LEVEL=10; RAKE_PCT=0.05
 SUBSCRIBER_MULTIPLIER=2.0; SUBSCRIPTION_PRICE=0.50; SUBSCRIPTION_DAYS=7
-DEPOSIT_COMMISSION=0.05; WITHDRAW_COMMISSION=0.05; BASE_MONEY_PER_CORRECT=0.001
+DEPOSIT_COMMISSION=0.05; WITHDRAW_COMMISSION=0.05
+BASE_MONEY_PER_CORRECT=0.05
+MONEY_PER_LEVEL=0.005
 MIN_WITHDRAW=0.05; DAILY_WITHDRAW_LIMIT=5.00; DEPOSIT_MIN=0.05; DEPOSIT_MAX=50.0
 DUEL_MIN=0.05; DUEL_MAX=1.00; DUEL_TTL=120; TIMER_PROBABILITY=0.20; TIMER_SECONDS=10
 POT_PERCENT=0.05; POT_HOUR=21; SPONSOR_PRICE=5.00; SPONSOR_QUESTIONS=20
@@ -51,6 +53,10 @@ def level_info(c):
     lvl=level_from_correct(c); emoji,name=LEVELS[lvl-1][1],LEVELS[lvl-1][2]
     ts=f"{emoji} {name} (ур. {lvl})"; p="🏆 Максимальный уровень!" if lvl>=MAX_LEVEL else f"до след. уровня: {ANSWERS_PER_LEVEL-(c-(lvl-1)*ANSWERS_PER_LEVEL)} отв."
     return lvl,emoji,name,0,ts,p
+def money_for_answer(correct_answers_before):
+    """Сколько $ за 1 правильный ответ на текущем уровне игрока."""
+    lvl=level_from_correct(correct_answers_before)
+    return round(BASE_MONEY_PER_CORRECT+(lvl-1)*MONEY_PER_LEVEL,4)
 def make_progress_bar(c):
     lvl=level_from_correct(c)
     if lvl>=MAX_LEVEL: return "▓"*10+" 10/10"
@@ -235,7 +241,7 @@ def _bpick_text(cid,bt):
     else: st="🔴 выключен"
     lines=[f"{cfg['emoji']} <b>БУСТЕР: {cfg['name']}</b>","",f"Статус: {st}",""]
     if bt=="points": lines.append("Множитель очков за ответ."); lines.append("<i>База: 1 очко (×2 с подпиской).</i>")
-    elif bt=="money": lines.append("Деньги за каждый правильный ответ."); lines.append(f"<i>База: ${BASE_MONEY_PER_CORRECT:.4f} × множитель.</i>")
+    elif bt=="money": lines.append("Множитель денег за ответ."); lines.append(f"<i>База: ${BASE_MONEY_PER_CORRECT:.4f} + ${MONEY_PER_LEVEL:.4f} за каждый уровень.</i>")
     else: lines.append("Убирает комиссию при пополнении и выводе.")
     lines.append(""); lines.append("Запусти кнопкой 👇")
     return "\n".join(lines)
@@ -253,7 +259,7 @@ def _bpick_kb(bt):
     rows.append([InlineKeyboardButton(text="⬅️ Назад",callback_data="boost:menu")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
-# =============== ЛОТЕРЕЯ (в quiz_invoices) ===============
+# =============== ЛОТЕРЕЯ ===============
 
 def loto_time_left():
     now=datetime.now(TZ); target=now.replace(hour=LOTTERY_HOUR,minute=0,second=0,microsecond=0)
@@ -275,7 +281,6 @@ def loto_my_sync(cid,uid):
         return len(r.data or [])
     except Exception as e: log.warning("loto_my: %s",e); return 0
 def loto_buy_pack_sync(cid,uid,count,pack_price):
-    """Пишет count записей, суммарно ровно pack_price."""
     try:
         per=round(pack_price/count,4)
         rows=[]
@@ -825,7 +830,7 @@ async def process_paid_invoice(ciid):
     if mid:
         try: await bot.edit_message_text(chat_id=cid,message_id=int(mid),text=f"✅ <b>Пополнение успешно!</b>\n\n💳 Оплачено: <b>${amt:.4f}</b>\n🏦 Комиссия {ec*100:.0f}%: <b>-${com:.4f}</b>\n💰 Зачислено: <b>${cr:.4f}</b>\n💼 Баланс: <b>${nb:.4f}</b>")
         except Exception: pass
-    try: await bot.send_message(uid,f"✅ <b>Баланс пополнен!</b>\n\n💳 Оплачено: <b>${amt:.4f}</b>\n🏦 Комиссия {ec*100:.0f}%: <b>-${com:.4f}</b>\n💰 Зачислено: <b>${cr:.4f}</b>\n💼 Баланс: <b>${nb:.4f}</b>")
+    try: await bot.send_message(uid,f"✅ <b>Баланс пополнен!</b>\n\n💳 Оплачено: <b>${amt:.4f}</b>\n🏦 Комиссия {ec*100:.0f}%: <b>-${com:.4f}</b>\n💰 Зачислено: <b>${cr:.4f}</b>\n💼 Баланс: <b>{nb:.4f}</b>")
     except Exception: pass
 async def start_webhook_server():
     app=web.Application(); app.router.add_post("/webhook",handle_webhook); app.router.get("/",lambda r: web.Response(text="ok"))
@@ -851,9 +856,9 @@ async def ask_question(cid):
     try:
         if is_image:
             png=render_question_image(q); buf=BufferedInputFile(png,filename="q.png")
-            msg=await safe_send(bot.send_photo,cid,buf,caption=f"🧠 <b>Вопрос!</b>{sn}\n\n{dl} · 🏆 +1 очко\n🔓 Вопрос открыт до правильного ответа.{pl}{tl}")
+            msg=await safe_send(bot.send_photo,cid,buf,caption=f"🧠 <b>Вопрос!</b>{sn}\n\n{dl} · 🏆 +1 очко · 💰 ${BASE_MONEY_PER_CORRECT:.2f}+\n🔓 Вопрос открыт до правильного ответа.{pl}{tl}")
         else:
-            msg=await safe_send(bot.send_message,cid,f"🧠 <b>Вопрос!</b>{sn}\n\n❓ {q}\n\n{dl} · 🏆 +1 очко\n🔓 Вопрос открыт до правильного ответа.{pl}{tl}")
+            msg=await safe_send(bot.send_message,cid,f"🧠 <b>Вопрос!</b>{sn}\n\n❓ {q}\n\n{dl} · 🏆 +1 очко · 💰 ${BASE_MONEY_PER_CORRECT:.2f}+\n🔓 Вопрос открыт до правильного ответа.{pl}{tl}")
         if msg:
             try: await bot.set_message_reaction(cid,msg.message_id,["🧠"])
             except Exception: pass
@@ -1096,7 +1101,7 @@ async def cmd_aisub(message:Message):
 async def cmd_start(message:Message):
     if message.from_user: TOURNAMENT_EDIT.pop(message.from_user.id,None)
     kb=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="💎 Подписка $0.50/нед",url=XROCKET_SUBSCRIBE_URL)],[InlineKeyboardButton(text="🎰 Лотерея /AiLoto",callback_data="loto:open:0")]])
-    await safe_send(message.reply,f"👋 <b>Викторина!</b>\n\n🎯 +1 очко\n📈 10 уровней\n🎴 /AiCard\n🎰 /AiLoto — лотерея (возврат + бонус)\n🎲 /AiDuel 0.20\n💳 /AiDeposit 1.0\n💸 Вывод ${MIN_WITHDRAW:.2f}\n\n📖 /AiHelp",reply_markup=kb)
+    await safe_send(message.reply,f"👋 <b>Викторина!</b>\n\n💰 За правильный ответ: <b>${BASE_MONEY_PER_CORRECT:.2f} + ${MONEY_PER_LEVEL:.3f}/уровень</b>\n🏆 Очки + уровень\n🎴 /AiCard\n🎰 /AiLoto — лотерея\n🎲 /AiDuel 0.20\n💳 /AiDeposit 1.0\n💸 Вывод ${MIN_WITHDRAW:.2f}\n\n📖 /AiHelp",reply_markup=kb)
 @dp.callback_query(F.data=="loto:open:0")
 async def on_loto_open(cb:CallbackQuery):
     if not cb.from_user or not isinstance(cb.message,Message): await cb.answer(); return
@@ -1106,6 +1111,7 @@ async def on_loto_open(cb:CallbackQuery):
 async def cmd_aihelp(message:Message):
     if message.chat.type not in ("group","supergroup"): return
     t=("📖 <b>СПРАВКА</b>\n\n<b>🎮 Игра</b>\n/AiBalance · /AiProfile · /AiCard · /AiTop · /AiLevels · /AiCoins\n/AiDuel 0.20\n\n<b>💰 Деньги</b>\n"
+       f"💰 За правильный ответ: <b>${BASE_MONEY_PER_CORRECT:.2f} + ${MONEY_PER_LEVEL:.3f} × (уровень-1)</b>\n"
        f"/AiDeposit — комиссия {DEPOSIT_COMMISSION*100:.0f}%\n/AiWithdraw — комиссия {WITHDRAW_COMMISSION*100:.0f}%, мин ${MIN_WITHDRAW:.2f}\n"
        f"/AiSubscribe — ×{SUBSCRIBER_MULTIPLIER:.0f} (${SUBSCRIPTION_PRICE:.2f}/{SUBSCRIPTION_DAYS}дн)\n"
        f"/AiLoto — лотерея (возврат + {int(LOTTERY_WINNER_SHARE*100)}% банка)\n/AiSponsor — в ЛС\n\n<b>📜</b> /AiRules\n")
@@ -1115,7 +1121,7 @@ async def cmd_aihelp(message:Message):
 @dp.message(Command("AiRules"))
 async def cmd_airules(message:Message):
     if message.chat.type not in ("group","supergroup"): return
-    await safe_send(message.reply,f"📜 <b>ПРАВИЛА</b>\n\n1. Оскорбления — бан.\n2. Обход бана — перманентный.\n3. Скрипты — бан.\n4. Спам — бан.\n5. Фиктивные дуэли — бан.\n6. Обман вывода — бан.\n\n💸 Вывод: ${MIN_WITHDRAW:.2f} · комиссия {WITHDRAW_COMMISSION*100:.0f}%\n💳 Депозит: комиссия {DEPOSIT_COMMISSION*100:.0f}%\n🎰 Лотерея: возврат + {int(LOTTERY_WINNER_SHARE*100)}% банка · {LOTTERY_HOUR}:00 МСК\n🎲 Рейк: {RAKE_PCT*100:.0f}%")
+    await safe_send(message.reply,f"📜 <b>ПРАВИЛА</b>\n\n1. Оскорбления — бан.\n2. Обход бана — перманентный.\n3. Скрипты — бан.\n4. Спам — бан.\n5. Фиктивные дуэли — бан.\n6. Обман вывода — бан.\n\n💰 За ответ: ${BASE_MONEY_PER_CORRECT:.2f} + ${MONEY_PER_LEVEL:.3f}/уровень\n💸 Вывод: ${MIN_WITHDRAW:.2f} · комиссия {WITHDRAW_COMMISSION*100:.0f}%\n💳 Депозит: комиссия {DEPOSIT_COMMISSION*100:.0f}%\n🎰 Лотерея: возврат + {int(LOTTERY_WINNER_SHARE*100)}% банка · {LOTTERY_HOUR}:00 МСК\n🎲 Рейк: {RAKE_PCT*100:.0f}%")
 @dp.message(Command("AiCoins"))
 async def cmd_aicoins(message:Message):
     if message.chat.type not in ("group","supergroup"): return
@@ -1175,7 +1181,7 @@ def admin_text(cid):
             if bt=="commission": bl.append(f"{cfg['emoji']} 0%")
             else: bl.append(f"{cfg['emoji']} x{int(b['multiplier'])}")
     bstr=(" · ".join(bl)) if bl else "нет"
-    return f"🛠 <b>Админ</b>\nВикторина: {st}\nРейк: {RAKE_PCT*100:.0f}% · Деп {DEPOSIT_COMMISSION*100:.0f}% · Выв {WITHDRAW_COMMISSION*100:.0f}%\n🚀 Бустеры: {bstr}{ct}"
+    return f"🛠 <b>Админ</b>\nВикторина: {st}\n💰 За ответ: ${BASE_MONEY_PER_CORRECT:.2f}+${MONEY_PER_LEVEL:.3f}/ур\nРейк: {RAKE_PCT*100:.0f}% · Деп {DEPOSIT_COMMISSION*100:.0f}% · Выв {WITHDRAW_COMMISSION*100:.0f}%\n🚀 Бустеры: {bstr}{ct}"
 @dp.message(Command("AiAdmin"))
 async def cmd_aiadmin(message:Message):
     if not message.from_user or not is_admin(message.from_user.id): return
@@ -1419,7 +1425,8 @@ async def cmd_aibalance(message:Message):
     td=await withdrawn_today(message.chat.id,message.from_user.id); ca=int(p["correct_answers"])
     _,_,_,_,ts,_=level_info(ca); bar=make_progress_bar(ca); sub=is_subscriber_cached(message.chat.id,message.from_user.id)
     sl=f"\n💎 ×{SUBSCRIBER_MULTIPLIER:.0f}" if sub else ""
-    await safe_send(message.reply,f"💰 <b>${float(p['balance']):.4f} USDT</b>\n🎖 {ts}\n🏆 {ca}\n<code>{bar}</code>{sl}\n💸 ${td:.4f} / ${DAILY_WITHDRAW_LIMIT:.2f}\n💳 /AiDeposit · 🎴 /AiCard · 🎰 /AiLoto")
+    per=money_for_answer(ca)
+    await safe_send(message.reply,f"💰 <b>${float(p['balance']):.4f} USDT</b>\n🎖 {ts}\n🏆 {ca}\n<code>{bar}</code>{sl}\n💵 За ответ: <b>${per:.4f}</b>\n💸 ${td:.4f} / ${DAILY_WITHDRAW_LIMIT:.2f}\n💳 /AiDeposit · 🎴 /AiCard · 🎰 /AiLoto")
 @dp.message(Command("AiCard"))
 async def cmd_aicard(message:Message):
     if message.chat.type not in ("group","supergroup") or not message.from_user: return
@@ -1448,14 +1455,16 @@ async def cmd_aiprofile(message:Message):
     td=await withdrawn_today(message.chat.id,message.from_user.id)
     nl="🏆 MAX" if lvl>=MAX_LEVEL else f"⬆️ До {LEVELS[lvl][1]} {LEVELS[lvl][2]}: {ANSWERS_PER_LEVEL-(ca-(lvl-1)*ANSWERS_PER_LEVEL)} очк."
     sl=f"\n💎 активна" if sub else ""
-    await safe_send(message.reply,f"👤 <b>{message.from_user.first_name}</b>\n\n🎖 <b>{ts}</b>{sl}\n\n<code>{bar}</code>\n{nl}\n\n💰 <b>${float(p['balance']):.4f}</b>\n💸 ${td:.4f}\n🏆 <b>{ca}</b>\n📍 <b>{ps}</b>")
+    per=money_for_answer(ca)
+    await safe_send(message.reply,f"👤 <b>{message.from_user.first_name}</b>\n\n🎖 <b>{ts}</b>{sl}\n\n<code>{bar}</code>\n{nl}\n\n💰 <b>${float(p['balance']):.4f}</b>\n💵 За ответ: <b>${per:.4f}</b>\n💸 ${td:.4f}\n🏆 <b>{ca}</b>\n📍 <b>{ps}</b>")
 @dp.message(Command("AiLevels"))
 async def cmd_ailevels(message:Message):
     if message.chat.type not in ("group","supergroup"): return
     ls=["🎖 <b>Уровни</b>\n"]
     for lvl,em,nm in LEVELS:
         mn=(lvl-1)*ANSWERS_PER_LEVEL; rq=f"{mn}+" if lvl==MAX_LEVEL else f"{mn}-{mn+ANSWERS_PER_LEVEL-1}"
-        ls.append(f"{em} <b>Ур. {lvl}</b> · {nm} · <i>{rq}</i>")
+        per=round(BASE_MONEY_PER_CORRECT+(lvl-1)*MONEY_PER_LEVEL,4)
+        ls.append(f"{em} <b>Ур. {lvl}</b> · {nm} · <i>{rq}</i> · 💰 ${per:.4f}")
     await safe_send(message.reply,"\n".join(ls))
 @dp.message(Command("AiTop"))
 async def cmd_aitop(message:Message):
@@ -1663,20 +1672,25 @@ async def handle_answer(message:Message):
     if tk: tk.cancel()
     p,_=await asyncio.gather(get_player(cid,uid,message.from_user.username,message.from_user.first_name),clear_active(cid),return_exceptions=True)
     if isinstance(p,Exception) or p is None: p=await get_player(cid,uid,message.from_user.username,message.from_user.first_name)
-    ol=level_from_correct(int(p["correct_answers"])); ot=TOP_CACHE.get(cid)
+    old_correct=int(p["correct_answers"])
+    ol=level_from_correct(old_correct); ot=TOP_CACHE.get(cid)
     is_sub=is_subscriber_cached(cid,uid)
+    # очки
     base=2 if is_sub else 1
     pm=booster_mult(cid,"points",1.0)
     pg=int(base*pm)
-    mm=booster_mult(cid,"money",0.0)
+    # деньги — за ответ всегда, зависит от уровня
+    money_base=money_for_answer(old_correct)
+    money_mult=booster_mult(cid,"money",1.0)  # default 1.0, всегда начисляем
+    money_reward=round(money_base*money_mult,4)
+    # начисляем очки
     await add_score(cid,uid)
     for _ in range(pg-1): await add_score(cid,uid)
-    if mm>0:
-        rw=round(BASE_MONEY_PER_CORRECT*mm,4)
-        if rw>0:
-            try: await add_balance(cid,uid,rw)
-            except Exception: pass
-    nc=int(p["correct_answers"])+pg; nl=level_from_correct(nc)
+    # начисляем деньги
+    if money_reward>0:
+        try: await add_balance(cid,uid,money_reward)
+        except Exception: pass
+    nc=old_correct+pg; nl=level_from_correct(nc)
     TOP1_COUNTER[cid]=TOP1_COUNTER.get(cid,0)+1
     if TOP1_COUNTER[cid]%TOP1_CHECK_EVERY==0:
         nt=await get_top1(cid)
@@ -1692,20 +1706,25 @@ async def handle_answer(message:Message):
     else: ash=q["answers"][0]
     parts2=[f"+{pg} очк"]
     if is_sub: parts2.append("💎")
-    if mm>0: parts2.append(f"+${round(BASE_MONEY_PER_CORRECT*mm,4):.4f} 💰")
+    parts2.append(f"+${money_reward:.4f} 💰")
+    if money_mult>1: parts2.append(f"x{int(money_mult)}")
     msg=f"{ph}\n{message.from_user.first_name} — {' · '.join(parts2)}\n<i>Ответ: {ash}</i>"
-    if nl>ol: msg+=f"\n\n{LEVELS[nl-1][1]} <b>НОВЫЙ УРОВЕНЬ {nl}!</b>\n🎖 {LEVELS[nl-1][2]}"
+    if nl>ol:
+        # следующий уровень — новая ставка за ответ
+        new_per=money_for_answer(nc)
+        msg+=f"\n\n{LEVELS[nl-1][1]} <b>НОВЫЙ УРОВЕНЬ {nl}!</b>\n🎖 {LEVELS[nl-1][2]}\n💵 Теперь за ответ: <b>${new_per:.4f}</b>"
     sent=await safe_send(message.reply,msg)
     if sent:
         try: await bot.set_message_reaction(cid,message.message_id,["✅"])
         except Exception: pass
 
 async def main():
-    print("="*50); print("Quiz Bot · lottery v3 (refund + 50% of remaining)")
+    print("="*50); print("Quiz Bot · money per answer by level")
     print(f"Easy {len(EASY_QUESTIONS)} · Medium {len(MEDIUM_QUESTIONS)} · Hard {len(HARD_QUESTIONS)} · Extreme {len(EXTREME_QUESTIONS)}")
     print(f"Admins: {sorted(ADMIN_IDS)}")
+    print(f"Money per answer: ${BASE_MONEY_PER_CORRECT:.4f} + ${MONEY_PER_LEVEL:.4f} × (level-1)")
     print(f"Commissions: dep {DEPOSIT_COMMISSION*100:.0f}% / wd {WITHDRAW_COMMISSION*100:.0f}%")
-    print(f"Lottery: base {LOTTERY_PRICE:.2f}/ticket · packs {LOTTERY_PACKS} · refund + {int(LOTTERY_WINNER_SHARE*100)}% остатка · {LOTTERY_HOUR}:00 MSK")
+    print(f"Lottery: base {LOTTERY_PRICE:.2f}/ticket · packs {LOTTERY_PACKS} · refund + {int(LOTTERY_WINNER_SHARE*100)}% остатка")
     await get_http(); await asyncio.to_thread(unlock_all_withdrawals_sync)
     global BANNED_CACHE,SUBSCRIBERS_CACHE
     BANNED_CACHE=await asyncio.to_thread(load_bans_sync); SUBSCRIBERS_CACHE=await asyncio.to_thread(load_subscribers_sync)
