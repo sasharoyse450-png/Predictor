@@ -72,19 +72,31 @@ def render_profile_card(name,le,ln,lvl,correct,place,balance,wd,is_sub):
     for y in range(H):
         r=int(18+(60-18)*y/H); g=int(20+(30-20)*y/H); b=int(40+(110-40)*y/H); draw.line([(0,y),(W,y)],fill=(r,g,b))
     draw.rectangle([10,10,W-11,H-11],outline=(255,215,0),width=3)
-    fb=get_font(56); fm=get_font(32); fs=get_font(24); fx=get_font(20)
-    draw.text((40,35),(name or "Игрок")[:24],fill=(255,255,255),font=fb)
-    draw.text((40,105),f"{le} {ln} · ур. {lvl}",fill=(255,215,0),font=fm)
-    draw.line([(40,155),(W-40,155)],fill=(255,215,0),width=2)
-    draw.text((40,180),"🏆 Очков:",fill=(200,200,220),font=fs); draw.text((250,180),str(correct),fill=(255,255,255),font=fm)
-    draw.text((40,230),"📍 Место:",fill=(200,200,220),font=fs); draw.text((250,230),f"#{place}" if place else "—",fill=(255,255,255),font=fm)
-    draw.text((40,280),"💰 Баланс:",fill=(200,200,220),font=fs); draw.text((250,280),f"${balance:.4f}",fill=(80,255,120),font=fm)
-    draw.text((40,330),"💸 Выведено:",fill=(200,200,220),font=fs); draw.text((250,330),f"${wd:.4f}",fill=(255,200,100),font=fm)
-    draw.text((40,380),"💎 Подписка: активна" if is_sub else "💎 Подписка: нет",fill=(255,120,220) if is_sub else (150,150,170),font=fs)
+    fb=get_font(52); fm=get_font(30); fs=get_font(22); fx=get_font(20); fxs=get_font(16)
+    draw.text((40,30),(name or "Player")[:24],fill=(255,255,255),font=fb)
+    draw.text((40,100),f"LVL {lvl}  -  {ln}",fill=(255,215,0),font=fm)
+    draw.line([(40,150),(W-40,150)],fill=(255,215,0),width=2)
+    y=175; dy=52
+    draw.text((40,y),"P O I N T S",fill=(150,150,180),font=fxs)
+    draw.text((40,y+18),str(correct),fill=(255,255,255),font=fm)
+    y+=dy
+    draw.text((40,y),"R A N K",fill=(150,150,180),font=fxs)
+    draw.text((40,y+18),f"#{place}" if place else "-",fill=(255,255,255),font=fm)
+    y+=dy
+    draw.text((40,y),"B A L A N C E",fill=(150,150,180),font=fxs)
+    draw.text((40,y+18),f"${balance:.4f}",fill=(80,255,120),font=fm)
+    y+=dy
+    draw.text((40,y),"W I T H D R A W N   T O D A Y",fill=(150,150,180),font=fxs)
+    draw.text((40,y+18),f"${wd:.4f}",fill=(255,200,100),font=fm)
+    if is_sub:
+        draw.text((W-260,30),"SUBSCRIBER",fill=(255,120,220),font=fm)
+        draw.text((W-260,68),"x2 to score",fill=(200,120,200),font=fxs)
+    else:
+        draw.text((W-260,30),"FREE USER",fill=(120,120,140),font=fm)
     bx,by,bw,bh=40,440,W-80,24
     il=correct-(lvl-1)*ANSWERS_PER_LEVEL
-    if lvl>=MAX_LEVEL: filled,bt=bw,"МАКС"
-    else: filled,bt=int(bw*il/ANSWERS_PER_LEVEL),f"{il}/{ANSWERS_PER_LEVEL}"
+    if lvl>=MAX_LEVEL: filled,bt=bw,"MAX LEVEL"
+    else: filled,bt=int(bw*il/ANSWERS_PER_LEVEL),f"{il} / {ANSWERS_PER_LEVEL}"
     draw.rectangle([bx,by,bx+bw,by+bh],outline=(100,100,140),width=2)
     if filled>0: draw.rectangle([bx+2,by+2,bx+filled-2,by+bh-2],fill=(255,215,0))
     bbox=draw.textbbox((0,0),bt,font=fx); tw=bbox[2]-bbox[0]; th=bbox[3]-bbox[1]
@@ -245,16 +257,18 @@ def unlock_all_withdrawals_sync():
     try: supabase.table("quiz_players").update({"is_withdrawing":False}).eq("is_withdrawing",True).execute()
     except Exception: pass
 def get_top_sync(cid,limit=10):
-    try: return supabase.table("quiz_players").select("user_id,username,first_name,balance,correct_answers").eq("chat_id",cid).order("correct_answers",desc=True).limit(limit).execute().data or []
+    try: return supabase.table("quiz_players").select("user_id,username,first_name,balance,correct_answers").eq("chat_id",cid).order("correct_answers",desc=True).order("balance",desc=True).limit(limit).execute().data or []
     except Exception: return []
 def get_top1_sync(cid):
     r=get_top_sync(cid,1); return int(r[0]["user_id"]) if r else None
 def get_player_place_sync(cid,uid):
     try:
-        me=supabase.table("quiz_players").select("correct_answers").eq("chat_id",cid).eq("user_id",uid).execute()
+        me=supabase.table("quiz_players").select("correct_answers,balance").eq("chat_id",cid).eq("user_id",uid).execute()
         if not me.data: return None
-        mca=int(me.data[0]["correct_answers"])
-        return len(supabase.table("quiz_players").select("user_id").eq("chat_id",cid).gt("correct_answers",mca).execute().data or [])+1
+        mca=int(me.data[0]["correct_answers"]); mb=float(me.data[0].get("balance") or 0)
+        above_ca=supabase.table("quiz_players").select("user_id").eq("chat_id",cid).gt("correct_answers",mca).execute().data or []
+        same_ca_above=supabase.table("quiz_players").select("user_id").eq("chat_id",cid).eq("correct_answers",mca).gt("balance",mb).execute().data or []
+        return len(above_ca)+len(same_ca_above)+1
     except Exception: return None
 def get_stats_sync():
     try:
@@ -678,11 +692,11 @@ async def on_turik_cb(cb:CallbackQuery):
 async def cmd_start(message:Message):
     if message.from_user: TOURNAMENT_EDIT.pop(message.from_user.id,None)
     kb=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="💎 Подписка $0.50/нед",url=XROCKET_SUBSCRIBE_URL)],[InlineKeyboardButton(text="🔗 Партнёрка xRocket",url=XROCKET_REFERRAL_URL)]])
-    await safe_send(message.reply,f"👋 <b>Викторина с дуэлями!</b>\n\n🎯 Квиз: +1 очко\n📈 10 уровней\n🎲 Дуэли: <code>/AiDuel 0.20</code>\n💳 <code>/AiDeposit 1.0</code>\n💸 Вывод от ${MIN_WITHDRAW:.2f}\n\n📖 /AiHelp · 📜 /AiRules",reply_markup=kb)
+    await safe_send(message.reply,f"👋 <b>Викторина с дуэлями!</b>\n\n🎯 Квиз: +1 очко\n📈 10 уровней\n🎴 /AiCard — карточка\n🎲 Дуэли: <code>/AiDuel 0.20</code>\n💳 <code>/AiDeposit 1.0</code>\n💸 Вывод от ${MIN_WITHDRAW:.2f}\n\n📖 /AiHelp · 📜 /AiRules",reply_markup=kb)
 @dp.message(Command("AiHelp"))
 async def cmd_aihelp(message:Message):
     if message.chat.type not in ("group","supergroup"): return
-    text=("📖 <b>СПРАВКА</b>\n\n<b>🎮 Игра</b>\n/AiBalance · /AiProfile · /AiTop · /AiLevels · /AiCoins\n/AiCard — карточка профиля\n/AiDuel 0.20 — дуэль\n\n<b>💰 Деньги</b>\n"
+    text=("📖 <b>СПРАВКА</b>\n\n<b>🎮 Игра</b>\n/AiBalance · /AiProfile · /AiCard · /AiTop · /AiLevels · /AiCoins\n/AiDuel 0.20 — дуэль\n\n<b>💰 Деньги</b>\n"
           f"/AiDeposit 0.05 — пополнить (от ${DEPOSIT_MIN:.2f})\n/AiWithdraw — вывод от ${MIN_WITHDRAW:.2f}\n"
           f"/AiSubscribe — подписка ×{SUBSCRIBER_MULTIPLIER}\n/AiSponsor — спонсорские вопросы (в ЛС)\n\n<b>📜 Общее</b>\n/AiRules · /AiHelp\n")
     if message.from_user and is_admin(message.from_user.id):
@@ -799,15 +813,17 @@ async def cmd_aipotgive(message:Message):
 @dp.message(Command("AiGive"))
 async def cmd_aigive(message:Message):
     if not message.from_user or not is_admin(message.from_user.id): return
+    if message.chat.type not in ("group","supergroup"): return
     parts=(message.text or "").split()
     if len(parts)<3: await safe_send(message.reply,"Формат: <code>/AiGive &lt;user_id&gt; &lt;сумма&gt; [причина]</code>"); return
     try: target=int(parts[1]); amt=round(float(parts[2]),4)
     except ValueError: await safe_send(message.reply,"user_id и сумма — числа."); return
     if amt<=0 or amt>100: await safe_send(message.reply,"Сумма: 0.0001-100"); return
     reason=" ".join(parts[3:]) if len(parts)>3 else "admin_give"
+    # если игрока нет — создадим запись
+    await get_player(message.chat.id,target)
     nb=await add_balance(message.chat.id,target,amt)
-    if nb is None: await safe_send(message.reply,"❌ Ошибка начисления (нет игрока?)"); return
-    await log_house_income(message.chat.id,-amt,f"admin_give:{reason[:50]}")
+    if nb is None: await safe_send(message.reply,"❌ Ошибка начисления"); return
     try: await bot.send_message(target,f"🎁 <b>Начисление от админа</b>\n\n💰 +${amt:.4f} USDT\n💼 Баланс: <b>${nb:.4f}</b>\n📝 {reason}")
     except Exception: pass
     await safe_send(message.reply,f"✅ <code>{target}</code> +${amt:.4f}\n💰 Баланс: ${nb:.4f}\n📝 {reason}")
@@ -957,16 +973,17 @@ async def cmd_aicard(message:Message):
     if message.chat.type not in ("group","supergroup") or not message.from_user: return
     cid,uid=message.chat.id,message.from_user.id
     p=await get_player(cid,uid,message.from_user.username,message.from_user.first_name)
-    ca=int(p["correct_answers"]); lvl,em,nm,_,_,_=level_info(ca)
+    ca=int(p["correct_answers"]); lvl,_,nm,_,_,_=level_info(ca)
     place=await get_player_place(cid,uid); td=await withdrawn_today(cid,uid)
     sub=is_subscriber_cached(cid,uid)
+    name=message.from_user.first_name or "Player"
     try:
-        png=render_profile_card(message.from_user.first_name or "Игрок",em,nm,lvl,ca,place,float(p["balance"]),td,sub)
+        png=render_profile_card(name,"","",lvl,ca,place,float(p["balance"]),td,sub)
         buf=BufferedInputFile(png,filename="card.png")
-        await safe_send(bot.send_photo,cid,buf,caption=f"🎴 <b>{message.from_user.first_name}</b> · {em} {nm} (ур. {lvl})\n🏆 {ca} очк · 💰 ${float(p['balance']):.4f}")
+        await safe_send(bot.send_photo,cid,buf,caption=f"<b>{name}</b> · LVL {lvl} ({nm})\nPoints: {ca} · Balance: ${float(p['balance']):.4f}")
     except Exception as e:
         log.warning("card: %s",e)
-        await safe_send(message.reply,f"🎴 {em} {nm} (ур. {lvl})\n🏆 {ca} очк · 💰 ${float(p['balance']):.4f}\n📍 #{place if place else '—'}")
+        await safe_send(message.reply,f"🎴 {nm} (ур. {lvl})\n🏆 {ca} очк · 💰 ${float(p['balance']):.4f}\n📍 #{place if place else '—'}")
 @dp.message(Command("AiProfile"))
 async def cmd_aiprofile(message:Message):
     if message.chat.type not in ("group","supergroup") or not message.from_user: return
